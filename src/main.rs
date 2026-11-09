@@ -4,6 +4,8 @@
 mod alias;
 mod compare;
 mod drill;
+
+mod cover;
 mod export;
 mod flow;
 mod graph;
@@ -3223,6 +3225,10 @@ fn kind_name(k: SymKind) -> &'static str {
     }
 }
 
+/// text / background of the `lazy` badge (a code-split chunk)
+const LAZY_FG: u32 = 0x6d28d9;
+const LAZY_BG: u32 = 0xede9fe;
+
 /// (text, background) for a wrapper badge
 fn wrap_colors(w: Wrap) -> (u32, u32) {
     match w {
@@ -4368,6 +4374,18 @@ impl Render for GraphView {
                                 .text_color(rgb(fg))
                                 .child(w.label())
                         }))
+                        .when(s.lazy, |d| {
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(LAZY_BG))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(LAZY_FG))
+                                    .child("lazy"),
+                            )
+                        })
                         .when(warns > 0 || dup.is_some(), |d| d.child(div().flex_1()))
                         .when_some(dup, |d, score| {
                             d.child(
@@ -5557,6 +5575,50 @@ impl Render for GraphView {
                     ),
             );
 
+            if s.lazy || !s.cover_hints.is_empty() {
+                p = p.child(section("Boundaries"));
+                if s.lazy {
+                    p = p.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(LAZY_BG))
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(LAZY_FG))
+                                    .child("lazy"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("Loaded on demand with lazy(() => import(...)): its own chunk, and it suspends while loading."),
+                            ),
+                    );
+                }
+                for (n, h) in s.cover_hints.iter().enumerate() {
+                    p = p.child(
+                        div()
+                            .id(("cover-hint", n))
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                            .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
             if !s.wraps.is_empty() {
                 p = p.child(section("Memoization"));
                 for w in &s.wraps {
@@ -5816,6 +5878,8 @@ impl Render for GraphView {
                         .map(|h| h.text.clone())
                         .or_else(|| t.prop_hints.first().map(|h| h.text.clone()))
                         .or_else(|| t.drill_hints.first().map(|h| h.text.clone()))
+
+                        .or_else(|| t.cover_hints.first().map(|h| h.text.clone()))
                         .unwrap_or_default();
                     p = p.child(
                         div()
