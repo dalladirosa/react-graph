@@ -1,0 +1,35 @@
+name: CI
+
+# Build and test on Windows and Apple Silicon macOS for every pull request, and for pushes to main,
+# so a break on one platform shows up before merging (the release workflow only runs on tags).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked: fail if Cargo.lock is out of date, like the release build does
+      - name: Test
+        run: cargo test --locked
