@@ -1,6 +1,6 @@
 [package]
 name = "react-graph"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,10 @@ gpui = "0.2.2"
 tree-sitter = "0.27.2"
 tree-sitter-typescript = "0.23.2"
 walkdir = "2.5.0"
+
+# macOS: compile gpui's Metal shaders at runtime, so building doesn't need Xcode's Metal toolchain
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 
 # Debug builds of gpui/lyon are very slow at tessellating paths; optimize deps even in dev.
 [profile.dev]
