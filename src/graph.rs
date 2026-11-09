@@ -1881,8 +1881,10 @@ pub fn build(root: &Path) -> Graph {
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| !is_skipped_dir(&e.file_name().to_string_lossy()));
     let all: Vec<PathBuf> =
         walker.filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).map(|e| e.into_path()).collect();
-    let mut paths: Vec<PathBuf> = all.iter().filter(|p| is_source_file(p)).cloned().collect();
-    let mut test_paths: Vec<PathBuf> = all.into_iter().filter(|p| is_test_file(p)).collect();
+    // judged by the path inside the project: a folder called `my.test.app` or `__tests__` above it says nothing
+    let inside = |p: &PathBuf| p.strip_prefix(root).unwrap_or(p).to_path_buf();
+    let mut paths: Vec<PathBuf> = all.iter().filter(|p| is_source_file(&inside(p))).cloned().collect();
+    let mut test_paths: Vec<PathBuf> = all.into_iter().filter(|p| is_test_file(&inside(p))).collect();
     paths.sort();
     test_paths.sort();
 
@@ -2605,5 +2607,23 @@ mod tests {
         assert!(g.test_files.iter().any(|f| f.ends_with("boardReducer.test.ts")));
         let reducer = idx(&g, "src/features/board/boardReducer.ts", "boardReducer");
         assert!(g.tests_of(reducer).iter().any(|&t| g.test_files[t].ends_with("boardReducer.test.ts")));
+    }
+
+    #[test]
+    fn a_project_folder_named_like_a_test_is_still_a_project() {
+        let base = std::env::temp_dir().join(format!("react-graph-odd-root-{}", std::process::id()));
+        for dir in ["my.test.app", "__tests__/proj", "a.spec.b"] {
+            let root = base.join(dir);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/App.tsx"), "export function App() { return <div />; }
+").unwrap();
+            std::fs::write(root.join("src/App.test.tsx"), "import { App } from \"./App\";
+test(\"a\", () => { void App; });
+").unwrap();
+            let g = build(&root);
+            assert_eq!((g.files, g.symbols.len(), g.test_files.len()), (1, 1, 1), "{dir}");
+            assert_eq!(g.tests_of(0).len(), 1, "{dir}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
