@@ -746,6 +746,34 @@ fn text<'a>(n: Node, src: &'a str) -> &'a str {
     n.utf8_text(src.as_bytes()).unwrap_or("")
 }
 
+/// An object property that puts a component on a route (react-router and similar):
+/// `element: <Home />`, `errorElement: <NotFound />`, `Component: Home`, `ErrorBoundary: NotFound`.
+/// Returns the key and the value node (a JSX element, or an uppercase identifier).
+fn route_entry<'t>(pair: Node<'t>, src: &str) -> Option<(&'static str, Node<'t>)> {
+    let key = pair.child_by_field_name("key")?;
+    let key = text(key, src).trim_matches(|c| c == '"' || c == '\'');
+    let value = strip_expr(pair.child_by_field_name("value")?);
+    let jsx = matches!(value.kind(), "jsx_element" | "jsx_self_closing_element");
+    let ident = value.kind() == "identifier" && text(value, src).starts_with(|c: char| c.is_uppercase());
+    ["element", "errorElement", "Component", "ErrorBoundary"]
+        .into_iter()
+        .find(|k| *k == key && match *k {
+            "element" | "errorElement" => jsx,
+            _ => ident,
+        })
+        .map(|k| (k, value))
+}
+
+/// Does this module-level expression hold route entries (see `route_entry`)?
+fn has_route_entries(node: Node, src: &str) -> bool {
+    if node.kind() == "pair" && route_entry(node, src).is_some() {
+        return true;
+    }
+    let mut c = node.walk();
+    // functions are their own symbols: routes defined inside one belong to it
+    node.children(&mut c).filter(|ch| !is_fn(*ch)).any(|ch| has_route_entries(ch, src))
+}
+
 fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
     match node.kind() {
         "function_declaration" => {
@@ -793,6 +821,15 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         None => {}
                     }
                 }
+                // module-level route config, rendered by no component:
+                //   const router = createBrowserRouter([{ path: "/", element: <Home /> }])
+                // the config renders its pages, so it gets a symbol of its own to hold those links
+                if owner.is_none() && name.kind() == "identifier" && has_route_entries(value, cx.src) {
+                    let id = new_symbol(text(name, cx.src), node, None, cx);
+                    cx.symbols[id].kind = SymKind::Component;
+                    visit(value, Some(id), cx);
+                    return;
+                }
                 // const { a, b } = useSomething();
                 if name.kind() == "object_pattern" && value.kind() == "call_expression" {
                     if let Some(f) = value.child_by_field_name("function") {
@@ -814,6 +851,22 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                             }
                         }
                     }
+                }
+            }
+        }
+        // route objects: `{ Component: Home }` renders Home just like `{ element: <Home /> }`
+        "pair" => {
+            if let (Some(owner), Some((key, value))) = (owner, route_entry(node, cx.src)) {
+                if value.kind() == "identifier" && matches!(key, "Component" | "ErrorBoundary") {
+                    cx.refs.push(RawRef {
+                        owner,
+                        name: text(value, cx.src).to_string(),
+                        kind: EdgeKind::Renders,
+                        file: cx.file.clone(),
+                        line: node.start_position().row + 1,
+                        via: None,
+                        event_prop: false,
+                    });
                 }
             }
         }
@@ -2011,6 +2064,31 @@ mod tests {
         assert!(hit("src/App.tsx") && hit("C:/proj/src/a/b.js") && hit("tsconfig.json") && hit("web/jsconfig.json"));
         assert!(!hit("README.md") && !hit("src/App.test.tsx") && !hit("src/types.d.ts") && !hit("package.json"));
         assert!(!hit("node_modules/react/index.js") && !hit("C:/proj/dist/app.js") && !hit(".git/HEAD"));
+    }
+
+    #[test]
+    fn module_level_route_config_renders_its_pages() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes"));
+        // `export const router = createBrowserRouter([...])` becomes an entry point of its own
+        let router = idx(&g, "router.tsx", "router");
+        assert_eq!(g.symbols[router].kind, SymKind::Component);
+        assert_eq!(
+            targets(&g, router, EdgeKind::Renders),
+            [
+                "Layout.tsx:Layout",
+                "pages/About.tsx:About",
+                "pages/Home.tsx:Home",
+                "pages/NotFound.tsx:NotFound",
+                "pages/Settings.tsx:Settings", // `Component: Settings`, no JSX
+            ]
+        );
+        assert_eq!(g.in_edges(router).count(), 0);
+        // a page is no longer "unused", but a component in no route still is
+        assert_eq!(g.in_edges(idx(&g, "pages/Home.tsx", "Home")).count(), 1);
+        assert_eq!(g.in_edges(idx(&g, "Orphan.tsx", "Orphan")).count(), 0);
+        // plain data and a lone `render(<App />)` don't turn into symbols
+        assert!(g.symbols.iter().all(|s| s.name != "theme"));
+        assert_eq!(g.symbols.len(), 7);
     }
 
     #[test]
