@@ -89,6 +89,7 @@ fn icon_svg(glyph: &str) -> &'static str {
         "\u{E8C8}" => "icons/copy.svg",
         "\u{E945}" => "icons/zap.svg",
         "\u{E8EE}" => "icons/repeat.svg",
+        "\u{E783}" => "icons/flask-conical-off.svg",
         "\u{ED1A}" => "icons/eye-off.svg",
         "\u{E706}" => "icons/sun.svg",
         "\u{E708}" => "icons/moon.svg",
@@ -123,8 +124,8 @@ macro_rules! bundled {
     };
 }
 const ICONS: &[(&str, &[u8])] = bundled!(
-    "chevron-down.svg", "chevron-right.svg", "copy.svg", "eye-off.svg", "file.svg", "filter-x.svg", "folder.svg",
-    "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
+    "chevron-down.svg", "chevron-right.svg", "copy.svg", "eye-off.svg", "file.svg", "filter-x.svg",
+    "flask-conical-off.svg", "folder.svg", "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
 );
 
 /// Serves the bundled icons to gpui's `svg()` element.
@@ -393,13 +394,15 @@ struct Filters {
     memo: bool,
     /// part of a render / call loop (A renders B renders A)
     cycle: bool,
+    /// top-level symbol that no test file imports
+    untested: bool,
     /// Component, Hook, Function
     kinds: [bool; 3],
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.kinds.iter().any(|&k| k)
+        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.untested || self.kinds.iter().any(|&k| k)
     }
 }
 
@@ -846,6 +849,17 @@ impl GraphView {
     fn open_in_editor(&mut self, i: usize, cx: &mut Context<Self>) {
         let Some(s) = self.graph.symbols.get(i) else { return };
         let (path, line) = (self.root_path.join(&s.file), s.line);
+        self.open_file_at(path, line, cx);
+    }
+
+    /// Open a test file in the editor.
+    fn open_test(&mut self, t: usize, cx: &mut Context<Self>) {
+        let Some(f) = self.graph.test_files.get(t) else { return };
+        let path = self.root_path.join(f);
+        self.open_file_at(path, 1, cx);
+    }
+
+    fn open_file_at(&mut self, path: PathBuf, line: usize, cx: &mut Context<Self>) {
         let (p, task) = (path.clone(), cx.background_spawn(async move { open_with_code(&path, line) }));
         cx.spawn(async move |this, cx| {
             if !task.await {
@@ -2190,6 +2204,7 @@ impl GraphView {
             && (!f.memo || s.is_memoized())
             && (!f.unused || self.is_unused(i))
             && (!f.cycle || s.cycle.is_some())
+            && (!f.untested || self.graph.untested(i))
     }
 
     /// What the canvas starts from while filtering: every match, and every card on a path to one
@@ -4546,7 +4561,7 @@ impl Render for GraphView {
             side = side.child(tabs);
 
             type Toggle = fn(&mut Filters);
-            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 6] = [
+            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 7] = [
                 (
                     "f-dup",
                     "\u{E8C8}",
@@ -4607,8 +4622,18 @@ impl Render for GraphView {
                     0xbe185d,
                     |f| f.cycle = !f.cycle,
                 ),
+                (
+                    "f-untested",
+                    "\u{E783}",
+                    "No tests",
+                    "No test file (*.test.*, *.spec.*, __tests__/) imports it",
+                    count(&|i| g.untested(i)),
+                    f.untested,
+                    0x6d28d9,
+                    |f| f.untested = !f.untested,
+                ),
             ];
-            let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().items_center().gap(px(2.));
+            let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().flex_wrap().items_center().gap(px(2.));
             for (id, glyph, name, detail, num, on, color, toggle) in props {
                 let none = num == 0 && !on;
                 bar = bar.child(
@@ -5734,6 +5759,45 @@ impl Render for GraphView {
                             .gap_2()
                             .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
                             .child(div().text_sm().child(t.name.clone())),
+                    );
+                }
+            }
+
+            // tests: files that import it (or the top-level symbol it lives in)
+            if !self.graph.test_files.is_empty() {
+                let tests = self.graph.tests_of(sel).to_vec();
+                if tests.is_empty() && self.graph.untested(sel) {
+                    p = p.child(section("Tests")).child(
+                        div().px_2().text_xs().text_color(rgb(0x6d28d9)).child("No test file imports this"),
+                    );
+                }
+                if !tests.is_empty() {
+                    p = p.child(section("Tests"));
+                }
+                for (n, t) in tests.into_iter().take(30).enumerate() {
+                    let file = self.graph.test_files[t].clone();
+                    let name = short_file(&file).to_string();
+                    let dir = file[..file.len() - name.len()].trim_end_matches('/').to_string();
+                    p = p.child(
+                        div()
+                            .id(("test", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .tooltip(tip("Open the test in your editor", Some("VS Code, or the system default")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_test(t, cx);
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(rgb(0x6d28d9)).child("\u{2197}"))
+                            .child(div().text_sm().child(name))
+                            .child(div().min_w(px(0.)).overflow_hidden().text_xs().text_color(rgb(MUTED)).child(dir)),
                     );
                 }
             }

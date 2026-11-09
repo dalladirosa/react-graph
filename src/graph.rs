@@ -222,6 +222,9 @@ pub struct Symbol {
     pub similar: Vec<Similar>,
     /// member of a render / call cycle: index into `Graph::cycles`
     pub cycle: Option<usize>,
+    /// test files that import this symbol (indexes into `Graph::test_files`); top-level symbols only,
+    /// see `Graph::tests_of`
+    pub tests: Vec<usize>,
     /// byte range of the function node in its file (what `similar` fingerprints), for side-by-side compare
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
@@ -281,6 +284,8 @@ pub struct Graph {
     pub files: usize,
     /// relative paths (forward slashes) of every parsed source file
     pub file_list: Vec<String>,
+    /// relative paths of the test files (`*.test.*`, `*.spec.*`, `__tests__/`); read for their imports only
+    pub test_files: Vec<String>,
     /// every `createContext` found, for `Edge::ctx`
     pub contexts: Vec<ContextDecl>,
     /// groups of symbols that render or call each other in a loop (A -> B -> A), members sorted
@@ -298,6 +303,18 @@ impl Graph {
     }
     pub fn in_edges(&self, i: usize) -> impl Iterator<Item = &Edge> {
         self.inc[i].iter().map(move |&e| &self.edges[e])
+    }
+    /// Test files that import `i`, or the top-level symbol it is defined in.
+    pub fn tests_of(&self, i: usize) -> &[usize] {
+        let mut top = i;
+        while let Some(p) = self.symbols[top].parent {
+            top = p;
+        }
+        &self.symbols[top].tests
+    }
+    /// A top-level symbol that no test file imports. Never true when the project has no tests at all.
+    pub fn untested(&self, i: usize) -> bool {
+        !self.test_files.is_empty() && self.symbols[i].parent.is_none() && self.symbols[i].tests.is_empty()
     }
     /// "renders", "calls", ... or "context · ThemeContext"
     pub fn edge_label(&self, e: &Edge) -> String {
@@ -1104,6 +1121,7 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         is_value: false,
         similar: Vec::new(),
         cycle: None,
+        tests: Vec::new(),
         func: None,
         shape: Shape::default(),
         forwards: None,
@@ -1213,6 +1231,12 @@ enum Imported {
 struct Import {
     spec: String,
     name: Imported,
+}
+
+impl Import {
+    fn name_is_namespace(&self) -> bool {
+        matches!(self.name, Imported::Namespace)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1765,31 +1789,102 @@ fn is_skipped_dir(name: &str) -> bool {
     matches!(name, "node_modules" | ".git" | "dist" | "build" | ".next" | "coverage" | ".turbo" | ".cache")
 }
 
-/// A file `build` parses.
-fn is_source_file(p: &Path) -> bool {
+fn is_script(p: &Path) -> bool {
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(ext, "ts" | "tsx" | "js" | "jsx") && !p.to_string_lossy().ends_with(".d.ts")
+}
+
+/// A test file: `Card.test.tsx`, `Card.spec.js`, or anything inside a `__tests__` folder.
+pub fn is_test_file(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    matches!(ext, "ts" | "tsx" | "js" | "jsx") && !s.ends_with(".d.ts") && !s.contains(".test.") && !s.contains(".spec.")
+    is_script(p)
+        && (s.contains(".test.") || s.contains(".spec.") || p.components().any(|c| c.as_os_str() == "__tests__"))
+}
+
+/// A file `build` parses into symbols (test files are only read for what they import).
+fn is_source_file(p: &Path) -> bool {
+    is_script(p) && !is_test_file(p)
 }
 
 /// Would a change to `p` change what `build` returns: a source file, or the tsconfig that
 /// decides how imports resolve, outside the skipped folders. For the file watcher.
 pub fn affects_graph(p: &Path) -> bool {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    (is_source_file(p) || matches!(name, "tsconfig.json" | "jsconfig.json"))
+    (is_script(p) || matches!(name, "tsconfig.json" | "jsconfig.json"))
         && !p.components().any(|c| is_skipped_dir(&c.as_os_str().to_string_lossy()))
+}
+
+/// Imports of each test file (relative path, module facts), in path order.
+fn parse_test_modules(root: &Path, paths: &[PathBuf]) -> Vec<(String, Module)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let nthreads = 8.min(paths.len());
+    let chunk = paths.len().div_ceil(nthreads).max(1);
+    let parts: Vec<Vec<(String, Module)>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| {
+                std::thread::Builder::new()
+                    .stack_size(16 << 20)
+                    .spawn_scoped(sc, move || {
+                        let mut parser = Parser::new();
+                        parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()).expect("load tsx grammar");
+                        c.iter()
+                            .filter_map(|p| {
+                                let src = std::fs::read_to_string(p).ok()?;
+                                let tree = parser.parse(&src, None)?;
+                                let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
+                                Some((rel, collect_module(tree.root_node(), &src)))
+                            })
+                            .collect()
+                    })
+                    .expect("spawn parser thread")
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("parser thread")).collect()
+    });
+    parts.into_iter().flatten().collect()
+}
+
+/// (symbol, test file index) for every symbol a test file imports. `import * as X from "./x"`
+/// counts for every top-level symbol of that file.
+fn test_links(
+    symbols: &[Symbol],
+    modules: &HashMap<String, Module>,
+    file_list: &[String],
+    aliases: &AliasMap,
+    test_files: &[String],
+) -> Vec<(usize, usize)> {
+    let resolver = Resolver::new(symbols, modules, file_list, aliases);
+    let mut out = Vec::new();
+    for (t, file) in test_files.iter().enumerate() {
+        let Some(m) = modules.get(file) else { continue };
+        let mut names: Vec<&String> = m.imports.keys().collect();
+        names.sort();
+        for name in names {
+            let imp = &m.imports[name];
+            if imp.name_is_namespace() {
+                if let Some(f) = resolver.resolve_spec(file, &imp.spec) {
+                    out.extend(symbols.iter().enumerate().filter(|(_, s)| s.parent.is_none() && s.file == f).map(|(i, _)| (i, t)));
+                }
+            } else if let Some(i) = resolver.resolve_import(file, imp, 0) {
+                out.push((i, t));
+            }
+        }
+    }
+    out
 }
 
 pub fn build(root: &Path) -> Graph {
     // 1. list files (skipping heavy folders)
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| !is_skipped_dir(&e.file_name().to_string_lossy()));
-    let mut paths: Vec<PathBuf> = walker
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .filter(|p| is_source_file(p))
-        .collect();
+    let all: Vec<PathBuf> =
+        walker.filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).map(|e| e.into_path()).collect();
+    let mut paths: Vec<PathBuf> = all.iter().filter(|p| is_source_file(p)).cloned().collect();
+    let mut test_paths: Vec<PathBuf> = all.into_iter().filter(|p| is_test_file(p)).collect();
     paths.sort();
+    test_paths.sort();
 
     // 2. read + parse in parallel (file reads over WSL/network are slow)
     let nthreads = 16.min(paths.len().max(1));
@@ -1960,6 +2055,18 @@ pub fn build(root: &Path) -> Graph {
     }
 
     let contexts = add_context_edges(&symbols, &modules, &resolver, &ctx_refs, &mut edges);
+    drop(resolver);
+
+    // test files: which symbols they import (through barrels and path aliases, like any other import)
+    let test_mods = parse_test_modules(root, &test_paths);
+    let test_files: Vec<String> = test_mods.iter().map(|(f, _)| f.clone()).collect();
+    modules.extend(test_mods);
+    let links = test_links(&symbols, &modules, &file_list, &alias_map, &test_files);
+    for (sym, t) in links {
+        if !symbols[sym].tests.contains(&t) {
+            symbols[sym].tests.push(t);
+        }
+    }
 
     for (owner, h) in prop_hints {
         let have = &mut symbols[owner].prop_hints;
@@ -1993,7 +2100,7 @@ pub fn build(root: &Path) -> Graph {
         inc[e.to].push(ei);
     }
     file_list.sort();
-    Graph { symbols, edges, files, file_list, contexts, cycles, drills, out, inc }
+    Graph { symbols, edges, files, file_list, test_files, contexts, cycles, drills, out, inc }
 }
 
 #[cfg(test)]
@@ -2202,7 +2309,9 @@ mod tests {
     fn only_graph_inputs_count_as_changes() {
         let hit = |p: &str| affects_graph(Path::new(p));
         assert!(hit("src/App.tsx") && hit("C:/proj/src/a/b.js") && hit("tsconfig.json") && hit("web/jsconfig.json"));
-        assert!(!hit("README.md") && !hit("src/App.test.tsx") && !hit("src/types.d.ts") && !hit("package.json"));
+        // test files change which symbols count as tested
+        assert!(hit("src/App.test.tsx") && hit("src/__tests__/a.ts"));
+        assert!(!hit("README.md") && !hit("src/types.d.ts") && !hit("package.json"));
         assert!(!hit("node_modules/react/index.js") && !hit("C:/proj/dist/app.js") && !hit(".git/HEAD"));
     }
 
@@ -2427,5 +2536,74 @@ mod tests {
         assert_eq!(sym(&g, "Dash").drill_hints.len(), 0);
         assert_eq!(sym(&g, "Panel").drill_hints.len(), 1);
         assert_eq!(sym(&g, "Row").drill_hints.len(), 0);
+    }
+
+    fn tests_fixture() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tests"))
+    }
+
+    fn test_names(g: &Graph, name: &str) -> Vec<String> {
+        let i = g.symbols.iter().position(|s| s.name == name).unwrap_or_else(|| panic!("no symbol {name}"));
+        let mut v: Vec<String> = g.tests_of(i).iter().map(|&t| g.test_files[t].clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_files_are_found_but_not_parsed_as_source() {
+        let g = tests_fixture();
+        assert_eq!(
+            g.test_files,
+            ["Card.test.tsx", "__tests__/Button.test.tsx", "__tests__/helpers.tsx", "hooks/useCounter.spec.ts", "math.test.ts"]
+        );
+        // neither tests nor helpers inside `__tests__` become symbols or files of the graph
+        assert!(g.symbols.iter().all(|s| !s.file.contains("test") && !s.file.contains("spec") && s.name != "renderWithTheme"));
+        assert!(g.file_list.iter().all(|f| !f.contains("__tests__") && !f.contains(".test.") && !f.contains(".spec.")));
+    }
+
+    #[test]
+    fn imports_link_symbols_to_their_tests() {
+        let g = tests_fixture();
+        assert_eq!(test_names(&g, "Card"), ["Card.test.tsx"]);
+        // through a barrel, from a `__tests__` folder
+        assert_eq!(test_names(&g, "Button"), ["__tests__/Button.test.tsx"]);
+        // default import
+        assert_eq!(test_names(&g, "useCounter"), ["hooks/useCounter.spec.ts"]);
+        // `import * as math` covers every export of the file
+        assert_eq!(test_names(&g, "add"), ["math.test.ts"]);
+        assert_eq!(test_names(&g, "sub"), ["math.test.ts"]);
+        // a handler defined inside a tested component counts as tested
+        assert_eq!(test_names(&g, "onClick"), ["Card.test.tsx"]);
+    }
+
+    #[test]
+    fn untested_symbols_are_flagged() {
+        let g = tests_fixture();
+        let flagged: Vec<&str> = {
+            let mut v: Vec<&str> = (0..g.symbols.len()).filter(|&i| g.untested(i)).map(|i| g.symbols[i].name.as_str()).collect();
+            v.sort();
+            v
+        };
+        // imported by name only: its neighbours in the same file are not covered
+        assert_eq!(flagged, ["CardSkeleton", "IconButton", "Lonely"]);
+    }
+
+    #[test]
+    fn nothing_is_untested_in_a_project_without_tests() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/memo"));
+        assert!(g.test_files.is_empty());
+        assert!((0..g.symbols.len()).all(|i| !g.untested(i)));
+    }
+
+    #[test]
+    fn complex_react_reducer_test_is_linked() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        assert!(g.test_files.iter().any(|f| f.ends_with("boardReducer.test.ts")));
+        let reducer = idx(&g, "src/features/board/boardReducer.ts", "boardReducer");
+        assert!(g.tests_of(reducer).iter().any(|&t| g.test_files[t].ends_with("boardReducer.test.ts")));
     }
 }
