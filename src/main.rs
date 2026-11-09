@@ -870,6 +870,26 @@ impl GraphView {
         .detach();
     }
 
+    /// Save the drawn graph as one HTML page you can open anywhere and share.
+    fn export_html(&mut self, cx: &mut Context<Self>) {
+        let page = export::html(&self.drawn(), &folder_name(&self.root_path));
+        let rx = cx.prompt_for_new_path(&self.root_path, Some("react-graph.html"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let msg = match std::fs::write(&path, page) {
+                    Ok(()) => format!("Saved {}", prefs::display(&path)),
+                    Err(e) => format!("Could not save {}: {e}", prefs::display(&path)),
+                };
+                this.update(cx, |this, cx| {
+                    this.status = msg;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// Open the symbol's file at its line in VS Code; without the `code` command, in whatever
     /// the system opens that kind of file with.
     fn open_in_editor(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -5486,6 +5506,10 @@ impl Render for GraphView {
             buttons = buttons
                 .child(ghost_button("export-svg", "Export SVG").on_click(cx.listener(|this, _, _, cx| {
                     this.export_svg(cx);
+                    cx.notify();
+                })))
+                .child(ghost_button("export-html", "Export HTML").on_click(cx.listener(|this, _, _, cx| {
+                    this.export_html(cx);
                     cx.notify();
                 })))
                 .child(ghost_button("copy-mermaid", "Copy Mermaid").on_click(cx.listener(|this, _, _, cx| {
