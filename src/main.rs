@@ -59,6 +59,83 @@ const TITLE_BG: u32 = 0xf7f8fa;
 const TITLE_HOVER: u32 = 0xebecf0;
 const TB: f32 = 40.0;
 const ICON_FONT: &str = "Segoe Fluent Icons";
+const MAC: bool = cfg!(target_os = "macos");
+const UI_FONT: &str = if cfg!(windows) { "Segoe UI" } else { ".SystemUIFont" };
+const MONO_FONT: &str = if cfg!(windows) { "Consolas" } else if MAC { "Menlo" } else { "DejaVu Sans Mono" };
+
+/// Segoe Fluent Icons only ships with Windows; elsewhere the same icons come from bundled SVGs.
+/// `REACT_GRAPH_SVG_ICONS=1` uses the SVGs on Windows too (to check them without a Mac).
+fn svg_icons() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !cfg!(windows) || std::env::var_os("REACT_GRAPH_SVG_ICONS").is_some())
+}
+
+/// Bundled SVG for a Segoe Fluent Icons glyph.
+fn icon_svg(glyph: &str) -> &'static str {
+    match glyph {
+        "\u{E70D}" => "icons/chevron-down.svg",
+        "\u{E76C}" => "icons/chevron-right.svg",
+        "\u{E721}" => "icons/search.svg",
+        "\u{E73F}" => "icons/minimize-2.svg",
+        "\u{E7BA}" => "icons/triangle-alert.svg",
+        "\u{E81E}" => "icons/layers.svg",
+        "\u{E894}" => "icons/filter-x.svg",
+        "\u{E8A5}" => "icons/file.svg",
+        "\u{E8B7}" => "icons/folder.svg",
+        "\u{E8C8}" => "icons/copy.svg",
+        "\u{E945}" => "icons/zap.svg",
+        "\u{ED1A}" => "icons/eye-off.svg",
+        "\u{E706}" => "icons/sun.svg",
+        "\u{E708}" => "icons/moon.svg",
+        _ => "icons/x.svg",
+    }
+}
+
+/// An icon at `size` px. `color: None` takes the parent's text colour (hover included) where the
+/// platform allows it; SVG icons can't inherit, so they fall back to MUTED.
+fn icon(glyph: &'static str, size: f32, color: Option<u32>) -> gpui::AnyElement {
+    if svg_icons() {
+        gpui::svg()
+            .path(icon_svg(glyph))
+            .flex_shrink_0()
+            .size(px((size * 1.15).round()))
+            .text_color(rgb(color.unwrap_or(MUTED)))
+            .into_any_element()
+    } else {
+        div()
+            .flex_shrink_0()
+            .font_family(ICON_FONT)
+            .text_size(px(size))
+            .when_some(color, |d, c| d.text_color(rgb(c)))
+            .child(glyph)
+            .into_any_element()
+    }
+}
+
+macro_rules! bundled {
+    ($($name:literal),* $(,)?) => {
+        &[$((concat!("icons/", $name), include_bytes!(concat!("../assets/icons/", $name)) as &[u8])),*]
+    };
+}
+const ICONS: &[(&str, &[u8])] = bundled!(
+    "chevron-down.svg", "chevron-right.svg", "copy.svg", "eye-off.svg", "file.svg", "filter-x.svg", "folder.svg",
+    "layers.svg", "minimize-2.svg", "moon.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
+);
+
+/// Serves the bundled icons to gpui's `svg()` element.
+struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Ok(ICONS.iter().find(|(p, _)| *p == path).map(|(_, b)| std::borrow::Cow::Borrowed(*b)))
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        Ok(ICONS.iter().filter(|(p, _)| p.starts_with(path)).map(|(p, _)| gpui::SharedString::from(*p)).collect())
+    }
+}
+
+gpui::actions!(react_graph, [Quit]);
 
 static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -920,7 +997,7 @@ impl GraphView {
                                 .text_center()
                                 .text_xs()
                                 .truncate()
-                                .font_family("Consolas")
+                                .font_family(MONO_FONT)
                                 .text_color(rgb(color))
                                 .when(cur, |d| d.font_weight(gpui::FontWeight::BOLD))
                                 .child(label),
@@ -1230,7 +1307,7 @@ impl GraphView {
                     .flex_row()
                     .items_center()
                     .whitespace_nowrap()
-                    .font_family("Consolas")
+                    .font_family(MONO_FONT)
                     .text_size(px(12.5))
                     .text_color(rgb(0x1f2328))
                     .cursor_pointer()
@@ -1287,7 +1364,7 @@ impl GraphView {
             .flex_row()
             .items_center()
             .justify_between()
-            .child(div().text_xs().font_family("Consolas").text_color(rgb(MUTED)).child("compare"))
+            .child(div().text_xs().font_family(MONO_FONT).text_color(rgb(MUTED)).child("compare"))
             .child(
                 div()
                     .id("close-cmp")
@@ -1393,7 +1470,7 @@ impl GraphView {
                         .flex()
                         .flex_row()
                         .whitespace_nowrap()
-                        .font_family("Consolas")
+                        .font_family(MONO_FONT)
                         .text_size(px(12.5))
                         .text_color(rgb(0x1f2328))
                         .child(half(&rows.src_a, &rows.marks_a, r.a, ga))
@@ -1475,7 +1552,7 @@ impl GraphView {
                 .items_center()
                 .gap_x_1()
                 .text_xs()
-                .font_family("Consolas")
+                .font_family(MONO_FONT)
                 .child(p.a.clone())
                 .child(div().text_color(rgb(MUTED)).child("→"))
                 .child(p.b.clone())
@@ -2642,7 +2719,7 @@ fn dep_block(info: &DepInfo) -> Div {
                     .rounded(px(6.))
                     .bg(rgb(bg))
                     .when(d.origin == Origin::Outer, |c| c.border_1().border_dashed().border_color(rgb(0xcbd5e1)))
-                    .child(div().text_xs().font_family("Consolas").text_color(rgb(INK)).child(d.text.clone()))
+                    .child(div().text_xs().font_family(MONO_FONT).text_color(rgb(INK)).child(d.text.clone()))
                     .child(div().text_size(px(10.)).text_color(rgb(fg)).child(d.origin_label()))
             })));
         }
@@ -2808,7 +2885,7 @@ fn tip(title: impl Into<gpui::SharedString>, detail: Option<&'static str>) -> im
 }
 
 /// Square icon-only action button (tool window header, search field).
-fn tool_icon(id: &'static str, glyph: &'static str) -> Stateful<Div> {
+fn tool_icon(id: &'static str, glyph: &'static str, size: f32, color: Option<u32>) -> Stateful<Div> {
     div()
         .id(id)
         .flex_shrink_0()
@@ -2818,16 +2895,14 @@ fn tool_icon(id: &'static str, glyph: &'static str) -> Stateful<Div> {
         .flex()
         .items_center()
         .justify_center()
-        .font_family(ICON_FONT)
-        .text_size(px(12.))
         .text_color(rgb(MUTED))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(TITLE_HOVER)).text_color(rgb(INK)))
-        .child(glyph)
+        .child(icon(glyph, size, color))
 }
 
-fn folder_icon() -> Div {
-    div().flex_shrink_0().font_family(ICON_FONT).text_size(px(13.)).text_color(rgb(0x6c707e)).child("\u{E8B7}")
+fn folder_icon() -> gpui::AnyElement {
+    icon("\u{E8B7}", 13., Some(0x6c707e))
 }
 
 fn control_button(id: &'static str, label: &'static str, last: bool) -> Stateful<Div> {
@@ -3041,11 +3116,9 @@ impl GraphView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .font_family(ICON_FONT)
-                            .text_size(px(10.))
                             .text_color(rgb(0x9ca3af))
                             .hover(|st| st.bg(rgb(BORDER)).text_color(rgb(INK)))
-                            .child("\u{E711}")
+                            .child(icon("\u{E711}", 10., None))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.forget_recent(&gone_p);
@@ -3142,7 +3215,7 @@ impl GraphView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_popup(Popup::Project, cx)))
             .when(has, |d| d.child(badge(&name, 20.0)))
             .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(INK)).child(name))
-            .child(div().font_family(ICON_FONT).text_size(px(9.)).text_color(rgb(MUTED)).child("\u{E70D}"));
+            .child(icon("\u{E70D}", 9., Some(MUTED)));
         let theme = div()
             .id("theme-toggle")
             .flex_shrink_0()
@@ -3152,13 +3225,10 @@ impl GraphView {
             .items_center()
             .justify_center()
             .rounded(px(6.))
-            .font_family(ICON_FONT)
-            .text_size(px(15.))
-            .text_color(rgb(INK))
             .cursor_pointer()
             .hover(|st| st.bg(rgb(TITLE_HOVER)))
             // shows the mode a click switches to
-            .child(if dark() { "\u{E706}" } else { "\u{E708}" })
+            .child(icon(if dark() { "\u{E706}" } else { "\u{E708}" }, 15., Some(INK)))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.toggle_theme();
                 cx.notify();
@@ -3180,7 +3250,7 @@ impl GraphView {
                 })
                 .child(glyph)
         };
-        div()
+        let bar = div()
             .h(px(TB))
             .w_full()
             .flex_shrink_0()
@@ -3190,12 +3260,25 @@ impl GraphView {
             .bg(rgb(TITLE_BG))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(div().h_full().pl(px(12.)).pr(px(8.)).flex().items_center().window_control_area(gpui::WindowControlArea::Drag).child(logo(20.0)))
+            // macOS draws its own traffic lights at the top left (see `traffic_light_position`)
+            .child(
+                div()
+                    .h_full()
+                    .pl(px(if MAC { 80. } else { 12. }))
+                    .pr(px(8.))
+                    .flex()
+                    .items_center()
+                    .window_control_area(gpui::WindowControlArea::Drag)
+                    .child(logo(20.0)),
+            )
             .child(widget)
             .child(div().flex_1().h_full().window_control_area(gpui::WindowControlArea::Drag))
             .child(theme)
-            .child(div().w(px(8.)).h_full().window_control_area(gpui::WindowControlArea::Drag))
-            .child(win_btn(gpui::WindowControlArea::Min, "\u{E921}", false))
+            .child(div().w(px(8.)).h_full().window_control_area(gpui::WindowControlArea::Drag));
+        if MAC {
+            return bar;
+        }
+        bar.child(win_btn(gpui::WindowControlArea::Min, "\u{E921}", false))
             .child(win_btn(gpui::WindowControlArea::Max, if window.is_maximized() { "\u{E923}" } else { "\u{E922}" }, false))
             .child(win_btn(gpui::WindowControlArea::Close, "\u{E8BB}", true))
     }
@@ -3709,7 +3792,7 @@ impl Render for GraphView {
                         .child(
                             div()
                                 .text_size(px(10.0 * z))
-                                .font_family("Consolas")
+                                .font_family(MONO_FONT)
                                 .text_color(rgb(MUTED))
                                 .child(kind_name(s.kind)),
                         )
@@ -3720,7 +3803,7 @@ impl Render for GraphView {
                                 .rounded(px(4.0 * z))
                                 .bg(rgb(bg))
                                 .text_size(px(9.0 * z))
-                                .font_family("Consolas")
+                                .font_family(MONO_FONT)
                                 .text_color(rgb(fg))
                                 .child(w.label())
                         }))
@@ -3918,8 +4001,7 @@ impl Render for GraphView {
             .child(div().flex_1().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child("Project"));
         if ready && filtering {
             header = header.child(
-                tool_icon("tw-clear", "\u{E894}")
-                    .text_color(rgb(ACCENT))
+                tool_icon("tw-clear", "\u{E894}", 12., Some(ACCENT))
                     .tooltip(tip("Clear all filters", None))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.filters = Filters::default();
@@ -3930,7 +4012,7 @@ impl Render for GraphView {
         }
         if ready && !has_q && !filtering {
             header = header.child(
-                tool_icon("tw-collapse", "\u{E73F}").tooltip(tip("Collapse all folders", None)).on_click(cx.listener(
+                tool_icon("tw-collapse", "\u{E73F}", 12., None).tooltip(tip("Collapse all folders", None)).on_click(cx.listener(
                     |this, _, _, cx| {
                         this.open_dirs.clear();
                         cx.notify();
@@ -3955,14 +4037,7 @@ impl Render for GraphView {
             .border_1()
             .border_color(rgb(if has_q { ACCENT } else { 0xd3d5db }))
             .when(!has_q, |d| d.hover(|s| s.border_color(rgb(0xb4b8c1))))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .font_family(ICON_FONT)
-                    .text_size(px(12.))
-                    .text_color(rgb(if has_q { ACCENT } else { MUTED }))
-                    .child("\u{E721}"),
-            )
+            .child(icon("\u{E721}", 12., Some(if has_q { ACCENT } else { MUTED })))
             .child(
                 div()
                     .flex_1()
@@ -3974,10 +4049,9 @@ impl Render for GraphView {
             );
         if has_q {
             search = search.child(
-                tool_icon("search-clear", "\u{E711}")
+                tool_icon("search-clear", "\u{E711}", 9., None)
                     .w(px(20.))
                     .h(px(20.))
-                    .text_size(px(9.))
                     .tooltip(tip("Clear search", Some("Esc")))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.query.clear();
@@ -4029,13 +4103,13 @@ impl Render for GraphView {
                         })
                         .when_some(kind, |d, k| d.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(kind_color(k))))
                         .child(label)
-                        .tooltip(tip(tip_title, ki.map(|_| "Ctrl+click to combine kinds")))
+                        .tooltip(tip(tip_title, ki.map(|_| if MAC { "⌘-click to combine kinds" } else { "Ctrl+click to combine kinds" })))
                         .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                             let m = e.modifiers();
                             let ks = &mut this.filters.kinds;
                             match ki {
                                 None => *ks = [false; 3],
-                                Some(k) if m.control || m.shift => ks[k] = !ks[k],
+                                Some(k) if m.control || m.platform || m.shift => ks[k] = !ks[k],
                                 Some(k) => {
                                     let only = ks.iter().enumerate().all(|(j, &v)| v == (j == k));
                                     *ks = [false; 3];
@@ -4119,13 +4193,7 @@ impl Render for GraphView {
                         .cursor_pointer()
                         .when(on, |d| d.bg(tint(color, 0.14)).border_color(tint(color, 0.45)))
                         .when(!on, |d| d.border_color(gpui::transparent_black()).hover(|s| s.bg(rgb(TITLE_HOVER))))
-                        .child(
-                            div()
-                                .font_family(ICON_FONT)
-                                .text_size(px(12.))
-                                .text_color(rgb(if none { 0x9ca3af } else { color }))
-                                .child(glyph),
-                        )
+                        .child(icon(glyph, 12., Some(if none { 0x9ca3af } else { color })))
                         .child(
                             div()
                                 .text_xs()
@@ -4172,13 +4240,8 @@ impl Render for GraphView {
                         .gap(px(6.))
                         .text_xs()
                         .child(match kind {
-                            Some(k) => div().w(px(7.)).h(px(7.)).flex_shrink_0().rounded_full().bg(kind_color(k)),
-                            None => div()
-                                .flex_shrink_0()
-                                .font_family(ICON_FONT)
-                                .text_size(px(11.))
-                                .text_color(rgb(MUTED))
-                                .child("\u{E8A5}"),
+                            Some(k) => div().w(px(7.)).h(px(7.)).flex_shrink_0().rounded_full().bg(kind_color(k)).into_any_element(),
+                            None => icon("\u{E8A5}", 11., Some(MUTED)),
                         })
                         .child(
                             div()
@@ -4188,10 +4251,9 @@ impl Render for GraphView {
                                 .child(format!("In {name} · {size} symbol{}", if size == 1 { "" } else { "s" })),
                         )
                         .child(
-                            tool_icon("f-unscope", "\u{E711}")
+                            tool_icon("f-unscope", "\u{E711}", 8., None)
                                 .w(px(18.))
                                 .h(px(18.))
-                                .text_size(px(8.))
                                 .tooltip(tip("Search the whole project", None))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.widen_to_project();
@@ -4515,10 +4577,9 @@ impl Render for GraphView {
                 div()
                     .w(px(12.))
                     .flex_shrink_0()
-                    .font_family(ICON_FONT)
-                    .text_size(px(8.))
-                    .text_color(rgb(MUTED))
-                    .child(if open { "\u{E70D}" } else { "\u{E76C}" })
+                    .flex()
+                    .items_center()
+                    .child(icon(if open { "\u{E70D}" } else { "\u{E76C}" }, 8., Some(MUTED)))
             };
             let project = self
                 .root
@@ -4819,7 +4880,7 @@ impl Render for GraphView {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .font_family("Consolas")
+                                        .font_family(MONO_FONT)
                                         .text_color(rgb(MUTED))
                                         .child(kind_name(s.kind)),
                                 ),
@@ -4921,7 +4982,7 @@ impl Render for GraphView {
                                     .rounded(px(4.))
                                     .bg(rgb(bg))
                                     .text_xs()
-                                    .font_family("Consolas")
+                                    .font_family(MONO_FONT)
                                     .text_color(rgb(fg))
                                     .child(w.label()),
                             )
@@ -4963,7 +5024,7 @@ impl Render for GraphView {
                                     .child(
                                         div()
                                             .text_sm()
-                                            .font_family("Consolas")
+                                            .font_family(MONO_FONT)
                                             .text_color(kind_color(SymKind::Hook))
                                             .child(info.hook.clone()),
                                     )
@@ -4991,7 +5052,7 @@ impl Render for GraphView {
                             div()
                                 .mt_1()
                                 .text_xs()
-                                .font_family("Consolas")
+                                .font_family(MONO_FONT)
                                 .text_color(kind_color(o.kind))
                                 .child(format!("{} (inside)", o.name)),
                         );
@@ -5276,7 +5337,7 @@ impl Render for GraphView {
                                             .text_color(rgb(color))
                                             .child(badge),
                                     )
-                                    .child(div().text_xs().font_family("Consolas").text_color(rgb(MUTED)).child("source")),
+                                    .child(div().text_xs().font_family(MONO_FONT).text_color(rgb(MUTED)).child("source")),
                             )
                             .child(
                                 div()
@@ -5555,7 +5616,7 @@ impl Render for GraphView {
                                     div()
                                         .px(px(5.))
                                         .rounded(px(4.))
-                                        .font_family("Consolas")
+                                        .font_family(MONO_FONT)
                                         .when(top, |d| d.bg(rgb(ACCENT_100)).text_color(rgb(ACCENT)))
                                         .when(!top, |d| d.bg(rgb(0xf3f4f6)).text_color(rgb(INK)))
                                         .child(if again { format!("{} ↺", name(sym)) } else { name(sym) }),
@@ -5708,7 +5769,7 @@ impl Render for GraphView {
             .min_h(px(0.))
             .overflow_hidden()
             .bg(rgb(CANVAS))
-            .font_family("Segoe UI")
+            .font_family(UI_FONT)
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
@@ -5716,7 +5777,8 @@ impl Render for GraphView {
             )
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                 let k = &ev.keystroke;
-                if k.modifiers.control && !k.modifiers.alt && !k.modifiers.shift && k.key == "o" {
+                let cmd = if MAC { k.modifiers.platform } else { k.modifiers.control };
+                if cmd && !k.modifiers.alt && !k.modifiers.shift && k.key == "o" {
                     Self::prompt_open(cx);
                     return;
                 }
@@ -5823,7 +5885,7 @@ impl Render for GraphView {
             .size_full()
             .flex()
             .flex_col()
-            .font_family("Segoe UI")
+            .font_family(UI_FONT)
             .text_color(rgb(INK))
             .bg(rgb(CANVAS))
             .child(self.title_bar(window, cx))
@@ -5834,7 +5896,17 @@ impl Render for GraphView {
 fn main() {
     let root = std::env::args().nth(1).map(PathBuf::from);
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(Assets).run(move |cx: &mut App| {
+        // macOS: an app menu with Quit (⌘Q), and quit when the window closes
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![gpui::Menu { name: "React Graph".into(), items: vec![gpui::MenuItem::action("Quit React Graph", Quit)] }]);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
@@ -5843,7 +5915,8 @@ fn main() {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("React Graph".into()),
                     appears_transparent: true,
-                    ..Default::default()
+                    // centre macOS's traffic lights in the 40px title bar
+                    traffic_light_position: Some(point(px(14.), px(14.))),
                 }),
                 app_id: Some("react-graph".into()),
                 ..Default::default()

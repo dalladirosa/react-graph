@@ -1,7 +1,9 @@
 name: Release
 
-# Push a tag like `v0.1.1` to build the Windows executable + installer and publish a GitHub release.
-# Can also be started by hand from the Actions tab (it then only uploads the builds as an artifact).
+# Push a tag like `v0.2.0` to build Windows (installer + portable zip) and macOS Apple Silicon (.dmg)
+# and publish them as a GitHub release.
+# Can also be started by hand from the Actions tab: it then builds everything and attaches the files
+# to the run (plus a screenshot of the Mac app starting up), without publishing a release.
 on:
   push:
     tags: ["v*"]
@@ -53,16 +55,74 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: react-graph-windows-x64
+          name: windows-x64
           path: |
-            dist/*.exe
+            dist/*-setup.exe
             dist/*.zip
 
+  macos:
+    runs-on: macos-15 # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/* && "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Package
+        run: |
+          chmod +x installer/macos/bundle.sh
+          installer/macos/bundle.sh "$VERSION" arm64
+          ls -la dist
+
+      # Start the bundled app on a sample project and capture the screen, to see that it really runs.
+      - name: Smoke test
+        continue-on-error: true
+        run: |
+          "dist/React Graph.app/Contents/MacOS/react-graph" "$PWD/tests/fixtures/memo" &
+          pid=$!
+          sleep 15
+          screencapture -x dist/macos-smoke.png || true
+          if kill -0 "$pid" 2>/dev/null; then echo "app is running"; kill "$pid"; else echo "::warning::app exited early"; exit 1; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: |
+            dist/*.dmg
+            dist/macos-smoke.png
+          if-no-files-found: warn
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/react-graph-${{ env.VERSION }}-setup.exe
-            dist/react-graph-${{ env.VERSION }}-windows-x64-portable.zip
+            dist/*-setup.exe
+            dist/*-portable.zip
+            dist/*.dmg
           generate_release_notes: true
