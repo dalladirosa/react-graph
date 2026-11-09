@@ -1,7 +1,7 @@
 name: Release
 
-# Push a tag like `v0.1.0` to build the Windows executable and publish a GitHub release.
-# Can also be started by hand from the Actions tab (it then only uploads the build as an artifact).
+# Push a tag like `v0.1.1` to build the Windows executable + installer and publish a GitHub release.
+# Can also be started by hand from the Actions tab (it then only uploads the builds as an artifact).
 on:
   push:
     tags: ["v*"]
@@ -16,12 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check tag matches Cargo.toml version
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Read version
         shell: bash
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/* && "v$version" != "$GITHUB_REF_NAME" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
@@ -33,27 +33,36 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after install" }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Package
         shell: pwsh
         run: |
-          $name = "react-graph-${{ github.ref_name }}-windows-x64"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/react-graph.exe dist/react-graph.exe
-          Compress-Archive -Path dist/react-graph.exe -DestinationPath "$name.zip"
-          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Compress-Archive -Path dist/react-graph.exe -DestinationPath "dist/react-graph-$env:VERSION-windows-x64-portable.zip"
+          & $env:ISCC /Q "/DAppVersion=$env:VERSION" installer/react-graph.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: react-graph-windows-x64
           path: |
-            dist/react-graph.exe
-            ${{ env.ASSET }}
+            dist/*.exe
+            dist/*.zip
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/react-graph.exe
-            ${{ env.ASSET }}
+            dist/react-graph-${{ env.VERSION }}-setup.exe
+            dist/react-graph-${{ env.VERSION }}-windows-x64-portable.zip
           generate_release_notes: true
