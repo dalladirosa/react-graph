@@ -8,6 +8,8 @@ use crate::drill::{self, DrillHint};
 use crate::cover;
 
 use crate::lint::{self, LintHint};
+
+use crate::data::DataUse;
 use crate::similar::{self, Shape};
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -241,6 +243,9 @@ pub struct Symbol {
 
     /// rules of React broken here: hooks out of order, effects without cleanup, derived state, missing keys
     pub lint_hints: Vec<LintHint>,
+
+    /// HTTP calls, data-fetching hooks and stores used directly in this symbol
+    pub data: Vec<DataUse>,
     /// byte range of the function node in its file (what `similar` fingerprints), for side-by-side compare
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
@@ -296,6 +301,9 @@ pub struct Edge {
     pub route: bool,
 }
 
+/// How many calls away `Graph::data_of` looks for data access.
+const DATA_DEPTH: usize = 4;
+
 /// A `createContext` declaration.
 #[derive(Clone, Debug)]
 pub struct ContextDecl {
@@ -341,6 +349,28 @@ impl Graph {
     /// A top-level symbol that no test file imports. Never true when the project has no tests at all.
     pub fn untested(&self, i: usize) -> bool {
         !self.test_files.is_empty() && self.symbols[i].parent.is_none() && self.symbols[i].tests.is_empty()
+    }
+
+    /// What `i` reaches out to: its own data uses first, then those of the hooks and functions it
+    /// calls (up to `DATA_DEPTH` calls away), each with the first callee that leads to it.
+    pub fn data_of(&self, i: usize) -> Vec<(DataUse, Option<usize>)> {
+        let mut out: Vec<(DataUse, Option<usize>)> = self.symbols[i].data.iter().map(|d| (d.clone(), None)).collect();
+        let mut seen = HashSet::from([i]);
+        // (symbol, depth, first callee on the way)
+        let mut queue: std::collections::VecDeque<(usize, usize, Option<usize>)> = std::collections::VecDeque::from([(i, 0, None)]);
+        while let Some((n, depth, via)) = queue.pop_front() {
+            if depth >= DATA_DEPTH {
+                continue;
+            }
+            for e in self.out_edges(n).filter(|e| e.kind == EdgeKind::Calls || (e.kind == EdgeKind::Defines && depth == 0)) {
+                if seen.insert(e.to) {
+                    let first = via.or(Some(e.to));
+                    out.extend(self.symbols[e.to].data.iter().map(|d| (d.clone(), first)));
+                    queue.push_back((e.to, depth + 1, first));
+                }
+            }
+        }
+        out
     }
     /// "renders", "calls", ... or "context · ThemeContext"
     pub fn edge_label(&self, e: &Edge) -> String {
@@ -1258,6 +1288,13 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                 let hints = lint::missing_key(node, cx.src);
                 cx.symbols[owner].lint_hints.extend(hints);
             }
+
+            // fetch(...), axios.get(...), useQuery(...), useSelector(...)
+            if let Some(owner) = owner {
+                if let Some(u) = crate::data::uses(node, cx.src) {
+                    cx.symbols[owner].data.push(u);
+                }
+            }
             // useContext(Ctx) / use(Ctx)
             if let (Some(owner), Some(h)) = (owner, callee) {
                 if matches!(h, "useContext" | "use") {
@@ -1323,6 +1360,8 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         cover_hints: Vec::new(),
 
         lint_hints: Vec::new(),
+
+        data: Vec::new(),
         func: None,
         shape: Shape::default(),
         forwards: None,
@@ -3109,5 +3148,72 @@ export function Oops() { return <i />; }
         // TaskDetailsDrawer's draft (re-synced by an effect, but also typed into) is not derived state
         let hits = lint_hits(&g);
         assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    fn data_fixture() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/data"))
+    }
+
+    fn own_data(g: &Graph, name: &str) -> Vec<String> {
+        sym(g, name).data.iter().map(|d| format!("{}:{}", d.kind.label(), d.label)).collect()
+    }
+
+    #[test]
+    fn http_calls_are_found_with_method_and_path() {
+        let g = data_fixture();
+        assert_eq!(own_data(&g, "getProducts"), ["http:GET /api/products"]);
+        // template literals keep the path, `${}` becomes `{}`; the method is upper-cased
+        assert_eq!(own_data(&g, "createOrder"), ["http:POST /api/orders/{}"]);
+        assert_eq!(own_data(&g, "loadUser"), ["http:GET /api/users/{}"]);
+        assert_eq!(own_data(&g, "lookup"), ["http:GET (dynamic url)"]);
+        assert!(own_data(&g, "cached").is_empty(), "Map.get is not a request");
+    }
+
+    #[test]
+    fn query_and_store_hooks_are_found() {
+        let g = data_fixture();
+        assert_eq!(own_data(&g, "useTodos"), ["query:todos"]);
+        assert_eq!(own_data(&g, "useAddTodo"), ["query:mutation: mutation"]);
+        assert_eq!(own_data(&g, "Cart"), ["store:redux", "store:redux", "store:useCartStore"]);
+        assert!(own_data(&g, "Plain").is_empty());
+    }
+
+    #[test]
+    fn data_reaches_through_calls_and_nested_functions() {
+        let g = data_fixture();
+        let cart = idx(&g, "Cart.tsx", "Cart");
+        let all: Vec<(String, Option<String>)> = g
+            .data_of(cart)
+            .into_iter()
+            .map(|(d, via)| (d.label, via.map(|v| g.symbols[v].name.clone())))
+            .collect();
+        let has = |label: &str, via: Option<&str>| all.iter().any(|(l, v)| l == label && v.as_deref() == via);
+        assert!(has("redux", None));
+        // useDeep -> useTodos -> useQuery(["todos"]): found two calls away, through the first callee
+        assert!(has("todos", Some("useDeep")), "{all:?}");
+        // the nested `refresh` is defined in Cart, and calls getProducts / loadUser
+        assert!(has("GET /api/products", Some("refresh")), "{all:?}");
+        assert!(has("GET /api/users/{}", Some("refresh")), "{all:?}");
+        assert!(g.data_of(idx(&g, "Plain.tsx", "Plain")).is_empty());
+    }
+
+    #[test]
+    fn data_uses_have_their_line() {
+        let g = data_fixture();
+        assert_eq!(sym(&g, "getProducts").data[0].line, 4);
+        assert_eq!(sym(&g, "useTodos").data[0].line, 5);
+    }
+
+    #[test]
+    fn complex_react_data_access_is_found() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        // nothing may panic or produce an empty label
+        for s in &g.symbols {
+            assert!(s.data.iter().all(|d| !d.label.is_empty()));
+        }
     }
 }

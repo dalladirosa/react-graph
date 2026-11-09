@@ -6,6 +6,8 @@ mod compare;
 mod drill;
 
 mod cover;
+
+mod data;
 mod export;
 mod flow;
 mod graph;
@@ -95,6 +97,8 @@ fn icon_svg(glyph: &str) -> &'static str {
         "\u{E945}" => "icons/zap.svg",
         "\u{E8EE}" => "icons/repeat.svg",
         "\u{E783}" => "icons/flask-conical-off.svg",
+
+        "\u{E774}" => "icons/database.svg",
         "\u{ED1A}" => "icons/eye-off.svg",
         "\u{E706}" => "icons/sun.svg",
         "\u{E708}" => "icons/moon.svg",
@@ -129,7 +133,7 @@ macro_rules! bundled {
     };
 }
 const ICONS: &[(&str, &[u8])] = bundled!(
-    "chevron-down.svg", "chevron-right.svg", "copy.svg", "eye-off.svg", "file.svg", "filter-x.svg",
+    "chevron-down.svg", "chevron-right.svg", "copy.svg", "database.svg", "eye-off.svg", "file.svg", "filter-x.svg",
     "flask-conical-off.svg", "folder.svg", "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
 );
 
@@ -409,13 +413,16 @@ struct Filters {
     cycle: bool,
     /// top-level symbol that no test file imports
     untested: bool,
+
+    /// calls out to an API, a data-fetching hook or a store itself
+    data: bool,
     /// Component, Hook, Function
     kinds: [bool; 3],
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.untested || self.kinds.iter().any(|&k| k)
+        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.untested || self.data || self.kinds.iter().any(|&k| k)
     }
 }
 
@@ -2333,6 +2340,8 @@ impl GraphView {
             && (!f.unused || self.is_unused(i))
             && (!f.cycle || s.cycle.is_some())
             && (!f.untested || self.graph.untested(i))
+
+            && (!f.data || !s.data.is_empty())
     }
 
     /// What the canvas starts from while filtering: every match, and every card on a path to one
@@ -3230,6 +3239,18 @@ fn kind_name(k: SymKind) -> &'static str {
 /// text / background of the `lazy` badge (a code-split chunk)
 const LAZY_FG: u32 = 0x6d28d9;
 const LAZY_BG: u32 = 0xede9fe;
+
+/// text / background of the `data` badge and the Data filter
+const DATA_FG: u32 = 0x0369a1;
+const DATA_BG: u32 = 0xe0f2fe;
+
+fn data_color(k: data::DataKind) -> u32 {
+    match k {
+        data::DataKind::Http => 0x0369a1,
+        data::DataKind::Query => 0x7e22ce,
+        data::DataKind::Store => 0xb45309,
+    }
+}
 
 /// (text, background) for a wrapper badge
 fn wrap_colors(w: Wrap) -> (u32, u32) {
@@ -4388,6 +4409,19 @@ impl Render for GraphView {
                                     .child("lazy"),
                             )
                         })
+
+                        .when(!s.data.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(DATA_BG))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(DATA_FG))
+                                    .child("data"),
+                            )
+                        })
                         .when(warns > 0 || dup.is_some(), |d| d.child(div().flex_1()))
                         .when_some(dup, |d, score| {
                             d.child(
@@ -4705,7 +4739,7 @@ impl Render for GraphView {
             side = side.child(tabs);
 
             type Toggle = fn(&mut Filters);
-            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 7] = [
+            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 8] = [
                 (
                     "f-dup",
                     "\u{E8C8}",
@@ -4775,6 +4809,17 @@ impl Render for GraphView {
                     f.untested,
                     0x6d28d9,
                     |f| f.untested = !f.untested,
+                ),
+
+                (
+                    "f-data",
+                    "\u{E774}",
+                    "Data",
+                    "Calls an API (fetch, axios), a data-fetching hook (useQuery, useSWR) or a store (redux, zustand, jotai) itself",
+                    count(&|i| !g.symbols[i].data.is_empty()),
+                    f.data,
+                    DATA_FG,
+                    |f| f.data = !f.data,
                 ),
             ];
             let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().flex_wrap().items_center().gap(px(2.));
@@ -6028,6 +6073,57 @@ impl Render for GraphView {
                             .child(div().text_xs().text_color(rgb(0x6d28d9)).child("\u{2197}"))
                             .child(div().text_sm().child(name))
                             .child(div().min_w(px(0.)).overflow_hidden().text_xs().text_color(rgb(MUTED)).child(dir)),
+                    );
+                }
+            }
+
+            // what it reaches out to: its own calls, and those of the hooks and functions it calls
+            let data_uses = self.graph.data_of(sel);
+            if !data_uses.is_empty() {
+                p = p.child(section("Data"));
+                for (n, (u, via)) in data_uses.into_iter().take(30).enumerate() {
+                    let (line, via_name) = (u.line, via.map(|v| self.graph.symbols[v].name.clone()));
+                    let color = data_color(u.kind);
+                    p = p.child(
+                        div()
+                            .id(("data-use", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match via {
+                                    Some(v) => this.reveal(v),
+                                    None => {
+                                        let sym = &this.graph.symbols[sel];
+                                        let (file, start) = (sym.file.clone(), sym.line);
+                                        this.source_tab = true;
+                                        this.ensure_code(&file, start);
+                                        this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(tint(color, 0.12))
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(color))
+                                    .child(u.kind.label()),
+                            )
+                            .child(div().min_w(px(0.)).overflow_hidden().text_sm().font_family(MONO_FONT).child(u.label.clone()))
+                            .child(div().flex_shrink_0().text_xs().text_color(rgb(MUTED)).child(match via_name {
+                                Some(v) => format!("via {v}"),
+                                None => format!("line {line}"),
+                            })),
                     );
                 }
             }

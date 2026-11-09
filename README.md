@@ -21,6 +21,8 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
   - **Memoized:** wrapped in `memo`, `useCallback` or `useMemo`
   - **Cycles:** components or functions that render or call each other in a loop (A → B → A). Self-recursion doesn't count.
   - **No tests:** no test file imports it. Test files are `*.test.*`, `*.spec.*` and anything in a `__tests__` folder; imports through barrels and path aliases count, and `import * as x` covers the whole file. Only top-level symbols are flagged, and the filter stays empty in a project with no tests. Select a symbol to see the tests that import it under **Tests**, and click one to open it in your editor.
+
+  - **Data:** calls out to an API (`fetch`, `axios.get(...)`), a data-fetching hook (`useQuery`, `useSWR`, `useMutation`) or a store (redux, zustand `use...Store`, jotai, recoil) itself. Cards get a `data` badge, and the detail panel lists each call with its method and path (`POST /api/orders/{}`), including those made by the hooks and functions the symbol calls ("via useTodos"). Detected by well-known names only.
 - **Compare.** Shows two similar symbols side by side, with the differing tokens highlighted.
 - **Play flow.** Animates a trace from any symbol, either level by level ("waves") or in call-and-return order, and can also show it as a sequence diagram.
 - **Path finder.** Right-click a card and choose **Find path from here…**, then right-click another card and choose **Find path to here**. The shortest chain of renders and calls between them is drawn, lit up, with everything else faded. If the second card doesn't lead to the first, the other direction is tried. Esc clears it.
