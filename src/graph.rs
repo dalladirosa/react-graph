@@ -1126,7 +1126,9 @@ fn enter_fn(id: usize, func: Node, body: Node, cx: &mut Ctx) {
         let scope = build_scope(func, kind, cx.src);
         if kind == SymKind::Component {
             let names: HashSet<String> = scope.bindings.keys().cloned().collect();
-            cx.symbols[id].forwards = Some(drill::analyze(func, body, &names, cx.src));
+            // `const C = (props) => ...` is entered with the function itself as its body: the parameters aren't reads
+            let real_body = func.child_by_field_name("body").unwrap_or(body);
+            cx.symbols[id].forwards = Some(drill::analyze(func, real_body, &names, cx.src));
         }
         cx.scopes.push(scope);
     }
@@ -2414,5 +2416,16 @@ mod tests {
         for c in &g.drills {
             assert!(c.through.len() >= drill::MIN_THROUGH);
         }
+    }
+
+    #[test]
+    fn arrow_function_components_drill_too() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drilling_arrow"));
+        // `(props) => <Table items={props.items} />`, with and without a block body
+        assert_eq!(g.drills.len(), 1, "{:?}", g.drills);
+        assert_eq!(drill_names(&g, &g.drills[0]), ["Panel", "Table"]);
+        assert_eq!(sym(&g, "Dash").drill_hints.len(), 0);
+        assert_eq!(sym(&g, "Panel").drill_hints.len(), 1);
+        assert_eq!(sym(&g, "Row").drill_hints.len(), 0);
     }
 }
