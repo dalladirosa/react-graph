@@ -141,6 +141,44 @@ pub struct Hint {
     pub text: String,
 }
 
+/// `<Card onSelect={() => ...} />` where `Card` is wrapped in `memo`: the prop is a new value on
+/// every render, so the memo never gets to skip the re-render.
+#[derive(Clone, Debug)]
+pub struct PropHint {
+    /// the memo component receiving the prop
+    pub child: usize,
+    pub prop: String,
+    pub text: String,
+    /// 1-based line of the prop
+    pub line: usize,
+}
+
+/// A JSX prop whose value is created anew on every render (not yet matched to a memo component).
+struct UnstableProp {
+    prop: String,
+    /// "object", "array", "function", "element" or "instance"
+    what: &'static str,
+    /// the render-body variable holding it, for `style={style}`; None for an inline literal
+    via: Option<String>,
+    line: usize,
+}
+
+impl UnstableProp {
+    fn hint(&self, child: &str, id: usize) -> PropHint {
+        let (prop, what) = (&self.prop, self.what);
+        let fix = if what == "function" { "useCallback" } else { "useMemo" };
+        let text = match &self.via {
+            None => format!(
+                "`{child}` is wrapped in memo, but `{prop}` gets a new {what} on every render, so memo never skips it. Hoist it out of the component or wrap it in {fix}."
+            ),
+            Some(n) => format!(
+                "`{child}` is wrapped in memo, but `{prop}={{{n}}}` passes `{n}`, a new {what} created in the render body on every render, so memo never skips it. Wrap `{n}` in {fix}."
+            ),
+        };
+        PropHint { child: id, prop: prop.clone(), text, line: self.line }
+    }
+}
+
 /// A hook call that takes a dependency array.
 #[derive(Clone, Debug)]
 pub struct DepInfo {
@@ -173,6 +211,8 @@ pub struct Symbol {
     pub deps: Option<DepInfo>,
     /// other dependency-taking hooks called directly in this symbol (`useEffect`, ...)
     pub dep_hooks: Vec<DepInfo>,
+    /// props this component passes to a `memo` component that are new on every render
+    pub prop_hints: Vec<PropHint>,
     /// binds a computed value, not a function: `const rows = useMemo(() => filter(...), deps)`
     pub is_value: bool,
     /// other symbols of the same kind with an identical or near-identical body, best match first
@@ -199,10 +239,11 @@ impl Symbol {
     pub fn is_memoized(&self) -> bool {
         !self.wraps.is_empty() && self.wraps.iter().any(|w| *w != Wrap::ForwardRef)
     }
-    /// warnings on this symbol's own deps and the hooks it calls
+    /// warnings on this symbol's own deps and the hooks it calls, plus props that defeat a memo child
     pub fn warnings(&self) -> usize {
         self.deps.as_ref().map_or(0, |d| d.warnings())
             + self.dep_hooks.iter().map(|d| d.warnings()).sum::<usize>()
+            + self.prop_hints.len()
     }
 }
 
@@ -269,6 +310,8 @@ struct RawRef {
     via: Option<String>,
     /// For handlers: the prop is named like an event handler (`onClick`, `onSave`, ...).
     event_prop: bool,
+    /// For renders: props with a value that is new on every render
+    unstable: Vec<UnstableProp>,
 }
 
 /// `<Ctx.Provider>` / `useContext(Ctx)`: resolved to a `createContext` once all files are known.
@@ -746,6 +789,50 @@ fn text<'a>(n: Node, src: &'a str) -> &'a str {
     n.utf8_text(src.as_bytes()).unwrap_or("")
 }
 
+/// Props of a JSX element whose value is a new object / array / function / element on every
+/// render: written inline (`style={{ ... }}`) or bound so in the render body (`style={style}`
+/// after `const style = { ... }`). `key` and `ref` never reach the component as props.
+fn unstable_props(el: Node, scopes: &[Scope], src: &str) -> Vec<UnstableProp> {
+    let mut out = Vec::new();
+    let mut c = el.walk();
+    for a in el.children(&mut c).filter(|a| a.kind() == "jsx_attribute") {
+        let Some(prop) = a.named_child(0).filter(|p| p.kind() == "property_identifier").map(|p| text(p, src)) else {
+            continue;
+        };
+        if matches!(prop, "key" | "ref") {
+            continue;
+        }
+        let mut c2 = a.walk();
+        let Some(e) = a.children(&mut c2).find(|k| k.kind() == "jsx_expression") else { continue };
+        if e.named_child_count() != 1 {
+            continue;
+        }
+        let v = strip_expr(e.named_child(0).unwrap());
+        let (what, via) = match v.kind() {
+            "object" => ("object", None),
+            "array" => ("array", None),
+            "arrow_function" | "function_expression" | "function" => ("function", None),
+            "jsx_element" | "jsx_self_closing_element" | "jsx_fragment" => ("element", None),
+            "identifier" => match lookup(scopes, text(v, src)) {
+                Some((Origin::Unstable, Some(d))) => {
+                    let what = match d.as_str() {
+                        "object" => "object",
+                        "array" => "array",
+                        "function" => "function",
+                        "JSX element" => "element",
+                        _ => "instance",
+                    };
+                    (what, Some(text(v, src).to_string()))
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
+        out.push(UnstableProp { prop: prop.to_string(), what, via, line: a.start_position().row + 1 });
+    }
+    out
+}
+
 /// An object property that puts a component on a route (react-router and similar):
 /// `element: <Home />`, `errorElement: <NotFound />`, `Component: Home`, `ErrorBoundary: NotFound`.
 /// Returns the key and the value node (a JSX element, or an uppercase identifier).
@@ -866,6 +953,7 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         line: node.start_position().row + 1,
                         via: None,
                         event_prop: false,
+                        unstable: Vec::new(),
                     });
                 }
             }
@@ -904,6 +992,7 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         line: node.start_position().row + 1,
                         via: None,
                         event_prop: false,
+                        unstable: unstable_props(node, &cx.scopes, cx.src),
                     });
                     // onClick={handleAdd} => <Name> receives handleAdd
                     let mut c = node.walk();
@@ -926,6 +1015,7 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                                         line: a.start_position().row + 1,
                                         via: Some(n.to_string()),
                                         event_prop,
+                                        unstable: Vec::new(),
                                     });
                                 }
                             }
@@ -975,6 +1065,7 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         line: node.start_position().row + 1,
                         via: None,
                         event_prop: false,
+                        unstable: Vec::new(),
                     });
                 }
             }
@@ -999,6 +1090,7 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         wraps: Vec::new(),
         deps: None,
         dep_hooks: Vec::new(),
+        prop_hints: Vec::new(),
         is_value: false,
         similar: Vec::new(),
         cycle: None,
@@ -1751,6 +1843,7 @@ pub fn build(root: &Path) -> Graph {
     let resolver = Resolver::new(&symbols, &modules, &file_list, &alias_map);
 
     let mut edges: Vec<Edge> = Vec::new();
+    let mut prop_hints: Vec<(usize, PropHint)> = Vec::new();
     let mut seen: HashSet<(usize, usize, EdgeKind)> = HashSet::new();
     // refs arrive in source order per file, so the first one kept is the first use
     let mut push = |from: usize, to: usize, kind: EdgeKind, line: usize, site: usize, edges: &mut Vec<Edge>| {
@@ -1807,6 +1900,10 @@ pub fn build(root: &Path) -> Graph {
             (EdgeKind::Renders, _) => continue,
             (k, _) => k,
         };
+        // memo only helps when the props keep their identity
+        if kind == EdgeKind::Renders && t != owner && symbols[t].wraps.contains(&Wrap::Memo) {
+            prop_hints.extend(r.unstable.iter().map(|u| (owner, u.hint(&symbols[t].name, t))));
+        }
         let from = match &r.via {
             None => owner,
             Some(v) => {
@@ -1832,6 +1929,13 @@ pub fn build(root: &Path) -> Graph {
     }
 
     let contexts = add_context_edges(&symbols, &modules, &resolver, &ctx_refs, &mut edges);
+
+    for (owner, h) in prop_hints {
+        let have = &mut symbols[owner].prop_hints;
+        if !have.iter().any(|x| (x.child, &x.prop, x.line) == (h.child, &h.prop, h.line)) {
+            have.push(h);
+        }
+    }
 
     // loops of renders / calls; a symbol calling itself is plain recursion and doesn't count
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); symbols.len()];
@@ -2064,6 +2168,25 @@ mod tests {
         assert!(hit("src/App.tsx") && hit("C:/proj/src/a/b.js") && hit("tsconfig.json") && hit("web/jsconfig.json"));
         assert!(!hit("README.md") && !hit("src/App.test.tsx") && !hit("src/types.d.ts") && !hit("package.json"));
         assert!(!hit("node_modules/react/index.js") && !hit("C:/proj/dist/app.js") && !hit(".git/HEAD"));
+    }
+
+    #[test]
+    fn unstable_props_to_memo_children_are_flagged() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/memoprops"));
+        let list = &g.symbols[idx(&g, "List.tsx", "List")];
+        let hints: Vec<(&str, usize)> = list.prop_hints.iter().map(|h| (h.prop.as_str(), h.line)).collect();
+        // inline function, `style` (object from the render body), `select` (function), inline array;
+        // useCallback / useMemo values and the non-memo <Plain> are fine
+        assert_eq!(hints, [("onSelect", 12), ("style", 13), ("onSelect", 14), ("options", 16)]);
+        assert_eq!(list.warnings(), 4);
+        let card = idx(&g, "Card.tsx", "Card");
+        assert!(list.prop_hints.iter().all(|h| h.child == card));
+        let texts: Vec<&str> = list.prop_hints.iter().map(|h| h.text.as_str()).collect();
+        assert!(texts[0].contains("`Card` is wrapped in memo") && texts[0].contains("useCallback"), "{}", texts[0]);
+        assert!(texts[1].contains("`style={style}`") && texts[1].contains("new object") && texts[1].contains("useMemo"), "{}", texts[1]);
+        assert!(texts[3].contains("new array"), "{}", texts[3]);
+        // nothing else is flagged
+        assert_eq!(g.symbols.iter().map(|s| s.prop_hints.len()).sum::<usize>(), 4);
     }
 
     #[test]

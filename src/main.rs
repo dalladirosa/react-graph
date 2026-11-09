@@ -4409,7 +4409,7 @@ impl Render for GraphView {
                     "f-warn",
                     "\u{E7BA}",
                     "Warnings",
-                    "Dependency warnings on its own deps or the hooks it calls",
+                    "Dependency warnings on its own deps or the hooks it calls, or props that defeat a memo child",
                     count(&|i| g.symbols[i].warnings() > 0),
                     f.warn,
                     0xb45309,
@@ -5314,6 +5314,48 @@ impl Render for GraphView {
                 }
             }
 
+            if !s.prop_hints.is_empty() {
+                p = p.child(section("Props defeating memo"));
+                for (n, h) in s.prop_hints.iter().enumerate() {
+                    let (line, child) = (h.line, h.child);
+                    p = p.child(
+                        div()
+                            .id(("prop-hint", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                                if e.modifiers().control || e.modifiers().platform {
+                                    this.reveal(child);
+                                } else {
+                                    let sym = &this.graph.symbols[sel];
+                                    let (file, start) = (sym.file.clone(), sym.line);
+                                    this.source_tab = true;
+                                    this.ensure_code(&file, start);
+                                    this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                }
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                                    .child(div().text_sm().font_family(MONO_FONT).child(h.prop.clone()))
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!("line {line}"))),
+                            )
+                            .child(div().pl(px(15.)).min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
+
             let mut dups = Vec::new();
             self.similar_within(sel, &mut dups);
             if !dups.is_empty() {
@@ -5417,6 +5459,7 @@ impl Render for GraphView {
                         .flat_map(|d| d.hints.iter())
                         .find(|h| h.warn)
                         .map(|h| h.text.clone())
+                        .or_else(|| t.prop_hints.first().map(|h| h.text.clone()))
                         .unwrap_or_default();
                     p = p.child(
                         div()

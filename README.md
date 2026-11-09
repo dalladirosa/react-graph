@@ -16,7 +16,7 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
 - **Code-health filters.** Each filter shows how many symbols match:
   - **Duplicates:** similar code exists elsewhere (structural fingerprints, so renamed copies still match)
   - **Identical:** an exact structural twin exists, where only names or literals differ
-  - **Warnings:** hook dependency problems
+  - **Warnings:** hook dependency problems, and props that defeat a `memo` child (an inline `{}`, `[]` or `() => …`, or a value built in the render body, passed to a component wrapped in `memo`)
   - **Unused:** nothing renders, calls or passes it
   - **Memoized:** wrapped in `memo`, `useCallback` or `useMemo`
   - **Cycles:** components or functions that render or call each other in a loop (A → B → A). Self-recursion doesn't count.
