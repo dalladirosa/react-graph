@@ -255,8 +255,34 @@ pub fn annotate(root: &Path, symbols: &mut [Symbol], edges: &mut Vec<Edge>, file
                 }
             }
         }
+        // only code the App Router can reach is a Server or Client Component: files in `pages/`, dead code
+        // and helpers nobody renders from `app/` say nothing about where they run (unless they say so themselves)
+        let mut in_app = vec![false; n];
+        let mut reach: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for e in edges.iter().filter(|e| matches!(e.kind, EdgeKind::Renders | EdgeKind::Calls | EdgeKind::Handler | EdgeKind::Defines)) {
+            reach[e.from].push(e.to);
+        }
+        let mut queue: VecDeque<usize> = entries
+            .iter()
+            .filter(|(i, _)| symbols[*i].file.starts_with(&format!("{app}/")))
+            .map(|(i, _)| *i)
+            .collect();
+        for &i in &queue {
+            in_app[i] = true;
+        }
+        while let Some(i) = queue.pop_front() {
+            for &t in &reach[i] {
+                if !std::mem::replace(&mut in_app[t], true) {
+                    queue.push_back(t);
+                }
+            }
+        }
         let client_only: HashSet<&str> = CLIENT_HOOKS.iter().copied().collect();
         for i in 0..n {
+            let explicit = dir_of_file(&symbols[i].file).is_some() || symbols[i].server_action;
+            if !in_app[i] && !explicit {
+                continue;
+            }
             symbols[i].env = Some(env[i]);
             // interactive code in a Server Component
             let s = &symbols[i];

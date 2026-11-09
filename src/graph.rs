@@ -3444,4 +3444,39 @@ export function Oops() { return <i />; }
         let g = build(&root);
         assert!(g.symbols.iter().all(|s| s.entry.is_none() && s.env.is_none() && s.next_hints.is_empty()));
     }
+
+    #[test]
+    fn unreachable_code_is_neither_server_nor_client() {
+        let g = next_fixture("nextjs");
+        // nothing under app/ renders it, and it has no directive: it says nothing about where it runs
+        let orphan = sym(&g, "Orphan");
+        assert_eq!(orphan.env, None);
+        assert!(orphan.next_hints.is_empty());
+        // ...while an unreferenced file that does say "use client" is a client component
+        assert_eq!(sym(&g, "Island").env, Some(Env::Client { implicit: false }));
+        // a project with an app/ folder and a pages/ folder: pages/ files are not Server Components
+        let torture = tempdir_project(&[
+            ("app/layout.tsx", "export default function Root({ children }: any) { return <html>{children}</html>; }"),
+            ("pages/old.tsx", "import { useState } from \"react\";
+export default function Old() { const [a] = useState(0); return <b onClick={() => {}}>{a}</b>; }"),
+        ]);
+        let g2 = build(&torture);
+        assert_eq!(sym(&g2, "Root").env, Some(Env::Server));
+        assert_eq!(sym(&g2, "Old").env, None);
+        assert!(sym(&g2, "Old").next_hints.is_empty());
+        let _ = std::fs::remove_dir_all(&torture);
+    }
+
+    /// A throwaway project folder with the given files.
+    fn tempdir_project(files: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!("react-graph-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        for (f, text) in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        root
+    }
 }
