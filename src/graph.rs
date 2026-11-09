@@ -6,6 +6,8 @@ use crate::alias::AliasMap;
 use crate::drill::{self, DrillHint};
 
 use crate::cover;
+
+use crate::lint::{self, LintHint};
 use crate::similar::{self, Shape};
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -236,6 +238,9 @@ pub struct Symbol {
     pub provides_boundary: bool,
     /// missing Suspense / error boundary above it (see `cover`)
     pub cover_hints: Vec<Hint>,
+
+    /// rules of React broken here: hooks out of order, effects without cleanup, derived state, missing keys
+    pub lint_hints: Vec<LintHint>,
     /// byte range of the function node in its file (what `similar` fingerprints), for side-by-side compare
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
@@ -266,6 +271,8 @@ impl Symbol {
             + self.drill_hints.len()
 
             + self.cover_hints.len()
+
+            + self.lint_hints.len()
     }
 }
 
@@ -434,7 +441,7 @@ fn lookup<'s>(scopes: &'s [Scope], name: &str) -> Option<&'s (Origin, Option<Str
 }
 
 /// `useMemo` / `React.useMemo` => "useMemo"
-fn callee_name<'a>(call: Node, src: &'a str) -> Option<&'a str> {
+pub(crate) fn callee_name<'a>(call: Node, src: &'a str) -> Option<&'a str> {
     let f = call.child_by_field_name("function")?;
     match f.kind() {
         "identifier" => Some(text(f, src)),
@@ -443,7 +450,7 @@ fn callee_name<'a>(call: Node, src: &'a str) -> Option<&'a str> {
     }
 }
 
-fn call_args(call: Node) -> Vec<Node> {
+pub(crate) fn call_args(call: Node) -> Vec<Node> {
     match call.child_by_field_name("arguments") {
         Some(a) => {
             let mut c = a.walk();
@@ -453,7 +460,7 @@ fn call_args(call: Node) -> Vec<Node> {
     }
 }
 
-fn is_fn(n: Node) -> bool {
+pub(crate) fn is_fn(n: Node) -> bool {
     matches!(n.kind(), "arrow_function" | "function_expression" | "function")
 }
 
@@ -641,7 +648,7 @@ fn build_scope(func: Node, kind: SymKind, src: &str) -> Scope {
 }
 
 /// Identifiers read inside `n` that are not declared inside it (in order, deduplicated).
-fn free_refs(n: Node, src: &str) -> Vec<String> {
+pub(crate) fn free_refs(n: Node, src: &str) -> Vec<String> {
     fn walk(n: Node, src: &str, refs: &mut Vec<String>, declared: &mut Vec<String>) {
         let mut skip: Option<usize> = None;
         match n.kind() {
@@ -700,7 +707,7 @@ fn free_refs(n: Node, src: &str) -> Vec<String> {
 }
 
 /// `user?.profile.id` => "user"
-fn root_ident(mut n: Node, src: &str) -> Option<String> {
+pub(crate) fn root_ident(mut n: Node, src: &str) -> Option<String> {
     loop {
         n = strip_expr(n);
         match n.kind() {
@@ -1236,7 +1243,20 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                 if DEP_HOOKS.contains(&h) {
                     let info = analyze_deps(node, h, None, cx.src, &cx.scopes);
                     cx.symbols[owner].dep_hooks.push(info);
+                    if is_effect(h) {
+                        let hints = {
+                            let scopes = &cx.scopes;
+                            let is_setter = |n: &str| matches!(lookup(scopes, n), Some((Origin::Setter, _)));
+                            lint::effect_rules(node, h, &is_setter, lint::enclosing_fn(node), cx.src)
+                        };
+                        cx.symbols[owner].lint_hints.extend(hints);
+                    }
                 }
+            }
+            // items.map(item => <li />): every item needs a key
+            if let Some(owner) = owner {
+                let hints = lint::missing_key(node, cx.src);
+                cx.symbols[owner].lint_hints.extend(hints);
             }
             // useContext(Ctx) / use(Ctx)
             if let (Some(owner), Some(h)) = (owner, callee) {
@@ -1301,6 +1321,8 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         provides_suspense: false,
         provides_boundary: false,
         cover_hints: Vec::new(),
+
+        lint_hints: Vec::new(),
         func: None,
         shape: Shape::default(),
         forwards: None,
@@ -1318,6 +1340,9 @@ fn enter_fn(id: usize, func: Node, body: Node, cx: &mut Ctx) {
     cx.symbols[id].shape = similar::shape(&roots, |n| defines_symbol(n, src));
     cx.symbols[id].func = Some((func.start_byte(), func.end_byte()));
     let kind = cx.symbols[id].kind;
+    let real_body = func.child_by_field_name("body").unwrap_or(body);
+    let name = cx.symbols[id].name.clone();
+    cx.symbols[id].lint_hints = lint::hook_rules(real_body, kind, &name, cx.src);
     let scoped = matches!(kind, SymKind::Component | SymKind::Hook);
     if scoped {
         let scope = build_scope(func, kind, cx.src);
@@ -2991,5 +3016,96 @@ export function Oops() { return <i />; }
         assert_eq!(flagged, ["B"], "{flagged:?}");
         assert!(sym(&g, "Lazy").lazy);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn lint_hits(g: &Graph) -> Vec<(String, &'static str, usize)> {
+        let mut v: Vec<_> = g
+            .symbols
+            .iter()
+            .flat_map(|s| s.lint_hints.iter().map(move |h| (s.name.clone(), h.rule, h.line)))
+            .collect();
+        v.sort_by_key(|(_, _, l)| *l);
+        v
+    }
+
+    fn lint_fixture() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lint"))
+    }
+
+    #[test]
+    fn hooks_out_of_order_are_flagged() {
+        let hits: Vec<_> = lint_hits(&lint_fixture()).into_iter().filter(|h| h.1 == "hook-order").collect();
+        let n = |s: &str| s.to_string();
+        assert_eq!(
+            hits,
+            [
+                (n("Conditional"), "hook-order", 6),  // in an if
+                (n("Conditional"), "hook-order", 8),  // in a ternary
+                (n("Conditional"), "hook-order", 9),  // behind &&
+                (n("Conditional"), "hook-order", 11), // in a loop
+                (n("Conditional"), "hook-order", 14), // in an effect callback
+                (n("EarlyReturn"), "hook-order", 21), // after `if (!ready) return null`
+                (n("notAHook"), "hook-order", 36),    // in a plain function
+            ]
+        );
+        let g = lint_fixture();
+        let texts: Vec<&str> = sym(&g, "Conditional").lint_hints.iter().map(|h| h.text.as_str()).collect();
+        assert!(texts[0].contains("`useEffect` is called conditionally"), "{}", texts[0]);
+        assert!(texts[3].contains("in a loop"), "{}", texts[3]);
+        assert!(texts[4].contains("nested function or callback"), "{}", texts[4]);
+        assert!(sym(&g, "EarlyReturn").lint_hints[0].text.contains("after an early return"));
+        assert!(sym(&g, "notAHook").lint_hints[0].text.contains("neither a component nor a custom hook"));
+        // hooks in the right place, a custom hook, and an early return below every hook are fine
+        for ok in ["Fine", "useGood"] {
+            assert!(sym(&g, ok).lint_hints.is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn effects_that_never_clean_up_are_flagged() {
+        let g = lint_fixture();
+        let hits: Vec<_> = lint_hits(&g).into_iter().filter(|h| h.1 == "effect-cleanup").collect();
+        // a listener and a subscription with no cleanup; the interval returns one; `document.title` registers nothing
+        assert_eq!(hits.iter().map(|h| h.2).collect::<Vec<_>>(), [46, 53]);
+        assert!(sym(&g, "Leaky").lint_hints[0].text.contains("an event listener"));
+        assert!(sym(&g, "Leaky").lint_hints[1].text.contains("a subscription"));
+        assert_eq!(sym(&g, "Leaky").warnings(), 2);
+    }
+
+    #[test]
+    fn state_derived_in_an_effect_is_flagged() {
+        let g = lint_fixture();
+        let hits: Vec<_> = lint_hits(&g).into_iter().filter(|h| h.1 == "derived-state").collect();
+        // `setFiltered(f(items, query))` with [items, query]; not a constant reset, an updater, or async work
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].2, 66);
+        let t = &sym(&g, "Derived").lint_hints[0].text;
+        assert!(t.contains("`setFiltered`") && t.contains("`items`, `query`"), "{t}");
+        // `setV(1)` with no deps in Fine is a mount effect, not derived state
+        assert!(sym(&g, "Fine").lint_hints.is_empty());
+        // a draft the user also edits is local state that is re-synced, not derived
+        assert!(sym(&g, "Drawer").lint_hints.is_empty(), "{:?}", sym(&g, "Drawer").lint_hints);
+    }
+
+    #[test]
+    fn list_items_need_a_key() {
+        let g = lint_fixture();
+        let hits: Vec<_> = lint_hits(&g).into_iter().filter(|h| h.1 == "missing-key").collect();
+        // `<li>` with no key and a bare fragment; keyed items, non-JSX results and spread props are fine
+        assert_eq!(hits.iter().map(|h| h.2).collect::<Vec<_>>(), [83, 86]);
+        assert!(sym(&g, "List").lint_hints[1].text.contains("Fragment"));
+    }
+
+    #[test]
+    fn complex_react_has_no_lint_hits() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        // hooks there are called at the top of components and hooks, effects clean up, lists have keys, and
+        // TaskDetailsDrawer's draft (re-synced by an effect, but also typed into) is not derived state
+        let hits = lint_hits(&g);
+        assert!(hits.is_empty(), "{hits:?}");
     }
 }

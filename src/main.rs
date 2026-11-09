@@ -10,6 +10,8 @@ mod export;
 mod flow;
 mod graph;
 mod path;
+
+mod lint;
 mod prefs;
 mod similar;
 mod source;
@@ -5688,6 +5690,44 @@ impl Render for GraphView {
                 }
             }
 
+            if !s.lint_hints.is_empty() {
+                p = p.child(section("Rules of React"));
+                for (n, h) in s.lint_hints.iter().enumerate() {
+                    let line = h.line;
+                    p = p.child(
+                        div()
+                            .id(("lint-hint", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let sym = &this.graph.symbols[sel];
+                                let (file, start) = (sym.file.clone(), sym.line);
+                                this.source_tab = true;
+                                this.ensure_code(&file, start);
+                                this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                                    .child(div().text_sm().font_family(MONO_FONT).child(h.rule))
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!("line {line}"))),
+                            )
+                            .child(div().pl(px(15.)).min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
+
             if !s.prop_hints.is_empty() {
                 p = p.child(section("Props defeating memo"));
                 for (n, h) in s.prop_hints.iter().enumerate() {
@@ -5880,6 +5920,8 @@ impl Render for GraphView {
                         .or_else(|| t.drill_hints.first().map(|h| h.text.clone()))
 
                         .or_else(|| t.cover_hints.first().map(|h| h.text.clone()))
+
+                        .or_else(|| t.lint_hints.first().map(|h| h.text.clone()))
                         .unwrap_or_default();
                     p = p.child(
                         div()
