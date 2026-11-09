@@ -226,6 +226,35 @@ mod tests {
     }
 
     #[test]
+    fn windows_line_endings_and_odd_paths_survive() {
+        let mut st = Store::default();
+        st.put(Path::new("/work/a=b/my app"), sample());
+        let crlf = st.serialize().replace('\n', "\r\n");
+        let back = Store::parse(&crlf);
+        assert_eq!(back.get(Path::new("/work/a=b/my app")), Some(&sample()));
+        // a view saved by a newer version with lines this one doesn't know is still read
+        let newer = format!("{}future=1\nfilters=warn,untested\n", st.serialize());
+        let v = Store::parse(&newer).get(Path::new("/work/a=b/my app")).cloned().unwrap();
+        assert_eq!(v.filters, ["warn", "untested"]);
+    }
+
+    #[test]
+    fn a_truncated_file_loses_at_most_the_last_view() {
+        let mut st = Store::default();
+        st.put(Path::new("/a"), sample());
+        st.put(Path::new("/b"), sample());
+        let text = st.serialize();
+        for cut in [0, 1, 7, text.len() / 3, text.len() / 2, text.len() - 1] {
+            // never panics, whatever the cut (moved back to a char boundary)
+            let cut = (0..=cut).rev().find(|&c| text.is_char_boundary(c)).unwrap_or(0);
+            let _ = Store::parse(&text[..cut]);
+        }
+        assert!(Store::parse("").get(Path::new("/a")).is_none());
+        // lines before any `project=` belong to nobody
+        assert!(Store::parse("filters=warn\nselected=a\tb\t1\n").projects.is_empty());
+    }
+
+    #[test]
     fn keys_number_same_named_symbols_per_file() {
         let g = crate::graph::build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/memo"));
         let ks = keys(&g);
