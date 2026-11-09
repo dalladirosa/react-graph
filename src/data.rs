@@ -104,6 +104,11 @@ pub fn uses(call: Node, src: &str) -> Option<DataUse> {
     let args = call_args(call);
     let f = call.child_by_field_name("function")?;
     let mk = |kind, label: String| Some(DataUse { kind, label, line });
+    // `fetch()` / `useQuery()` with nothing to go on is not a call worth listing
+    let needs_arg = |n: &str| matches!(n, "fetch" | "axios" | "ky" | "useQuery" | "useInfiniteQuery" | "useSuspenseQuery" | "useSWR" | "useSWRImmutable") || VERBS.contains(&n);
+    if args.is_empty() && needs_arg(name) {
+        return None;
+    }
 
     // fetch(url, { method }) / axios(url)
     if f.kind() == "identifier" && matches!(name, "fetch" | "axios" | "ky") {

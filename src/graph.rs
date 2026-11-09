@@ -3167,6 +3167,13 @@ export function Oops() { return <i />; }
         assert_eq!(own_data(&g, "loadUser"), ["http:GET /api/users/{}"]);
         assert_eq!(own_data(&g, "lookup"), ["http:GET (dynamic url)"]);
         assert!(own_data(&g, "cached").is_empty(), "Map.get is not a request");
+        // `fetch()`, `axios.get()` and `useQuery()` with no arguments are not calls to list
+        let nothing = std::env::temp_dir().join(format!("react-graph-data-{}", std::process::id()));
+        std::fs::create_dir_all(&nothing).unwrap();
+        std::fs::write(nothing.join("A.tsx"), "export function A() { fetch(); axios.get(); useQuery(); useSWR(); return <p />; }").unwrap();
+        let g2 = build(&nothing);
+        assert!(own_data(&g2, "A").is_empty(), "{:?}", own_data(&g2, "A"));
+        let _ = std::fs::remove_dir_all(&nothing);
     }
 
     #[test]
