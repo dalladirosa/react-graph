@@ -5907,7 +5907,10 @@ fn main() {
             }
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+        // 1280×800, but never bigger than 90% of the screen (macOS shrinks oversized windows,
+        // and the first frame then renders at the wrong size)
+        let screen = cx.primary_display().map(|d| d.bounds().size).unwrap_or(size(px(1280.), px(800.)));
+        let bounds = Bounds::centered(None, size(px(1280.).min(screen.width * 0.9), px(800.).min(screen.height * 0.9)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
