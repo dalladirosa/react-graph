@@ -3070,6 +3070,8 @@ export function Oops() { return <i />; }
         assert!(sym(&g, "Leaky").lint_hints[0].text.contains("an event listener"));
         assert!(sym(&g, "Leaky").lint_hints[1].text.contains("a subscription"));
         assert_eq!(sym(&g, "Leaky").warnings(), 2);
+        // `{ once: true }` listeners remove themselves
+        assert!(sym(&g, "Once").lint_hints.is_empty(), "{:?}", sym(&g, "Once").lint_hints);
     }
 
     #[test]

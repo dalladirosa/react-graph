@@ -99,3 +99,11 @@ export function Drawer({ task }: any) {
   }, [task.id]);
   return <input value={draft} onChange={(e) => setDraft(e.target.value)} />;
 }
+
+// removes itself after the first event: nothing to clean up
+export function Once() {
+  useEffect(() => {
+    window.addEventListener("click", () => {}, { once: true });
+  }, []);
+  return null;
+}

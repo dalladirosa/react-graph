@@ -177,6 +177,8 @@ pub fn hook_rules(body: Node, kind: SymKind, name: &str, src: &str) -> Vec<LintH
 fn registration<'t>(n: Node<'t>, src: &str) -> Option<(&'static str, Node<'t>)> {
     match n.kind() {
         "call_expression" => match callee_name(n, src)? {
+            // `{ once: true }` removes itself
+            "addEventListener" if listens_once(n, src) => None,
             "addEventListener" => Some(("an event listener", n)),
             "setInterval" => Some(("an interval", n)),
             "subscribe" => Some(("a subscription", n)),
@@ -192,6 +194,17 @@ fn registration<'t>(n: Node<'t>, src: &str) -> Option<(&'static str, Node<'t>)> 
         },
         _ => None,
     }
+}
+
+/// `el.addEventListener("x", fn, { once: true })`
+fn listens_once(call: Node, src: &str) -> bool {
+    let Some(opts) = call_args(call).get(2).map(|o| strip_expr(*o)).filter(|o| o.kind() == "object") else { return false };
+    let mut c = opts.walk();
+    let found = opts.named_children(&mut c).filter(|p| p.kind() == "pair").any(|p| {
+        p.child_by_field_name("key").is_some_and(|k| text(k, src) == "once")
+            && p.child_by_field_name("value").is_some_and(|v| text(v, src) == "true")
+    });
+    found
 }
 
 fn first_registration<'t>(n: Node<'t>, src: &str) -> Option<(&'static str, Node<'t>)> {
