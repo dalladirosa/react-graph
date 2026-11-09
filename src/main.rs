@@ -14,6 +14,8 @@ mod graph;
 mod path;
 
 mod lint;
+
+mod next;
 mod prefs;
 mod similar;
 mod source;
@@ -2251,7 +2253,9 @@ impl GraphView {
 
     /// Nothing references `i` except the symbol that defines it.
     fn is_unused(&self, i: usize) -> bool {
-        !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
+        // pages, layouts and route handlers are loaded by Next.js itself
+        !self.graph.symbols[i].is_entry()
+            && !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
     }
 
     /// Follow selection changes. The selection's own links are drawn (see `relayout`), so the
@@ -3251,6 +3255,24 @@ fn data_color(k: data::DataKind) -> u32 {
         data::DataKind::Http => 0x0369a1,
         data::DataKind::Query => 0x7e22ce,
         data::DataKind::Store => 0xb45309,
+    }
+}
+
+/// (text, background) for a Server / Client Component badge
+fn env_colors(e: next::Env) -> (u32, u32) {
+    match e {
+        next::Env::Server => (0x15803d, 0xdcfce7),
+        next::Env::Client { .. } => (0x1d4ed8, 0xdbeafe),
+        next::Env::Action => (0xb45309, 0xfef3c7),
+    }
+}
+
+fn env_explainer(e: next::Env) -> &'static str {
+    match e {
+        next::Env::Server => "Server Component: rendered on the server. No hooks, no event handlers; it can be async.",
+        next::Env::Client { implicit: false } => "Client Component: its file starts with \"use client\". It ships to the browser.",
+        next::Env::Client { implicit: true } => "Client Component by import: its file has no directive, but a client component renders or calls it, so it ships to the browser too.",
+        next::Env::Action => "Server Action: runs on the server when called from the client (\"use server\").",
     }
 }
 
@@ -4422,6 +4444,32 @@ impl Render for GraphView {
                                     .font_family(MONO_FONT)
                                     .text_color(rgb(DATA_FG))
                                     .child("data"),
+                            )
+                        })
+
+                        .when_some(s.env, |d, e| {
+                            let (fg, bg) = env_colors(e);
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(bg))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(fg))
+                                    .child(e.label()),
+                            )
+                        })
+                        .when_some(s.entry.as_ref(), |d, e| {
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(0xf1f5f9))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(0x475569))
+                                    .child(e.kind.label()),
                             )
                         })
                         .when(warns > 0 || dup.is_some(), |d| d.child(div().flex_1()))
@@ -5969,6 +6017,8 @@ impl Render for GraphView {
                         .or_else(|| t.cover_hints.first().map(|h| h.text.clone()))
 
                         .or_else(|| t.lint_hints.first().map(|h| h.text.clone()))
+
+                        .or_else(|| t.next_hints.first().map(|h| h.text.clone()))
                         .unwrap_or_default();
                     p = p.child(
                         div()
@@ -6126,6 +6176,59 @@ impl Render for GraphView {
                                 Some(v) => format!("via {v}"),
                                 None => format!("line {line}"),
                             })),
+                    );
+                }
+            }
+
+            if s.entry.is_some() || s.env.is_some() || !s.next_hints.is_empty() {
+                p = p.child(section("Next.js"));
+                if let Some(e) = &s.entry {
+                    p = p.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(0xf1f5f9))
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(0x475569))
+                                    .child(e.kind.label()),
+                            )
+                            .child(div().text_sm().font_family(MONO_FONT).child(e.route.clone()))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("loaded by Next.js")),
+                    );
+                }
+                if let Some(env) = s.env {
+                    let (fg, bg) = env_colors(env);
+                    p = p.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                div().px(px(5.)).rounded(px(4.)).bg(rgb(bg)).text_xs().font_family(MONO_FONT).text_color(rgb(fg)).child(env.label()),
+                            )
+                            .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(MUTED)).child(env_explainer(env))),
+                    );
+                }
+                for h in &s.next_hints {
+                    p = p.child(
+                        div()
+                            .mt_1()
+                            .px_2()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                            .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
                     );
                 }
             }

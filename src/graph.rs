@@ -10,6 +10,8 @@ use crate::cover;
 use crate::lint::{self, LintHint};
 
 use crate::data::DataUse;
+
+use crate::next::{self, Directive, Entry, Env};
 use crate::similar::{self, Shape};
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -246,6 +248,17 @@ pub struct Symbol {
 
     /// HTTP calls, data-fetching hooks and stores used directly in this symbol
     pub data: Vec<DataUse>,
+
+    /// Next.js (App Router): where it runs
+    pub env: Option<Env>,
+    /// Next.js: a file the framework loads itself (page, layout, route handler, ...)
+    pub entry: Option<Entry>,
+    /// Next.js: interactive code in a Server Component
+    pub next_hints: Vec<Hint>,
+    /// browser-only hooks and event handlers used directly in this symbol: (name, line)
+    pub(crate) client_uses: Vec<(String, usize)>,
+    /// has a `"use server"` directive of its own
+    pub(crate) server_action: bool,
     /// byte range of the function node in its file (what `similar` fingerprints), for side-by-side compare
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
@@ -265,6 +278,10 @@ pub struct Similar {
 }
 
 impl Symbol {
+    /// The pages, layouts and handlers Next.js loads itself are used by the framework.
+    pub fn is_entry(&self) -> bool {
+        self.entry.is_some()
+    }
     pub fn is_memoized(&self) -> bool {
         !self.wraps.is_empty() && self.wraps.iter().any(|w| *w != Wrap::ForwardRef)
     }
@@ -278,6 +295,8 @@ impl Symbol {
             + self.cover_hints.len()
 
             + self.lint_hints.len()
+
+            + self.next_hints.len()
     }
 }
 
@@ -425,7 +444,7 @@ struct RawCtx {
 }
 
 /// `onClick` / `onSave` (but not `one` or `online`)
-fn is_event_prop(name: &str) -> bool {
+pub(crate) fn is_event_prop(name: &str) -> bool {
     name.strip_prefix("on").and_then(|r| r.chars().next()).is_some_and(|c| c.is_ascii_uppercase())
 }
 
@@ -1207,6 +1226,15 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         provide,
                     });
                 }
+                // <button onClick={...}>: an event handler on a DOM element
+                if n.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    let mut c = node.walk();
+                    for a in node.children(&mut c).filter(|a| a.kind() == "jsx_attribute") {
+                        if let Some(p) = a.named_child(0).filter(|p| p.kind() == "property_identifier" && is_event_prop(text(*p, cx.src))) {
+                            cx.symbols[owner].client_uses.push((text(p, cx.src).to_string(), a.start_position().row + 1));
+                        }
+                    }
+                }
                 if n.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
                     // the element that is a route's page: itself, or (for `<A><B/></A>`) its jsx_element
                     let route = cx.route_node.is_some_and(|id| {
@@ -1295,6 +1323,12 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                     cx.symbols[owner].data.push(u);
                 }
             }
+            // browser-only hooks
+            if let (Some(owner), Some(h)) = (owner, callee) {
+                if next::CLIENT_HOOKS.contains(&h) {
+                    cx.symbols[owner].client_uses.push((h.to_string(), node.start_position().row + 1));
+                }
+            }
             // useContext(Ctx) / use(Ctx)
             if let (Some(owner), Some(h)) = (owner, callee) {
                 if matches!(h, "useContext" | "use") {
@@ -1362,6 +1396,12 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         lint_hints: Vec::new(),
 
         data: Vec::new(),
+
+        env: None,
+        entry: None,
+        next_hints: Vec::new(),
+        client_uses: Vec::new(),
+        server_action: false,
         func: None,
         shape: Shape::default(),
         forwards: None,
@@ -1382,6 +1422,15 @@ fn enter_fn(id: usize, func: Node, body: Node, cx: &mut Ctx) {
     let real_body = func.child_by_field_name("body").unwrap_or(body);
     let name = cx.symbols[id].name.clone();
     cx.symbols[id].lint_hints = lint::hook_rules(real_body, kind, &name, cx.src);
+
+    // `async function save() { "use server"; ... }`
+    if let Some(b) = func.child_by_field_name("body").filter(|b| b.kind() == "statement_block") {
+        let mut c = b.walk();
+        let first = b.named_children(&mut c).find(|s| s.kind() != "comment");
+        if first.is_some_and(|s| directive_of(s, cx.src) == Some(Directive::Server)) {
+            cx.symbols[id].server_action = true;
+        }
+    }
     let scoped = matches!(kind, SymKind::Component | SymKind::Hook);
     if scoped {
         let scope = build_scope(func, kind, cx.src);
@@ -1507,6 +1556,21 @@ struct Module {
     aliases: HashMap<String, String>,
     /// top-level `const ThemeContext = createContext(...)`
     contexts: HashMap<String, usize>,
+    /// `"use client"` / `"use server"` at the top of the file
+    directive: Option<Directive>,
+}
+
+/// `"use client"` / `"use server"` as a statement.
+fn directive_of(st: Node, src: &str) -> Option<Directive> {
+    if st.kind() != "expression_statement" {
+        return None;
+    }
+    let s = st.named_child(0).filter(|s| s.kind() == "string")?;
+    match string_value(s, src).as_str() {
+        "use client" => Some(Directive::Client),
+        "use server" => Some(Directive::Server),
+        _ => None,
+    }
 }
 
 /// `"./Button"` => `./Button`; identifiers pass through.
@@ -1662,7 +1726,17 @@ fn collect_export(st: Node, src: &str, m: &mut Module) {
 fn collect_module(root: Node, src: &str) -> Module {
     let mut m = Module::default();
     let mut c = root.walk();
+    // directives come first, before any import (comments and other directives aside)
+    let mut prologue = true;
     for st in root.named_children(&mut c) {
+        if prologue {
+            match (st.kind(), directive_of(st, src)) {
+                (_, Some(d)) => m.directive = m.directive.or(Some(d)),
+                ("comment", _) => {}
+                ("expression_statement", _) if st.named_child(0).is_some_and(|s| s.kind() == "string") => {}
+                _ => prologue = false,
+            }
+        }
         match st.kind() {
             "import_statement" => collect_import(st, src, &mut m),
             "export_statement" => collect_export(st, src, &mut m),
@@ -2366,6 +2440,15 @@ pub fn build(root: &Path) -> Graph {
         }
     }
 
+
+    // Next.js: routes, server / client components, layout nesting
+    {
+        let facts: HashMap<&str, next::FileFacts> = modules
+            .iter()
+            .map(|(f, m)| (f.as_str(), next::FileFacts { directive: m.directive, default_export: m.exports.get("default").cloned() }))
+            .collect();
+        next::annotate(root, &mut symbols, &mut edges, &file_list, &facts);
+    }
 
     for (owner, h) in prop_hints {
         let have = &mut symbols[owner].prop_hints;
@@ -3222,5 +3305,143 @@ export function Oops() { return <i />; }
         for s in &g.symbols {
             assert!(s.data.iter().all(|d| !d.label.is_empty()));
         }
+    }
+
+    fn next_fixture(dir: &str) -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir))
+    }
+
+    fn entries(g: &Graph) -> Vec<(String, &'static str, String)> {
+        let mut v: Vec<_> = g
+            .symbols
+            .iter()
+            .filter_map(|s| s.entry.as_ref().map(|e| (s.name.clone(), e.kind.label(), e.route.clone())))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn app_router_files_are_entries_with_their_routes() {
+        let g = next_fixture("nextjs");
+        let t = |a: &str, b: &'static str, c: &str| (a.to_string(), b, c.to_string());
+        let mut want = vec![
+            t("RootLayout", "layout", "/"),
+            t("Home", "page", "/"),
+            t("Loading", "loading", "/"),
+            t("BlogLayout", "layout", "/blog"),
+            t("Post", "page", "/blog/[slug]"),
+            t("Cart", "page", "/cart"), // `(shop)` is a route group: not in the URL
+            t("Dashboard", "page", "/dashboard"),
+            t("Contact", "page", "/contact"),
+            t("GET", "route handler", "/api/hello"), // `helper` in the same file is not a handler
+        ];
+        want.sort();
+        assert_eq!(entries(&g), want);
+        assert!(sym(&g, "Home").is_entry() && !sym(&g, "Nav").is_entry());
+    }
+
+    #[test]
+    fn layouts_wrap_what_is_below_them() {
+        let g = next_fixture("nextjs");
+        let from = |name: &str| -> Vec<String> {
+            let i = g.symbols.iter().position(|s| s.name == name).unwrap();
+            let mut v: Vec<String> = g.out_edges(i).filter(|e| e.kind == EdgeKind::Renders).map(|e| g.symbols[e.to].name.clone()).collect();
+            v.sort();
+            v
+        };
+        // the root layout wraps the pages next to it and the layouts / pages below, but a page under
+        // /blog hangs off the blog layout instead
+        assert_eq!(from("RootLayout"), ["BlogLayout", "Cart", "Contact", "Dashboard", "Home", "Loading", "Nav"]);
+        assert_eq!(from("BlogLayout"), ["Post"]);
+        // nothing renders a layout twice
+        let n = g.edges.iter().filter(|e| e.kind == EdgeKind::Renders && g.symbols[e.to].name == "Post").count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn server_and_client_components_are_told_apart() {
+        let g = next_fixture("nextjs");
+        let env = |n: &str| sym(&g, n).env;
+        assert_eq!(env("Counter"), Some(Env::Client { implicit: false }));
+        // no directive, but the client Counter renders it: it ships to the browser
+        assert_eq!(env("Label"), Some(Env::Client { implicit: true }));
+        for n in ["Home", "Feed", "Nav", "RootLayout", "Dashboard"] {
+            assert_eq!(env(n), Some(Env::Server), "{n}");
+        }
+        // a "use server" file and a function with its own directive
+        assert_eq!(env("save"), Some(Env::Action));
+        assert_eq!(env("submit"), Some(Env::Action));
+        assert_eq!(env("Contact"), Some(Env::Server));
+    }
+
+    #[test]
+    fn interactive_server_components_are_flagged() {
+        let g = next_fixture("nextjs");
+        let flagged: Vec<&str> = g.symbols.iter().filter(|s| !s.next_hints.is_empty()).map(|s| s.name.as_str()).collect();
+        assert_eq!(flagged, ["Dashboard"]);
+        let h = &sym(&g, "Dashboard").next_hints[0];
+        assert!(h.warn && h.text.contains("`useState`") && h.text.contains("Server Component") && h.text.contains("use client"), "{}", h.text);
+        // the same hook in a client component is fine
+        assert!(sym(&g, "Counter").next_hints.is_empty());
+    }
+
+    #[test]
+    fn pages_router_files_are_entries() {
+        let g = next_fixture("nextpages");
+        let t = |a: &str, b: &'static str, c: &str| (a.to_string(), b, c.to_string());
+        let mut want = vec![
+            t("MyApp", "_app", "(_app)"),
+            t("Index", "page", "/"),
+            t("About", "page", "/about"),
+            t("Post", "page", "/posts/[id]"),
+            t("handler", "api", "/api/users"),
+        ];
+        want.sort();
+        assert_eq!(entries(&g), want);
+        // no App Router: no server / client split
+        assert!(g.symbols.iter().all(|s| s.env.is_none() && s.next_hints.is_empty()));
+    }
+
+    #[test]
+    fn other_projects_are_not_next() {
+        for dir in ["memo", "routes", "flow"] {
+            let g = next_fixture(dir);
+            assert!(g.symbols.iter().all(|s| s.entry.is_none() && s.env.is_none()), "{dir}");
+        }
+    }
+
+    #[test]
+    fn route_paths() {
+        assert_eq!(next::app_route("app", "app/page.tsx"), "/");
+        assert_eq!(next::app_route("src/app", "src/app/(auth)/@modal/login/page.tsx"), "/login");
+        assert_eq!(next::app_route("app", "app/shop/[...all]/page.tsx"), "/shop/[...all]");
+        assert_eq!(next::pages_route("pages", "pages/index.tsx"), "/");
+        assert_eq!(next::pages_route("pages", "pages/blog/index.tsx"), "/blog");
+        assert_eq!(next::pages_route("src/pages", "src/pages/a/[b].tsx"), "/a/[b]");
+    }
+
+    #[test]
+    fn directives_only_count_at_the_top() {
+        let src = |s: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()).unwrap();
+            let t = parser.parse(s, None).unwrap();
+            collect_module(t.root_node(), s).directive
+        };
+        assert_eq!(src("'use client'\nimport a from 'a'"), Some(Directive::Client));
+        assert_eq!(src("// header\n\"use server\";\nexport const x = 1;"), Some(Directive::Server));
+        assert_eq!(src("import a from 'a';\n'use client';"), None);
+        assert_eq!(src("const x = 1;"), None);
+    }
+
+    #[test]
+    fn complex_react_is_not_next() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        assert!(g.symbols.iter().all(|s| s.entry.is_none() && s.env.is_none() && s.next_hints.is_empty()));
     }
 }
