@@ -67,7 +67,7 @@ react-graph.exe C:\path\to\my-app                                        # Windo
 "/Applications/React Graph.app/Contents/MacOS/react-graph" ~/code/my-app   # macOS
 ```
 
-`node_modules` and other build folders are skipped. Settings (theme and recent projects) are stored in `%APPDATA%\react-graph\settings.txt` on Windows and `~/.config/react-graph/settings.txt` on macOS.
+`node_modules` and other build folders are skipped. Settings (theme and recent projects) are stored in `%APPDATA%\react-graph\settings.txt` on Windows and `~/.config/react-graph/settings.txt` on macOS; saved views are in `views.txt` next to it.
 
 ## Build from source
 
