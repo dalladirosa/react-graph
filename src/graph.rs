@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::alias::AliasMap;
+use crate::drill::{self, DrillHint};
 use crate::similar::{self, Shape};
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -213,6 +214,8 @@ pub struct Symbol {
     pub dep_hooks: Vec<DepInfo>,
     /// props this component passes to a `memo` component that are new on every render
     pub prop_hints: Vec<PropHint>,
+    /// props this component only hands on to a child, as part of a long chain (prop drilling)
+    pub drill_hints: Vec<DrillHint>,
     /// binds a computed value, not a function: `const rows = useMemo(() => filter(...), deps)`
     pub is_value: bool,
     /// other symbols of the same kind with an identical or near-identical body, best match first
@@ -223,6 +226,8 @@ pub struct Symbol {
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
     shape: Shape,
+    /// what the component does with its props; only kept until prop drilling is resolved
+    pub(crate) forwards: Option<drill::Forwards>,
 }
 
 /// Another symbol whose body has (nearly) the same structure: a candidate to merge or extract.
@@ -244,6 +249,7 @@ impl Symbol {
         self.deps.as_ref().map_or(0, |d| d.warnings())
             + self.dep_hooks.iter().map(|d| d.warnings()).sum::<usize>()
             + self.prop_hints.len()
+            + self.drill_hints.len()
     }
 }
 
@@ -279,6 +285,9 @@ pub struct Graph {
     pub contexts: Vec<ContextDecl>,
     /// groups of symbols that render or call each other in a loop (A -> B -> A), members sorted
     pub cycles: Vec<Vec<usize>>,
+    /// props that travel through components that only forward them (the hints on the symbols come from these)
+    #[allow(dead_code)]
+    pub drills: Vec<drill::Chain>,
     out: Vec<Vec<usize>>,
     inc: Vec<Vec<usize>>,
 }
@@ -391,7 +400,7 @@ fn is_fn(n: Node) -> bool {
 }
 
 /// `x as T`, `x!`, `(x)`, `x satisfies T` => x
-fn strip_expr(mut n: Node) -> Node {
+pub(crate) fn strip_expr(mut n: Node) -> Node {
     while matches!(
         n.kind(),
         "parenthesized_expression" | "as_expression" | "non_null_expression" | "satisfies_expression"
@@ -436,7 +445,7 @@ fn unwrap_wrappers<'t>(value: Node<'t>, src: &str) -> Option<Unwrapped<'t>> {
 }
 
 /// Every name bound by a pattern (`{ a, b: c, ...rest }`, `[x, y = 1]`, `id`).
-fn pattern_names(n: Node, src: &str, out: &mut Vec<String>) {
+pub(crate) fn pattern_names(n: Node, src: &str, out: &mut Vec<String>) {
     match n.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => out.push(text(n, src).to_string()),
         "pair_pattern" => {
@@ -785,7 +794,7 @@ fn kind_for(name: &str) -> SymKind {
     }
 }
 
-fn text<'a>(n: Node, src: &'a str) -> &'a str {
+pub(crate) fn text<'a>(n: Node, src: &'a str) -> &'a str {
     n.utf8_text(src.as_bytes()).unwrap_or("")
 }
 
@@ -1091,11 +1100,13 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         deps: None,
         dep_hooks: Vec::new(),
         prop_hints: Vec::new(),
+        drill_hints: Vec::new(),
         is_value: false,
         similar: Vec::new(),
         cycle: None,
         func: None,
         shape: Shape::default(),
+        forwards: None,
     });
     cx.symbols.len() - 1
 }
@@ -1112,7 +1123,12 @@ fn enter_fn(id: usize, func: Node, body: Node, cx: &mut Ctx) {
     let kind = cx.symbols[id].kind;
     let scoped = matches!(kind, SymKind::Component | SymKind::Hook);
     if scoped {
-        cx.scopes.push(build_scope(func, kind, cx.src));
+        let scope = build_scope(func, kind, cx.src);
+        if kind == SymKind::Component {
+            let names: HashSet<String> = scope.bindings.keys().cloned().collect();
+            cx.symbols[id].forwards = Some(drill::analyze(func, body, &names, cx.src));
+        }
+        cx.scopes.push(scope);
     }
     visit(body, Some(id), cx);
     if scoped {
@@ -1844,6 +1860,7 @@ pub fn build(root: &Path) -> Graph {
 
     let mut edges: Vec<Edge> = Vec::new();
     let mut prop_hints: Vec<(usize, PropHint)> = Vec::new();
+    let mut hops: Vec<drill::Hop> = Vec::new();
     let mut seen: HashSet<(usize, usize, EdgeKind)> = HashSet::new();
     // refs arrive in source order per file, so the first one kept is the first use
     let mut push = |from: usize, to: usize, kind: EdgeKind, line: usize, site: usize, edges: &mut Vec<Edge>| {
@@ -1926,6 +1943,18 @@ pub fn build(root: &Path) -> Graph {
             }
         };
         push(from, t, kind, r.line, owner, &mut edges);
+        // `<Child prop={own} />`: the value goes on to `t`
+        if kind == EdgeKind::Renders && r.via.is_none() && t != owner {
+            if let Some(f) = &symbols[owner].forwards {
+                hops.extend(f.passes.iter().filter(|p| p.child == r.name && p.elem_line == r.line).map(|p| drill::Hop {
+                    from: owner,
+                    to: t,
+                    own: p.own.clone(),
+                    child_prop: p.child_prop.clone(),
+                    line: p.line,
+                }));
+            }
+        }
     }
 
     let contexts = add_context_edges(&symbols, &modules, &resolver, &ctx_refs, &mut edges);
@@ -1942,6 +1971,11 @@ pub fn build(root: &Path) -> Graph {
     for e in edges.iter().filter(|e| matches!(e.kind, EdgeKind::Renders | EdgeKind::Calls)) {
         adj[e.from].push(e.to);
     }
+    let drills = drill::find_chains(&symbols, &hops);
+    drill::add_hints(&mut symbols, &hops, &drills);
+    for s in symbols.iter_mut() {
+        s.forwards = None;
+    }
     let cycles = find_cycles(&adj);
     for (c, members) in cycles.iter().enumerate() {
         for &m in members {
@@ -1957,7 +1991,7 @@ pub fn build(root: &Path) -> Graph {
         inc[e.to].push(ei);
     }
     file_list.sort();
-    Graph { symbols, edges, files, file_list, contexts, cycles, out, inc }
+    Graph { symbols, edges, files, file_list, contexts, cycles, drills, out, inc }
 }
 
 #[cfg(test)]
@@ -2305,5 +2339,80 @@ mod tests {
         assert!(similar_to(&g, "src/context/AuthContext.tsx", "useAuth").is_empty());
         // same-name components with different bodies are not duplicates
         assert!(similar_to(&g, "src/features/projects/Toolbar.tsx", "Toolbar").is_empty());
+    }
+
+    fn drilling() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drilling"))
+    }
+
+    fn drill_names(g: &Graph, c: &drill::Chain) -> Vec<String> {
+        c.through.iter().map(|&t| g.symbols[t].name.clone()).collect()
+    }
+
+    #[test]
+    fn prop_drilling_chains_are_found() {
+        let g = drilling();
+        let mut chains: Vec<(String, Vec<String>, String)> = g
+            .drills
+            .iter()
+            .map(|c| (g.symbols[c.origin].name.clone(), drill_names(&g, c), g.symbols[c.end].name.clone()))
+            .collect();
+        chains.sort();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            chains,
+            [
+                // useState value in App, forwarded by three components, read by Avatar
+                ("App".to_string(), s(&["Layout", "Sidebar", "UserMenu"]), "Avatar".to_string()),
+                // `props.items` style
+                ("Dashboard".to_string(), s(&["Panel", "Table"]), "Row".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn forwarding_components_get_a_warning() {
+        let g = drilling();
+        for n in ["Layout", "Sidebar", "UserMenu", "Panel", "Table"] {
+            let s = sym(&g, n);
+            assert_eq!(s.drill_hints.len(), 1, "{n}: {:?}", s.drill_hints);
+            assert_eq!(s.warnings(), 1, "{n}");
+        }
+        let h = &sym(&g, "Sidebar").drill_hints[0];
+        assert_eq!(h.prop, "user");
+        assert!(h.text.contains("App \u{2192} Layout \u{2192} Sidebar \u{2192} UserMenu \u{2192} Avatar"), "{}", h.text);
+        // the line of `<UserMenu user={user} />`
+        assert_eq!(h.line, 9);
+        // `theme` is forwarded one step to a component that reads it: no chain
+        assert!(sym(&g, "Sidebar").drill_hints.iter().all(|h| h.prop != "theme"));
+        // origin and the component that finally uses it are not flagged
+        for n in ["App", "Avatar", "Dashboard", "Row"] {
+            assert!(sym(&g, n).drill_hints.is_empty(), "{n}");
+        }
+    }
+
+    #[test]
+    fn short_chains_and_used_props_are_not_drilling() {
+        let g = drilling();
+        // one forwarding level is normal
+        for n in ["Shallow", "Badge"] {
+            assert!(sym(&g, n).drill_hints.is_empty(), "{n}");
+        }
+        // Toolbar reads `title` itself, so only Menu forwards it: one level
+        for n in ["Toolbar", "Menu", "Item"] {
+            assert!(sym(&g, n).drill_hints.is_empty(), "{n}");
+        }
+    }
+
+    #[test]
+    fn complex_react_drilling_is_consistent() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        for c in &g.drills {
+            assert!(c.through.len() >= drill::MIN_THROUGH);
+        }
     }
 }

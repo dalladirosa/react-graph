@@ -3,6 +3,7 @@
 
 mod alias;
 mod compare;
+mod drill;
 mod export;
 mod flow;
 mod graph;
@@ -5356,6 +5357,49 @@ impl Render for GraphView {
                 }
             }
 
+            if !s.drill_hints.is_empty() {
+                p = p.child(section("Prop drilling"));
+                for (n, h) in s.drill_hints.iter().enumerate() {
+                    let (line, end) = (h.line, h.end);
+                    p = p.child(
+                        div()
+                            .id(("drill-hint", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .tooltip(tip("Show the line", Some(if MAC { "⌘-click: jump to where it is used" } else { "Ctrl+click: jump to where it is used" })))
+                            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                                if e.modifiers().control || e.modifiers().platform {
+                                    this.reveal(end);
+                                } else {
+                                    let sym = &this.graph.symbols[sel];
+                                    let (file, start) = (sym.file.clone(), sym.line);
+                                    this.source_tab = true;
+                                    this.ensure_code(&file, start);
+                                    this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                }
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                                    .child(div().text_sm().font_family(MONO_FONT).child(h.prop.clone()))
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!("line {line}"))),
+                            )
+                            .child(div().pl(px(15.)).min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
+
             let mut dups = Vec::new();
             self.similar_within(sel, &mut dups);
             if !dups.is_empty() {
@@ -5460,6 +5504,7 @@ impl Render for GraphView {
                         .find(|h| h.warn)
                         .map(|h| h.text.clone())
                         .or_else(|| t.prop_hints.first().map(|h| h.text.clone()))
+                        .or_else(|| t.drill_hints.first().map(|h| h.text.clone()))
                         .unwrap_or_default();
                     p = p.child(
                         div()
