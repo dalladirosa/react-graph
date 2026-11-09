@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn highlights_sample_component() {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample-react/src/components/CartPanel.tsx");
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/memo/ProductCard.tsx");
         let f = load(&p).expect("load");
         assert_eq!(f.lines.len(), f.highlights.len());
         for (line, hl) in f.lines.iter().zip(&f.highlights) {
