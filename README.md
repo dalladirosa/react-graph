@@ -27,6 +27,7 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
 - **Source view.** Shows the code for the selected symbol or file.
 - **Export.** **Export SVG** saves what is drawn as a picture, and **Copy Mermaid** puts it on the clipboard as a Mermaid flowchart.
 - **Open in editor.** Right-click a card and choose **Open in editor** to jump to its line in VS Code (the `code` command must be on your PATH; otherwise the file opens with the system default).
+- **Saved views.** Each project remembers its open cards, filters, selected symbol, picked file and the "Hooks & functions" / "Dim others" switches, and puts them back the next time you open it. Cards that no longer exist are dropped, and renaming or editing code around a symbol doesn't lose it (symbols are matched by file and name, not by line).
 - **Light and dark themes**, and a list of recently opened projects.
 
 ## Install

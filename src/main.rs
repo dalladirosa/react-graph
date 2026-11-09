@@ -11,6 +11,7 @@ mod path;
 mod prefs;
 mod similar;
 mod source;
+mod views;
 
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, Hsla, IntoElement, KeyDownEvent,
@@ -359,6 +360,14 @@ struct GraphView {
     path: Option<PathView>,
     /// theme and recent projects, saved between runs
     prefs: prefs::Prefs,
+    /// per project: open cards, filters, selection, saved between runs
+    views: views::Store,
+    /// the view as last restored or saved (what the saver compares against)
+    last_view: Option<views::View>,
+    /// symbol keys of the loaded graph, by index (see `views::keys`)
+    sym_keys: Vec<views::SymKey>,
+    /// saves the view a second after it changes; dropping it stops it
+    view_saver: Option<gpui::Task<()>>,
     /// open drop-down from the sidebar header
     popup: Option<Popup>,
     /// the popup a press outside just closed, and when: a press on its own toggle button
@@ -767,6 +776,10 @@ impl GraphView {
             path_from: None,
             path: None,
             prefs: prefs::Prefs::load(),
+            views: views::Store::load(),
+            last_view: None,
+            sym_keys: Vec::new(),
+            view_saver: None,
             popup: None,
             popup_closed: None,
             watcher: None,
@@ -1833,6 +1846,8 @@ impl GraphView {
         let shown = root.to_string_lossy().to_string();
         self.root = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
         self.root_path = root.clone();
+        self.last_view = None;
+        self.view_saver = None;
         self.code = CodeView::default();
         self.cmp = None;
         self.flow = None;
@@ -1884,8 +1899,10 @@ impl GraphView {
                 }
                 this.graph = g;
                 this.loading = false;
+                this.restore_view();
                 this.relayout();
                 this.fit_pending = true;
+                this.start_view_saver(cx);
                 // files changed while this was loading
                 if std::mem::take(&mut this.reload_pending) {
                     this.reload_graph(cx);
@@ -1973,6 +1990,110 @@ impl GraphView {
         .detach();
     }
 
+    /// What would be saved for this project right now.
+    fn snapshot_view(&self) -> views::View {
+        let f = &self.filters;
+        let on = [
+            (f.dup, "dup"),
+            (f.exact, "exact"),
+            (f.warn, "warn"),
+            (f.unused, "unused"),
+            (f.memo, "memo"),
+            (f.cycle, "cycle"),
+        ];
+        let kinds = ["component", "hook", "function"];
+        let keys = |set: &mut dyn Iterator<Item = usize>| {
+            let mut v: Vec<usize> = set.filter(|&i| i < self.sym_keys.len()).collect();
+            v.sort_unstable();
+            v.into_iter().map(|i| self.sym_keys[i].clone()).collect::<Vec<_>>()
+        };
+        views::View {
+            filters: on.iter().filter(|(b, _)| *b).map(|(_, n)| n.to_string()).collect(),
+            kinds: kinds.iter().enumerate().filter(|(i, _)| f.kinds[*i]).map(|(_, n)| n.to_string()).collect(),
+            show_functions: self.show_functions,
+            dim_others: self.focus_selection,
+            focus_file: self.focus_file.clone(),
+            selected: self.selected.and_then(|i| self.sym_keys.get(i).cloned()),
+            expanded: keys(&mut self.expanded.iter().copied()),
+            pinned: keys(&mut self.pinned.iter().copied()),
+        }
+    }
+
+    /// Put back the view this project had when it was last open (nothing saved: leave the defaults).
+    /// Cards that no longer exist are dropped.
+    fn restore_view(&mut self) {
+        self.sym_keys = views::keys(&self.graph);
+        if let Some(v) = self.views.get(&self.root_path).cloned() {
+            let index = views::index(&self.graph);
+            let pick = |k: &views::SymKey| index.get(k).copied();
+            let mut f = Filters::default();
+            for name in &v.filters {
+                match name.as_str() {
+                    "dup" => f.dup = true,
+                    "exact" => f.exact = true,
+                    "warn" => f.warn = true,
+                    "unused" => f.unused = true,
+                    "memo" => f.memo = true,
+                    "cycle" => f.cycle = true,
+                    _ => {}
+                }
+            }
+            for k in &v.kinds {
+                match k.as_str() {
+                    "component" => f.kinds[0] = true,
+                    "hook" => f.kinds[1] = true,
+                    "function" => f.kinds[2] = true,
+                    _ => {}
+                }
+            }
+            self.filters = f;
+            self.show_functions = v.show_functions;
+            self.focus_selection = v.dim_others;
+            self.focus_file = v.focus_file.filter(|f| self.graph.file_list.contains(f));
+            self.expanded = v.expanded.iter().filter_map(pick).collect();
+            self.pinned = v.pinned.iter().filter_map(pick).collect();
+            self.selected = v.selected.as_ref().and_then(pick);
+            // the picked file open in the explorer
+            if let Some(f) = self.focus_file.clone() {
+                let mut acc = String::new();
+                for seg in f.split('/').take(f.split('/').count().saturating_sub(1)) {
+                    if !acc.is_empty() {
+                        acc.push('/');
+                    }
+                    acc.push_str(seg);
+                    self.open_dirs.insert(acc.clone());
+                }
+            }
+        }
+        self.last_view = Some(self.snapshot_view());
+    }
+
+    /// Write the view when it changed since the last write.
+    fn save_view(&mut self) {
+        if self.loading || self.root.is_empty() || self.graph.symbols.is_empty() {
+            return;
+        }
+        let v = self.snapshot_view();
+        if self.last_view.as_ref() == Some(&v) {
+            return;
+        }
+        self.views.put(&self.root_path, v.clone());
+        self.views.save();
+        self.last_view = Some(v);
+    }
+
+    /// Check once a second whether the view changed, and save it if so.
+    fn start_view_saver(&mut self, cx: &mut Context<Self>) {
+        self.view_saver = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                if this.update(cx, |this, _| this.save_view()).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
     /// Swap in a rebuilt graph, carrying symbol indexes over by (file, name, nth with that name).
     fn apply_reload(&mut self, g: Graph, took: std::time::Duration) {
         fn keys(g: &Graph) -> Vec<(String, String, usize)> {
@@ -2020,6 +2141,7 @@ impl GraphView {
             *self.file_syms.entry(s.file.clone()).or_default() += 1;
         }
         self.graph = g;
+        self.sym_keys = views::keys(&self.graph);
         self.set_scope(self.filter_scope);
         // the code panel shows the file as it is now
         if let Some(f) = self.code.file.clone() {
