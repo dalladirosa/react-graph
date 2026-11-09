@@ -9,6 +9,9 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
 ## Features
 
 - **Graph view.** Components, hooks and functions are shown as cards, with edges for render, call and prop relations. Expand or collapse nodes, use **Dim others** to focus on one, zoom, and pan with the minimap.
+- **Context links.** A component that provides a context (`<ThemeContext.Provider>`) is linked, with a dashed amber edge, to everything that reads it: `useContext(ThemeContext)`, and the components and hooks that call a custom hook doing so.
+- **Path aliases.** `paths` and `baseUrl` from `tsconfig.json` / `jsconfig.json` (including `extends`) are followed, so `import { Button } from "@/ui/Button"` resolves like a relative import. Without a config, `@/` and `~/` are assumed to mean `src/`.
+- **Live reload.** The graph rebuilds when a source file or tsconfig in the open folder changes. Selection, expanded cards and the view stay where they are.
 - **Project panel.** A file tree with symbol counts. Search by typing anywhere, and use the tabs to show only components, hooks or functions (Ctrl+click, or ⌘-click on a Mac, combines kinds).
 - **Code-health filters.** Each filter shows how many symbols match:
   - **Duplicates:** similar code exists elsewhere (structural fingerprints, so renamed copies still match)
@@ -16,9 +19,12 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
   - **Warnings:** hook dependency problems
   - **Unused:** nothing renders, calls or passes it
   - **Memoized:** wrapped in `memo`, `useCallback` or `useMemo`
+  - **Cycles:** components or functions that render or call each other in a loop (A → B → A). Self-recursion doesn't count.
 - **Compare.** Shows two similar symbols side by side, with the differing tokens highlighted.
 - **Play flow.** Animates a trace from any symbol, either level by level ("waves") or in call-and-return order, and can also show it as a sequence diagram.
 - **Source view.** Shows the code for the selected symbol or file.
+- **Export.** **Export SVG** saves what is drawn as a picture, and **Copy Mermaid** puts it on the clipboard as a Mermaid flowchart.
+- **Open in editor.** Right-click a card and choose **Open in editor** to jump to its line in VS Code (the `code` command must be on your PATH; otherwise the file opens with the system default).
 - **Light and dark themes**, and a list of recently opened projects.
 
 ## Install
