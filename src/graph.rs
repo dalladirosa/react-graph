@@ -2938,4 +2938,58 @@ test(\"a\", () => { void App; });
         assert!(g.symbols.iter().all(|s| s.cover_hints.is_empty()), "{:?}", hinted(&g));
         assert!(sym(&g, "Protected").provides_suspense);
     }
+
+    /// A throwaway project folder with the given files.
+    fn tempdir_project(files: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!("react-graph-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        for (f, text) in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn jsx_routes_and_member_tags_are_understood() {
+        let root = tempdir_project(&[
+            (
+                "App.tsx",
+                "import * as React from \"react\";
+import { Home, A, B, Oops } from \"./pages\";
+const Lazy = React.lazy(() => import(\"./Lazy\"));
+export function App() {
+  return (
+    <Routes>
+      <Route path=\"/\" element={<Home />} errorElement={<Oops />}>
+        <Route path=\"a\" element={<A />} />
+      </Route>
+      <Route path=\"/b\" element={<B />} />
+      <React.Suspense fallback={null}><Lazy /></React.Suspense>
+    </Routes>
+  );
+}
+",
+            ),
+            (
+                "pages.tsx",
+                "export function Home() { return <i />; }
+export function A() { return <i />; }
+export function B() { return <i />; }
+export function Oops() { return <i />; }
+",
+            ),
+            ("Lazy.tsx", "export default function Lazy() { return <i />; }
+"),
+        ]);
+        let g = build(&root);
+        let mut flagged = hinted(&g);
+        flagged.sort();
+        // Home has an errorElement, A sits in Home's route, B has none; <React.Suspense> covers the lazy page
+        assert_eq!(flagged, ["B"], "{flagged:?}");
+        assert!(sym(&g, "Lazy").lazy);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
