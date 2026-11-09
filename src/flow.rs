@@ -154,14 +154,16 @@ type Ok<'a> = &'a dyn Fn(EdgeKind) -> bool;
 /// Edges leaving `n`, in source order. Handler edges are written in another component
 /// (the one passing the prop), so they come last.
 fn outs(g: &Graph, n: usize, ok: Ok) -> Vec<Edge> {
-    let mut v: Vec<Edge> = g.out_edges(n).filter(|e| e.to != n && ok(e.kind)).copied().collect();
+    let mut v: Vec<Edge> =
+        g.out_edges(n).filter(|e| e.to != n && e.kind != EdgeKind::Context && ok(e.kind)).copied().collect();
     v.sort_by_key(|e| (e.site != e.from, e.line));
     v
 }
 
 /// Edges arriving at `n`, by caller file and line.
 fn ins(g: &Graph, n: usize, ok: Ok) -> Vec<Edge> {
-    let mut v: Vec<Edge> = g.in_edges(n).filter(|e| e.from != n && ok(e.kind)).copied().collect();
+    let mut v: Vec<Edge> =
+        g.in_edges(n).filter(|e| e.from != n && e.kind != EdgeKind::Context && ok(e.kind)).copied().collect();
     v.sort_by(|a, b| (&g.symbols[a.site].file, a.line).cmp(&(&g.symbols[b.site].file, b.line)));
     v
 }
@@ -280,6 +282,7 @@ impl Trace {
             (Move::Go, EdgeKind::Renders) => format!("{a} renders {b}"),
             (Move::Go, EdgeKind::Handler) => format!("{a} runs {b} on an event"),
             (Move::Go, EdgeKind::Defines) => format!("{a} defines {b}"),
+            (Move::Go, EdgeKind::Context) => format!("{a} provides context to {b}"),
             (Move::Back, _) => format!("{b} returns to {a}"),
         };
         if s.repeat && s.mv == Move::Go { format!("{text} (already shown)") } else { text }

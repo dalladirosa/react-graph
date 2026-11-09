@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use crate::alias::AliasMap;
 use crate::similar::{self, Shape};
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -23,6 +24,9 @@ pub enum EdgeKind {
     Defines,
     /// Function is passed as a prop/handler (onClick={fn})
     Handler,
+    /// A component providing a context (`<Ctx.Provider>`) to a symbol that reads it
+    /// (`useContext(Ctx)`, directly or through a custom hook). Not an execution step.
+    Context,
 }
 
 impl EdgeKind {
@@ -32,6 +36,7 @@ impl EdgeKind {
             EdgeKind::Calls => "calls",
             EdgeKind::Defines => "defines",
             EdgeKind::Handler => "handler",
+            EdgeKind::Context => "context",
         }
     }
 }
@@ -172,6 +177,8 @@ pub struct Symbol {
     pub is_value: bool,
     /// other symbols of the same kind with an identical or near-identical body, best match first
     pub similar: Vec<Similar>,
+    /// member of a render / call cycle: index into `Graph::cycles`
+    pub cycle: Option<usize>,
     /// byte range of the function node in its file (what `similar` fingerprints), for side-by-side compare
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
@@ -209,6 +216,15 @@ pub struct Edge {
     /// symbol whose code holds `line`: `from`, except for handler edges, where it is the
     /// component that passes the prop (`<Card onAdd={handleAdd} />` is written in the parent)
     pub site: usize,
+    /// `Context` edges: index into `Graph::contexts`
+    pub ctx: Option<usize>,
+}
+
+/// A `createContext` declaration.
+#[derive(Clone, Debug)]
+pub struct ContextDecl {
+    pub name: String,
+    pub file: String,
 }
 
 #[derive(Default)]
@@ -218,6 +234,10 @@ pub struct Graph {
     pub files: usize,
     /// relative paths (forward slashes) of every parsed source file
     pub file_list: Vec<String>,
+    /// every `createContext` found, for `Edge::ctx`
+    pub contexts: Vec<ContextDecl>,
+    /// groups of symbols that render or call each other in a loop (A -> B -> A), members sorted
+    pub cycles: Vec<Vec<usize>>,
     out: Vec<Vec<usize>>,
     inc: Vec<Vec<usize>>,
 }
@@ -228,6 +248,13 @@ impl Graph {
     }
     pub fn in_edges(&self, i: usize) -> impl Iterator<Item = &Edge> {
         self.inc[i].iter().map(move |&e| &self.edges[e])
+    }
+    /// "renders", "calls", ... or "context · ThemeContext"
+    pub fn edge_label(&self, e: &Edge) -> String {
+        match e.ctx.and_then(|c| self.contexts.get(c)) {
+            Some(c) => format!("{} · {}", e.kind.label(), c.name),
+            None => e.kind.label().to_string(),
+        }
     }
 }
 
@@ -242,6 +269,16 @@ struct RawRef {
     via: Option<String>,
     /// For handlers: the prop is named like an event handler (`onClick`, `onSave`, ...).
     event_prop: bool,
+}
+
+/// `<Ctx.Provider>` / `useContext(Ctx)`: resolved to a `createContext` once all files are known.
+struct RawCtx {
+    owner: usize,
+    name: String,
+    file: String,
+    line: usize,
+    /// true = provides the context (`<Ctx.Provider>` / `<Ctx>`), false = reads it
+    provide: bool,
 }
 
 /// `onClick` / `onSave` (but not `one` or `online`)
@@ -265,6 +302,7 @@ struct Ctx<'a> {
     file: String,
     symbols: &'a mut Vec<Symbol>,
     refs: &'a mut Vec<RawRef>,
+    ctx_refs: &'a mut Vec<RawCtx>,
     /// `const { addItem } = useCart()` => addItem -> useCart
     aliases: &'a mut HashMap<(String, String), String>,
     /// `export default memo(Card)` => (file, "Card")
@@ -782,6 +820,28 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
         "jsx_opening_element" | "jsx_self_closing_element" => {
             if let (Some(owner), Some(name)) = (owner, node.child_by_field_name("name")) {
                 let n = text(name, cx.src);
+                // <Ctx.Provider value=...> / <Ctx.Consumer> / React 19's <Ctx value=...>
+                let ctx_use = match name.kind() {
+                    "member_expression" => match (name.child_by_field_name("object"), name.child_by_field_name("property")) {
+                        (Some(o), Some(p)) if o.kind() == "identifier" => match text(p, cx.src) {
+                            "Provider" => Some((text(o, cx.src), true)),
+                            "Consumer" => Some((text(o, cx.src), false)),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    "identifier" if n.starts_with(|c: char| c.is_uppercase()) => Some((n, true)),
+                    _ => None,
+                };
+                if let Some((ctx, provide)) = ctx_use {
+                    cx.ctx_refs.push(RawCtx {
+                        owner,
+                        name: ctx.to_string(),
+                        file: cx.file.clone(),
+                        line: node.start_position().row + 1,
+                        provide,
+                    });
+                }
                 if n.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
                     cx.refs.push(RawRef {
                         owner,
@@ -838,6 +898,20 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                     cx.symbols[owner].dep_hooks.push(info);
                 }
             }
+            // useContext(Ctx) / use(Ctx)
+            if let (Some(owner), Some(h)) = (owner, callee) {
+                if matches!(h, "useContext" | "use") {
+                    if let Some(a) = call_args(node).first().map(|a| strip_expr(*a)).filter(|a| a.kind() == "identifier") {
+                        cx.ctx_refs.push(RawCtx {
+                            owner,
+                            name: text(a, cx.src).to_string(),
+                            file: cx.file.clone(),
+                            line: node.start_position().row + 1,
+                            provide: false,
+                        });
+                    }
+                }
+            }
             if let (Some(owner), Some(f)) = (owner, node.child_by_field_name("function")) {
                 if f.kind() == "identifier" {
                     cx.refs.push(RawRef {
@@ -874,6 +948,7 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         dep_hooks: Vec::new(),
         is_value: false,
         similar: Vec::new(),
+        cycle: None,
         func: None,
         shape: Shape::default(),
     });
@@ -995,6 +1070,8 @@ struct Module {
     reexports: Vec<ReExport>,
     /// `const FastCard = memo(Card)` => FastCard -> Card
     aliases: HashMap<String, String>,
+    /// top-level `const ThemeContext = createContext(...)`
+    contexts: HashMap<String, usize>,
 }
 
 /// `"./Button"` => `./Button`; identifiers pass through.
@@ -1037,7 +1114,13 @@ fn lazy_import_spec(value: Node, src: &str) -> Option<String> {
     find(*call_args(value).first()?, src)
 }
 
-/// Top-level `const` declarations: lazy imports and memo aliases.
+/// `createContext(...)` / `React.createContext<T>(...)`
+fn is_create_context(value: Node, src: &str) -> bool {
+    let v = strip_expr(value);
+    v.kind() == "call_expression" && callee_name(v, src) == Some("createContext")
+}
+
+/// Top-level `const` declarations: lazy imports, memo aliases and contexts.
 fn collect_declarators(decl: Node, src: &str, m: &mut Module) {
     let mut c = decl.walk();
     for d in decl.named_children(&mut c).filter(|d| d.kind() == "variable_declarator") {
@@ -1048,7 +1131,9 @@ fn collect_declarators(decl: Node, src: &str, m: &mut Module) {
             continue;
         }
         let name = text(name, src).to_string();
-        if let Some(spec) = lazy_import_spec(value, src) {
+        if is_create_context(value, src) {
+            m.contexts.insert(name, d.start_position().row + 1);
+        } else if let Some(spec) = lazy_import_spec(value, src) {
             m.imports.insert(name, Import { spec, name: Imported::Default });
         } else if let Some(Unwrapped::Ident { target }) = unwrap_wrappers(value, src) {
             if target != name {
@@ -1162,21 +1247,33 @@ struct Resolver<'a> {
     files: HashSet<&'a str>,
     /// file -> name -> first top-level symbol with that name
     top: HashMap<&'a str, HashMap<&'a str, usize>>,
+    /// tsconfig / jsconfig `paths` and `baseUrl`
+    aliases: &'a AliasMap,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(symbols: &'a [Symbol], modules: &'a HashMap<String, Module>, file_list: &'a [String]) -> Self {
+    fn new(
+        symbols: &'a [Symbol],
+        modules: &'a HashMap<String, Module>,
+        file_list: &'a [String],
+        aliases: &'a AliasMap,
+    ) -> Self {
         let mut top: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
         for (i, s) in symbols.iter().enumerate().filter(|(_, s)| s.parent.is_none()) {
             top.entry(s.file.as_str()).or_default().entry(s.name.as_str()).or_insert(i);
         }
-        Resolver { modules, files: file_list.iter().map(|f| f.as_str()).collect(), top }
+        Resolver { modules, files: file_list.iter().map(|f| f.as_str()).collect(), top, aliases }
     }
 
-    /// `"../ui"` imported from `src/a/B.tsx` => `src/ui/index.ts` (if it was parsed)
+    fn find_file(&self, base: &str) -> Option<&'a str> {
+        RESOLVE_SUFFIXES.iter().find_map(|sfx| self.files.get(format!("{base}{sfx}").as_str()).copied())
+    }
+
+    /// `"../ui"` imported from `src/a/B.tsx` => `src/ui/index.ts` (if it was parsed).
+    /// `"@/ui/Button"` goes through the tsconfig `paths`; packages resolve to nothing.
     fn resolve_spec(&self, from: &str, spec: &str) -> Option<&'a str> {
         if !spec.starts_with('.') {
-            return None; // package or path alias
+            return self.aliases.candidates(spec).iter().find_map(|base| self.find_file(base));
         }
         let mut parts: Vec<&str> = from.split('/').collect();
         parts.pop();
@@ -1189,11 +1286,12 @@ impl<'a> Resolver<'a> {
                 s => parts.push(s),
             }
         }
-        let base = parts.join("/");
-        RESOLVE_SUFFIXES.iter().find_map(|sfx| self.files.get(format!("{base}{sfx}").as_str()).copied())
+        self.find_file(&parts.join("/"))
     }
 
-    fn find_export(&self, file: &str, name: &str, depth: usize) -> Option<usize> {
+    /// Follows `name` exported by `file` (through aliases, imports and re-exports) to the place
+    /// where `leaf(file, local_name)` finds it.
+    fn find_export_with<T>(&self, file: &str, name: &str, depth: usize, leaf: &dyn Fn(&str, &str) -> Option<T>) -> Option<T> {
         if depth > 12 {
             return None;
         }
@@ -1205,32 +1303,36 @@ impl<'a> Resolver<'a> {
         };
         if let Some(local) = local {
             let target = m.aliases.get(local).map(|s| s.as_str()).unwrap_or(local);
-            if let Some(&i) = self.top.get(file).and_then(|t| t.get(target)) {
-                return Some(i);
+            if let Some(hit) = leaf(file, target) {
+                return Some(hit);
             }
             // import { X } from "./x"; export { X };
             if let Some(imp) = m.imports.get(target) {
-                return self.resolve_import(file, imp, depth + 1);
+                return self.resolve_import_with(file, imp, depth + 1, leaf);
             }
         }
         m.reexports.iter().find_map(|re| match re {
             ReExport::Star { spec } if name != "default" => {
-                self.resolve_spec(file, spec).and_then(|f| self.find_export(f, name, depth + 1))
+                self.resolve_spec(file, spec).and_then(|f| self.find_export_with(f, name, depth + 1, leaf))
             }
             ReExport::Named { spec, imported, exported } if exported == name => {
-                self.resolve_spec(file, spec).and_then(|f| self.find_export(f, imported, depth + 1))
+                self.resolve_spec(file, spec).and_then(|f| self.find_export_with(f, imported, depth + 1, leaf))
             }
             _ => None,
         })
     }
 
-    fn resolve_import(&self, file: &str, imp: &Import, depth: usize) -> Option<usize> {
+    fn resolve_import_with<T>(&self, file: &str, imp: &Import, depth: usize, leaf: &dyn Fn(&str, &str) -> Option<T>) -> Option<T> {
         let f = self.resolve_spec(file, &imp.spec)?;
         match &imp.name {
-            Imported::Named(n) => self.find_export(f, n, depth),
-            Imported::Default => self.find_export(f, "default", depth),
+            Imported::Named(n) => self.find_export_with(f, n, depth, leaf),
+            Imported::Default => self.find_export_with(f, "default", depth, leaf),
             Imported::Namespace => None,
         }
+    }
+
+    fn resolve_import(&self, file: &str, imp: &Import, depth: usize) -> Option<usize> {
+        self.resolve_import_with(file, imp, depth, &|f, t| self.top.get(f).and_then(|m| m.get(t)).copied())
     }
 
     /// The symbol `name`, as used in `file`, refers to through that file's imports.
@@ -1238,11 +1340,21 @@ impl<'a> Resolver<'a> {
         let imp = self.modules.get(file)?.imports.get(name)?;
         self.resolve_import(file, imp, 0)
     }
+
+    /// The `createContext` declaration `name` refers to in `file`: declared there, or imported.
+    fn resolve_context(&self, file: &str, name: &str, ids: &HashMap<(&str, &str), usize>) -> Option<usize> {
+        if let Some(&i) = ids.get(&(file, name)) {
+            return Some(i);
+        }
+        let imp = self.modules.get(file)?.imports.get(name)?;
+        self.resolve_import_with(file, imp, 0, &|f, t| ids.get(&(f, t)).copied())
+    }
 }
 
 struct Part {
     symbols: Vec<Symbol>,
     refs: Vec<RawRef>,
+    ctx_refs: Vec<RawCtx>,
     aliases: HashMap<(String, String), String>,
     memo_marks: Vec<(String, String)>,
     comp_alias: HashMap<String, String>,
@@ -1259,6 +1371,7 @@ fn parse_chunk(root: &Path, paths: &[PathBuf]) -> Part {
     let mut part = Part {
         symbols: Vec::new(),
         refs: Vec::new(),
+        ctx_refs: Vec::new(),
         aliases: HashMap::new(),
         memo_marks: Vec::new(),
         comp_alias: HashMap::new(),
@@ -1282,6 +1395,7 @@ fn parse_chunk(root: &Path, paths: &[PathBuf]) -> Part {
             file: rel,
             symbols: &mut part.symbols,
             refs: &mut part.refs,
+            ctx_refs: &mut part.ctx_refs,
             aliases: &mut part.aliases,
             memo_marks: &mut part.memo_marks,
             comp_alias: &mut part.comp_alias,
@@ -1347,30 +1461,170 @@ fn check_hook_values(symbols: &mut [Symbol]) {
     }
 }
 
+/// Strongly connected components with more than one node (Tarjan, iterative: no recursion
+/// depth to overflow on a long chain), each sorted, in order of their first member.
+fn find_cycles(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const NONE: usize = usize::MAX;
+    let n = adj.len();
+    let (mut index, mut low) = (vec![NONE; n], vec![0; n]);
+    let mut on_stack = vec![false; n];
+    let (mut stack, mut found) = (Vec::new(), Vec::new());
+    let mut next = 0;
+    for root in 0..n {
+        if index[root] != NONE {
+            continue;
+        }
+        // (node, next neighbour to look at)
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(&(v, i)) = work.last() {
+            if index[v] == NONE {
+                index[v] = next;
+                low[v] = next;
+                next += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if let Some(&w) = adj[v].get(i) {
+                work.last_mut().unwrap().1 += 1;
+                if index[w] == NONE {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut comp = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if comp.len() > 1 {
+                    comp.sort_unstable();
+                    found.push(comp);
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Links the component providing a context to every symbol reading it: the ones calling
+/// `useContext(Ctx)` and, through custom hooks, the components and hooks that call those.
+fn add_context_edges(
+    symbols: &[Symbol],
+    modules: &HashMap<String, Module>,
+    resolver: &Resolver,
+    ctx_refs: &[RawCtx],
+    edges: &mut Vec<Edge>,
+) -> Vec<ContextDecl> {
+    // declarations, in file order for a stable result
+    let mut decls: Vec<ContextDecl> = Vec::new();
+    let mut files: Vec<&String> = modules.keys().collect();
+    files.sort();
+    for f in files {
+        let mut names: Vec<&String> = modules[f].contexts.keys().collect();
+        names.sort();
+        decls.extend(names.into_iter().map(|n| ContextDecl { name: n.clone(), file: f.clone() }));
+    }
+    if decls.is_empty() {
+        return decls;
+    }
+    let ids: HashMap<(&str, &str), usize> =
+        decls.iter().enumerate().map(|(i, d)| ((d.file.as_str(), d.name.as_str()), i)).collect();
+    // an import we could not follow (package, odd alias): accept a context name that is unique
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, d) in decls.iter().enumerate() {
+        by_name.entry(d.name.as_str()).or_default().push(i);
+    }
+
+    // context -> (providers, readers), each with the line of the first use
+    type Users = Vec<(usize, usize)>;
+    let mut users: Vec<(Users, Users)> = vec![(Vec::new(), Vec::new()); decls.len()];
+    for r in ctx_refs {
+        let Some(c) = resolver
+            .resolve_context(&r.file, &r.name, &ids)
+            .or_else(|| by_name.get(r.name.as_str()).filter(|v| v.len() == 1).map(|v| v[0]))
+        else {
+            continue;
+        };
+        let side = if r.provide { &mut users[c].0 } else { &mut users[c].1 };
+        if !side.iter().any(|&(o, _)| o == r.owner) {
+            side.push((r.owner, r.line));
+        }
+    }
+
+    // callers by callee, to carry a hook's context on to whoever calls the hook
+    let mut callers: HashMap<usize, Vec<usize>> = HashMap::new();
+    for e in edges.iter().filter(|e| e.kind == EdgeKind::Calls) {
+        callers.entry(e.to).or_default().push(e.from);
+    }
+
+    let mut seen: HashSet<(usize, usize, usize)> = HashSet::new();
+    for (c, (providers, readers)) in users.iter().enumerate() {
+        // readers, plus whoever reads through a custom hook (stops at components)
+        let mut all: Vec<usize> = readers.iter().map(|&(o, _)| o).collect();
+        let mut k = 0;
+        while k < all.len() {
+            let r = all[k];
+            k += 1;
+            if symbols[r].kind != SymKind::Hook {
+                continue;
+            }
+            for &caller in callers.get(&r).map(Vec::as_slice).unwrap_or(&[]) {
+                if !all.contains(&caller) && symbols[caller].kind != SymKind::Function {
+                    all.push(caller);
+                }
+            }
+        }
+        for &(p, line) in providers {
+            for &to in &all {
+                if p != to && seen.insert((p, to, c)) {
+                    edges.push(Edge { from: p, to, kind: EdgeKind::Context, line, site: p, ctx: Some(c) });
+                }
+            }
+        }
+    }
+    decls
+}
+
+/// Folders that never hold the project's own source.
+fn is_skipped_dir(name: &str) -> bool {
+    matches!(name, "node_modules" | ".git" | "dist" | "build" | ".next" | "coverage" | ".turbo" | ".cache")
+}
+
+/// A file `build` parses.
+fn is_source_file(p: &Path) -> bool {
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let s = p.to_string_lossy();
+    matches!(ext, "ts" | "tsx" | "js" | "jsx") && !s.ends_with(".d.ts") && !s.contains(".test.") && !s.contains(".spec.")
+}
+
+/// Would a change to `p` change what `build` returns: a source file, or the tsconfig that
+/// decides how imports resolve, outside the skipped folders. For the file watcher.
+pub fn affects_graph(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    (is_source_file(p) || matches!(name, "tsconfig.json" | "jsconfig.json"))
+        && !p.components().any(|c| is_skipped_dir(&c.as_os_str().to_string_lossy()))
+}
+
 pub fn build(root: &Path) -> Graph {
     // 1. list files (skipping heavy folders)
-    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
-        let n = e.file_name().to_string_lossy();
-        !(n == "node_modules"
-            || n == ".git"
-            || n == "dist"
-            || n == "build"
-            || n == ".next"
-            || n == "coverage"
-            || n == ".turbo"
-            || n == ".cache")
-    });
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| !is_skipped_dir(&e.file_name().to_string_lossy()));
     let mut paths: Vec<PathBuf> = walker
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|p| {
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            matches!(ext, "ts" | "tsx" | "js" | "jsx")
-                && !p.to_string_lossy().ends_with(".d.ts")
-                && !p.to_string_lossy().contains(".test.")
-                && !p.to_string_lossy().contains(".spec.")
-        })
+        .filter(|p| is_source_file(p))
         .collect();
     paths.sort();
 
@@ -1392,6 +1646,7 @@ pub fn build(root: &Path) -> Graph {
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut refs: Vec<RawRef> = Vec::new();
+    let mut ctx_refs: Vec<RawCtx> = Vec::new();
     let mut aliases: HashMap<(String, String), String> = HashMap::new();
     let mut memo_marks: Vec<(String, String)> = Vec::new();
     let mut comp_alias: HashMap<String, String> = HashMap::new();
@@ -1410,6 +1665,10 @@ pub fn build(root: &Path) -> Graph {
             s
         }));
         refs.extend(part.refs.into_iter().map(|mut r| {
+            r.owner += base;
+            r
+        }));
+        ctx_refs.extend(part.ctx_refs.into_iter().map(|mut r| {
             r.owner += base;
             r
         }));
@@ -1435,14 +1694,15 @@ pub fn build(root: &Path) -> Graph {
         }
     }
 
-    let resolver = Resolver::new(&symbols, &modules, &file_list);
+    let alias_map = AliasMap::load(root);
+    let resolver = Resolver::new(&symbols, &modules, &file_list, &alias_map);
 
     let mut edges: Vec<Edge> = Vec::new();
     let mut seen: HashSet<(usize, usize, EdgeKind)> = HashSet::new();
     // refs arrive in source order per file, so the first one kept is the first use
     let mut push = |from: usize, to: usize, kind: EdgeKind, line: usize, site: usize, edges: &mut Vec<Edge>| {
         if from != to && seen.insert((from, to, kind)) {
-            edges.push(Edge { from, to, kind, line, site });
+            edges.push(Edge { from, to, kind, line, site, ctx: None });
         }
     };
 
@@ -1518,6 +1778,20 @@ pub fn build(root: &Path) -> Graph {
         push(from, t, kind, r.line, owner, &mut edges);
     }
 
+    let contexts = add_context_edges(&symbols, &modules, &resolver, &ctx_refs, &mut edges);
+
+    // loops of renders / calls; a symbol calling itself is plain recursion and doesn't count
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); symbols.len()];
+    for e in edges.iter().filter(|e| matches!(e.kind, EdgeKind::Renders | EdgeKind::Calls)) {
+        adj[e.from].push(e.to);
+    }
+    let cycles = find_cycles(&adj);
+    for (c, members) in cycles.iter().enumerate() {
+        for &m in members {
+            symbols[m].cycle = Some(c);
+        }
+    }
+
     let n = symbols.len();
     let mut out = vec![Vec::new(); n];
     let mut inc = vec![Vec::new(); n];
@@ -1526,7 +1800,7 @@ pub fn build(root: &Path) -> Graph {
         inc[e.to].push(ei);
     }
     file_list.sort();
-    Graph { symbols, edges, files, file_list, out, inc }
+    Graph { symbols, edges, files, file_list, contexts, cycles, out, inc }
 }
 
 #[cfg(test)]
@@ -1668,6 +1942,75 @@ mod tests {
         // const Lazy = lazy(() => import("./LazyPage"))
         let app = idx(&g, "c/App.tsx", "App");
         assert_eq!(targets(&g, app, EdgeKind::Renders), ["c/LazyPage.tsx:LazyPage"]);
+    }
+
+    #[test]
+    fn tsconfig_paths_resolve_aliased_imports() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/aliases"));
+        // "@/ui/Button" and "@shared/Card" via `paths`; the decoys under legacy/ sort first
+        let home = idx(&g, "src/pages/Home.tsx", "Home");
+        assert_eq!(
+            targets(&g, home, EdgeKind::Renders),
+            ["packages/shared/Card.tsx:Card", "src/ui/Button.tsx:Button"]
+        );
+        // "@ui" is an exact pattern pointing at a barrel
+        let about = idx(&g, "src/pages/About.tsx", "About");
+        assert_eq!(targets(&g, about, EdgeKind::Renders), ["src/ui/Button.tsx:Button"]);
+        // nothing renders the legacy decoys
+        assert_eq!(g.in_edges(idx(&g, "legacy/Button.tsx", "Button")).count(), 0);
+    }
+
+    #[test]
+    fn context_providers_link_to_their_readers() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/context"));
+        let app = idx(&g, "App.tsx", "App");
+        // Footer calls useContext itself, Header goes through useTheme (which is linked too);
+        // Plain reads nothing, and legacy/Old reads a different context of the same name
+        assert_eq!(
+            targets(&g, app, EdgeKind::Context),
+            ["Footer.tsx:Footer", "Header.tsx:Header", "useTheme.ts:useTheme"]
+        );
+        assert!(g.out_edges(app).filter(|e| e.kind == EdgeKind::Context).all(|e| {
+            g.edge_label(e) == "context · ThemeContext" && g.contexts[e.ctx.unwrap()].file == "ThemeContext.ts"
+        }));
+        assert_eq!(g.in_edges(idx(&g, "legacy/Old.tsx", "Old")).filter(|e| e.kind == EdgeKind::Context).count(), 0);
+        // the link is not a call or a render
+        assert_eq!(targets(&g, app, EdgeKind::Renders), ["Footer.tsx:Footer", "Header.tsx:Header", "Plain.tsx:Plain"]);
+    }
+
+    #[test]
+    fn render_and_call_loops_are_cycles() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cycles"));
+        let cyc = |name: &str| sym(&g, name).cycle;
+        // A -> B -> C -> A, and the even/odd pair
+        let abc = cyc("A");
+        assert!(abc.is_some() && cyc("B") == abc && cyc("C") == abc);
+        let eo = cyc("isEven");
+        assert!(eo.is_some() && cyc("isOdd") == eo && eo != abc);
+        // renders the loop from outside, renders itself, and is a leaf: none are part of a loop
+        assert!(cyc("Entry").is_none() && cyc("Tree").is_none() && cyc("Leaf").is_none());
+        assert_eq!(g.cycles.len(), 2);
+        let names: Vec<&str> = g.cycles[abc.unwrap()].iter().map(|&i| g.symbols[i].name.as_str()).collect();
+        assert_eq!(names, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn cycle_finder_handles_long_chains_and_self_loops() {
+        // a 50k-node ring would overflow a recursive walk; a lone self-loop is not a cycle
+        let n = 50_000;
+        let mut adj: Vec<Vec<usize>> = (0..n).map(|i| vec![(i + 1) % n]).collect();
+        adj.push(vec![n]);
+        let found = find_cycles(&adj);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].len(), n);
+    }
+
+    #[test]
+    fn only_graph_inputs_count_as_changes() {
+        let hit = |p: &str| affects_graph(Path::new(p));
+        assert!(hit("src/App.tsx") && hit("C:/proj/src/a/b.js") && hit("tsconfig.json") && hit("web/jsconfig.json"));
+        assert!(!hit("README.md") && !hit("src/App.test.tsx") && !hit("src/types.d.ts") && !hit("package.json"));
+        assert!(!hit("node_modules/react/index.js") && !hit("C:/proj/dist/app.js") && !hit(".git/HEAD"));
     }
 
     #[test]

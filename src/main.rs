@@ -1,7 +1,9 @@
 // release builds are a GUI app: no console window behind it
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod alias;
 mod compare;
+mod export;
 mod flow;
 mod graph;
 mod prefs;
@@ -84,6 +86,7 @@ fn icon_svg(glyph: &str) -> &'static str {
         "\u{E8B7}" => "icons/folder.svg",
         "\u{E8C8}" => "icons/copy.svg",
         "\u{E945}" => "icons/zap.svg",
+        "\u{E8EE}" => "icons/repeat.svg",
         "\u{ED1A}" => "icons/eye-off.svg",
         "\u{E706}" => "icons/sun.svg",
         "\u{E708}" => "icons/moon.svg",
@@ -119,7 +122,7 @@ macro_rules! bundled {
 }
 const ICONS: &[(&str, &[u8])] = bundled!(
     "chevron-down.svg", "chevron-right.svg", "copy.svg", "eye-off.svg", "file.svg", "filter-x.svg", "folder.svg",
-    "layers.svg", "minimize-2.svg", "moon.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
+    "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
 );
 
 /// Serves the bundled icons to gpui's `svg()` element.
@@ -354,6 +357,12 @@ struct GraphView {
     /// the popup a press outside just closed, and when: a press on its own toggle button
     /// closes it (mouse-down-out) and must not reopen it on the click that follows
     popup_closed: Option<(Popup, Instant)>,
+    /// watches the open folder; dropping it ends the watch (and the task polling it)
+    watcher: Option<notify::RecommendedWatcher>,
+    /// a rebuild after a file change is running
+    refreshing: bool,
+    /// files changed again while loading / rebuilding: rebuild once more when done
+    reload_pending: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -376,13 +385,15 @@ struct Filters {
     unused: bool,
     /// wrapped in memo / useCallback / useMemo
     memo: bool,
+    /// part of a render / call loop (A renders B renders A)
+    cycle: bool,
     /// Component, Hook, Function
     kinds: [bool; 3],
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.dup || self.exact || self.warn || self.unused || self.memo || self.kinds.iter().any(|&k| k)
+        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.kinds.iter().any(|&k| k)
     }
 }
 
@@ -643,6 +654,48 @@ fn layout(nodes: &[usize], edges: &[Edge], g: &Graph) -> (HashMap<usize, (f32, f
     (pos, (width, height))
 }
 
+/// Open `file` at `line` with the `code` command (VS Code, and Cursor / VSCodium when they
+/// provide one). False when there is no such command or it failed.
+fn open_with_code(file: &std::path::Path, line: usize) -> bool {
+    let target = format!("{}:{line}", file.display());
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        // `code` is a .cmd script there; no console window for it
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "code", "-g", &target]).creation_flags(0x0800_0000);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("code");
+        c.args(["-g", &target]);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Watches `root` recursively; the receiver gets a message for each change to a file that
+/// affects the graph (see `graph::affects_graph`). Dropping the watcher closes the channel.
+fn watch_folder(root: &std::path::Path) -> Option<(notify::RecommendedWatcher, std::sync::mpsc::Receiver<()>)> {
+    use notify::Watcher;
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            if !ev.kind.is_access() && ev.paths.iter().any(|p| graph::affects_graph(p)) {
+                tx.send(()).ok();
+            }
+        }
+    })
+    .ok()?;
+    w.watch(root, notify::RecursiveMode::Recursive).ok()?;
+    Some((w, rx))
+}
+
 // ---------------------------------------------------------------- state
 
 impl GraphView {
@@ -696,6 +749,9 @@ impl GraphView {
             prefs: prefs::Prefs::load(),
             popup: None,
             popup_closed: None,
+            watcher: None,
+            refreshing: false,
+            reload_pending: false,
         }
     }
 
@@ -735,6 +791,63 @@ impl GraphView {
             }
         })
         .detach();
+    }
+
+    /// The drawn cards and links, for export.
+    fn drawn(&self) -> export::Drawn<'_> {
+        export::Drawn {
+            graph: &self.graph,
+            nodes: &self.view.nodes,
+            edges: &self.view.edges,
+            pos: &self.view.pos,
+            card: (NODE_W, NODE_H),
+        }
+    }
+
+    /// Save the drawn graph as an SVG picture, where the user chooses.
+    fn export_svg(&mut self, cx: &mut Context<Self>) {
+        let svg = export::svg(&self.drawn());
+        let rx = cx.prompt_for_new_path(&self.root_path, Some("react-graph.svg"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let msg = match std::fs::write(&path, svg) {
+                    Ok(()) => format!("Saved {}", prefs::display(&path)),
+                    Err(e) => format!("Could not save {}: {e}", prefs::display(&path)),
+                };
+                this.update(cx, |this, cx| {
+                    this.status = msg;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Open the symbol's file at its line in VS Code; without the `code` command, in whatever
+    /// the system opens that kind of file with.
+    fn open_in_editor(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(s) = self.graph.symbols.get(i) else { return };
+        let (path, line) = (self.root_path.join(&s.file), s.line);
+        let (p, task) = (path.clone(), cx.background_spawn(async move { open_with_code(&path, line) }));
+        cx.spawn(async move |this, cx| {
+            if !task.await {
+                this.update(cx, |this, cx| {
+                    this.status = "No `code` command found: opened with the system default instead".into();
+                    cx.open_with_system(&p);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Put the drawn graph on the clipboard as a Mermaid flowchart.
+    fn copy_mermaid(&mut self, cx: &mut Context<Self>) {
+        let text = export::mermaid(&self.drawn());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = format!("Copied a Mermaid diagram of {} cards to the clipboard", self.view.nodes.len());
     }
 
     /// Open a folder from the recent list; one that is gone is dropped from the list instead.
@@ -947,6 +1060,7 @@ impl GraphView {
                 (Move::Go, EdgeKind::Renders) => format!("<{to} />"),
                 (Move::Go, EdgeKind::Handler) => format!("on event: {to}()"),
                 (Move::Go, EdgeKind::Defines) => format!("defines {to}"),
+                (Move::Go, EdgeKind::Context) => format!("context to {to}"),
             };
             let cur = cur_row == Some(r);
             let color = if cur {
@@ -1702,6 +1816,8 @@ impl GraphView {
         self.tree = DirNode::default();
         self.view = ViewData::default();
         self.status = "Loading…".into();
+        self.reload_pending = false;
+        self.start_watching(cx);
         cx.notify();
         let task = cx.background_spawn(async move {
             let t = Instant::now();
@@ -1737,11 +1853,145 @@ impl GraphView {
                 this.loading = false;
                 this.relayout();
                 this.fit_pending = true;
+                // files changed while this was loading
+                if std::mem::take(&mut this.reload_pending) {
+                    this.reload_graph(cx);
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Rebuild when a source file or tsconfig under the open folder changes. Dropping the old
+    /// watcher closes its channel, which ends the task polling it.
+    fn start_watching(&mut self, cx: &mut Context<Self>) {
+        use std::sync::mpsc::TryRecvError;
+        use std::time::Duration;
+        self.watcher = None;
+        let Some((w, rx)) = watch_folder(&self.root_path) else { return };
+        self.watcher = Some(w);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(300)).await;
+                let mut dirty = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(()) => dirty = true,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+                if !dirty {
+                    continue;
+                }
+                // let a burst (format on save, git checkout) settle before rebuilding once
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(400)).await;
+                    let mut more = false;
+                    while rx.try_recv().is_ok() {
+                        more = true;
+                    }
+                    if !more {
+                        break;
+                    }
+                }
+                if this.update(cx, |this, cx| this.reload_graph(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Rebuild the graph of the open folder in place: selection, expanded cards, pins and the
+    /// view stay where they are.
+    fn reload_graph(&mut self, cx: &mut Context<Self>) {
+        if self.root.is_empty() {
+            return;
+        }
+        if self.loading || self.refreshing {
+            self.reload_pending = true;
+            return;
+        }
+        self.refreshing = true;
+        let root = self.root_path.clone();
+        let build_root = root.clone();
+        let task = cx.background_spawn(async move {
+            let t = Instant::now();
+            let g = graph::build(&build_root);
+            (g, t.elapsed())
+        });
+        cx.spawn(async move |this, cx| {
+            let (g, took) = task.await;
+            this.update(cx, |this, cx| {
+                this.refreshing = false;
+                if this.graph_root_is(&root) && !this.loading {
+                    this.apply_reload(g, took);
+                }
+                if std::mem::take(&mut this.reload_pending) {
+                    this.reload_graph(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Swap in a rebuilt graph, carrying symbol indexes over by (file, name, nth with that name).
+    fn apply_reload(&mut self, g: Graph, took: std::time::Duration) {
+        fn keys(g: &Graph) -> Vec<(String, String, usize)> {
+            let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+            g.symbols
+                .iter()
+                .map(|s| {
+                    let n = seen.entry((s.file.as_str(), s.name.as_str())).or_default();
+                    *n += 1;
+                    (s.file.clone(), s.name.clone(), *n - 1)
+                })
+                .collect()
+        }
+        let old = keys(&self.graph);
+        let fresh: HashMap<(String, String, usize), usize> =
+            keys(&g).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+        let carry = |i: usize| old.get(i).and_then(|k| fresh.get(k)).copied();
+
+        self.selected = self.selected.and_then(carry);
+        self.scope_seen = self.selected;
+        self.filter_scope = self.filter_scope.and_then(carry);
+        self.expanded = self.expanded.iter().filter_map(|&i| carry(i)).collect();
+        self.pinned = self.pinned.iter().filter_map(|&i| carry(i)).collect();
+        // anything holding indexes into the old graph
+        self.cmp = None;
+        self.flow = None;
+        self.menu = None;
+        self.hover_card = None;
+
+        self.status = format!(
+            "{} files · {} symbols · {} edges · reloaded in {:.1}s",
+            g.files,
+            g.symbols.len(),
+            g.edges.len(),
+            took.as_secs_f32()
+        );
+        if self.focus_file.as_ref().is_some_and(|f| !g.file_list.contains(f)) {
+            self.focus_file = None;
+        }
+        self.tree = DirNode::build(&g.file_list);
+        self.file_syms.clear();
+        for s in g.symbols.iter().filter(|s| s.parent.is_none()) {
+            *self.file_syms.entry(s.file.clone()).or_default() += 1;
+        }
+        self.graph = g;
+        self.set_scope(self.filter_scope);
+        // the code panel shows the file as it is now
+        if let Some(f) = self.code.file.clone() {
+            self.code.src = Some(source::load(&self.root_path.join(&f)).map(Rc::new));
+            self.code.scrolled_for = None;
+        }
+        self.relayout();
     }
 
     /// Still showing `root` (another folder may have been opened while it loaded).
@@ -1778,6 +2028,7 @@ impl GraphView {
     fn follows(&self, e: &Edge) -> bool {
         let g = &self.graph;
         e.from != e.to
+            && e.kind != EdgeKind::Context
             && (self.show_functions
                 || g.symbols[e.from].kind != SymKind::Component
                 || g.symbols[e.to].kind == SymKind::Component)
@@ -1828,7 +2079,7 @@ impl GraphView {
 
     /// Nothing references `i` except the symbol that defines it.
     fn is_unused(&self, i: usize) -> bool {
-        !self.graph.in_edges(i).any(|e| e.from != i && e.kind != EdgeKind::Defines)
+        !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
     }
 
     /// Follow selection changes. The selection's own links are drawn (see `relayout`), so the
@@ -1917,6 +2168,7 @@ impl GraphView {
             && (!f.warn || s.warnings() > 0)
             && (!f.memo || s.is_memoized())
             && (!f.unused || self.is_unused(i))
+            && (!f.cycle || s.cycle.is_some())
     }
 
     /// What the canvas starts from while filtering: every match, and every card on a path to one
@@ -2245,14 +2497,21 @@ impl GraphView {
                 ),
             );
         }
-        m = m.child(sep()).child(item("menu-source", "</> View source".into()).on_click(cx.listener(
-            move |this, _, _, cx| {
+        m = m
+            .child(sep())
+            .child(item("menu-source", "</> View source".into()).on_click(cx.listener(move |this, _, _, cx| {
                 this.menu = None;
                 this.selected = Some(i);
                 this.source_tab = true;
                 cx.notify();
-            },
-        )));
+            })))
+            .child(item("menu-editor", "\u{2197} Open in editor".into()).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.menu = None;
+                    this.open_in_editor(i, cx);
+                    cx.notify();
+                },
+            )));
         if other_file {
             m = m.child(item("menu-file", format!("Show only {}", short_file(&file))).on_click(cx.listener(
                 move |this, _, _, cx| {
@@ -2384,7 +2643,7 @@ impl GraphView {
             if again || depth >= 8 {
                 return;
             }
-            for e in v.graph.out_edges(n) {
+            for e in v.graph.out_edges(n).filter(|e| e.kind != EdgeKind::Context) {
                 rec(v, e.to, depth + 1, Some(e.kind), expanded, out);
             }
         }
@@ -2656,6 +2915,7 @@ fn edge_color(k: EdgeKind) -> Hsla {
         EdgeKind::Calls => rgb(0xc4b5fd).into(),
         EdgeKind::Handler => rgb(0x86efac).into(),
         EdgeKind::Defines => rgb(0xd1d5db).into(),
+        EdgeKind::Context => rgb(0xf59e0b).into(),
     }
 }
 
@@ -3558,7 +3818,7 @@ impl Render for GraphView {
                     };
                     let c4 = edge_curve((*fx, *fy), (*tx, *ty), z);
                     let w = (if hot { 2.4 } else { 1.8 } * z.sqrt()).clamp(1.0, 3.0);
-                    let dash = (*kind == EdgeKind::Defines && z >= 0.35).then_some((5.0, 4.0));
+                    let dash = (*kind == EdgeKind::Context || (*kind == EdgeKind::Defines && z >= 0.35)).then_some((5.0, 4.0));
                     strokes.curve(bounds.origin, c4, w, dash, c);
                 }
 
@@ -4124,7 +4384,7 @@ impl Render for GraphView {
             side = side.child(tabs);
 
             type Toggle = fn(&mut Filters);
-            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 5] = [
+            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 6] = [
                 (
                     "f-dup",
                     "\u{E8C8}",
@@ -4174,6 +4434,16 @@ impl Render for GraphView {
                     f.memo,
                     0x0e7490,
                     |f| f.memo = !f.memo,
+                ),
+                (
+                    "f-cycle",
+                    "\u{E8EE}",
+                    "Cycles",
+                    "Renders or calls itself through a loop (A \u{2192} B \u{2192} A)",
+                    count(&|i| g.symbols[i].cycle.is_some()),
+                    f.cycle,
+                    0xbe185d,
+                    |f| f.cycle = !f.cycle,
                 ),
             ];
             let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().items_center().gap(px(2.));
@@ -4786,6 +5056,15 @@ impl Render for GraphView {
                     cx.notify();
                 })),
             );
+            buttons = buttons
+                .child(ghost_button("export-svg", "Export SVG").on_click(cx.listener(|this, _, _, cx| {
+                    this.export_svg(cx);
+                    cx.notify();
+                })))
+                .child(ghost_button("copy-mermaid", "Copy Mermaid").on_click(cx.listener(|this, _, _, cx| {
+                    this.copy_mermaid(cx);
+                    cx.notify();
+                })));
             let plural = |n: usize| if n == 1 { "" } else { "s" };
             let shown = self.view.nodes.len();
             let stats = match &self.focus_file {
@@ -5176,6 +5455,39 @@ impl Render for GraphView {
                 }
             }
 
+            if let Some(members) = self.graph.symbols[sel].cycle.map(|c| self.graph.cycles[c].clone()) {
+                p = p.child(section("Cycle"));
+                p = p.child(
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .text_color(rgb(0xbe185d))
+                        .child("Renders or calls itself again through these:"),
+                );
+                for (n, m) in members.into_iter().filter(|&m| m != sel).take(30).enumerate() {
+                    let t = &self.graph.symbols[m];
+                    p = p.child(
+                        div()
+                            .id(("cyc", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reveal(m);
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
+                            .child(div().text_sm().child(t.name.clone())),
+                    );
+                }
+            }
+
             p = p.child(section("Used by"));
             let used_by: Vec<_> = self.graph.in_edges(sel).take(30).copied().collect();
             if used_by.is_empty() {
@@ -5202,7 +5514,7 @@ impl Render for GraphView {
                         .gap_2()
                         .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
                         .child(div().text_sm().child(t.name.clone()))
-                        .child(div().text_xs().text_color(rgb(MUTED)).child(e.kind.label())),
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(self.graph.edge_label(&e))),
                 );
             }
 
@@ -5952,4 +6264,27 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn watcher_reports_source_changes_only() {
+        let dir = std::env::temp_dir().join(format!("react-graph-watch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let (_w, rx) = watch_folder(&dir).expect("watch the folder");
+
+        // not a graph input: nothing arrives
+        std::fs::write(dir.join("notes.md"), "hi").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(1500)).is_err());
+
+        // a new component does
+        std::fs::write(dir.join("src").join("New.tsx"), "export function New() { return <div /> }").unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok(), "no event for a new .tsx file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
