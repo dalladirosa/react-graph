@@ -7,6 +7,7 @@ mod drill;
 mod export;
 mod flow;
 mod graph;
+mod path;
 mod prefs;
 mod similar;
 mod source;
@@ -351,6 +352,10 @@ struct GraphView {
     seq_follow: bool,
     /// right-click menu on a card: (card, window position)
     menu: Option<(usize, (f32, f32))>,
+    /// "Find path" start, picked from a card's menu: "Find path to here" on another card completes the route
+    path_from: Option<usize>,
+    /// the shortest route being shown: its cards and links stay lit, everything else fades
+    path: Option<PathView>,
     /// theme and recent projects, saved between runs
     prefs: prefs::Prefs,
     /// open drop-down from the sidebar header
@@ -404,6 +409,15 @@ fn kind_index(k: SymKind) -> usize {
         SymKind::Hook => 1,
         SymKind::Function => 2,
     }
+}
+
+/// A route between two symbols (see `path`).
+struct PathView {
+    route: path::Route,
+    /// the route's symbols, for quick lookups
+    set: HashSet<usize>,
+    /// the route's links
+    edges: HashSet<flow::EdgeKey>,
 }
 
 /// An animated trace through the graph (see `flow`).
@@ -747,6 +761,8 @@ impl GraphView {
             seq_scroll: (0.0, 0.0),
             seq_follow: true,
             menu: None,
+            path_from: None,
+            path: None,
             prefs: prefs::Prefs::load(),
             popup: None,
             popup_closed: None,
@@ -1806,6 +1822,8 @@ impl GraphView {
         self.code = CodeView::default();
         self.cmp = None;
         self.flow = None;
+        self.path = None;
+        self.path_from = None;
         self.file_panel = false;
         self.selected = None;
         self.scope_seen = None;
@@ -1967,6 +1985,8 @@ impl GraphView {
         // anything holding indexes into the old graph
         self.cmp = None;
         self.flow = None;
+        self.path = None;
+        self.path_from = None;
         self.menu = None;
         self.hover_card = None;
 
@@ -2418,6 +2438,65 @@ impl GraphView {
         }
     }
 
+    /// The strip over the canvas while a route is shown (or waiting for its end): what it is, and how to close it.
+    fn path_banner(&self, vw: f32, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let g = &self.graph;
+        let name = |i: usize| g.symbols[i].name.clone();
+        let (text, hint) = match (&self.path, self.path_from) {
+            (Some(p), _) => {
+                let steps = p.route.edges.len();
+                let route = p.route.nodes.iter().map(|&n| name(n)).collect::<Vec<_>>().join(" \u{2192} ");
+                let dir = if p.route.reversed { " (reverse direction)" } else { "" };
+                (format!("Path \u{b7} {steps} step{}{dir}: {route}", if steps == 1 { "" } else { "s" }), "Esc to clear")
+            }
+            (None, Some(f)) => (
+                format!("Path from {}: right-click the other card, then \"Find path to here\"", name(f)),
+                "Esc to cancel",
+            ),
+            (None, None) => return None,
+        };
+        let right = if self.showing_code() || self.cmp.is_some() { self.right_gap(vw) } else { MARGIN };
+        Some(
+            div()
+                .id("path-banner")
+                .occlude()
+                .absolute()
+                .top(px(TOP_BAR - 8.))
+                .left(px(LEFT_W + MARGIN))
+                .right(px(right))
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(
+                    card()
+                        .max_w_full()
+                        .px_3()
+                        .py(px(6.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .text_sm()
+                        .child(div().flex_shrink_0().text_color(rgb(ACCENT)).child("\u{2937}"))
+                        .child(div().min_w(px(0.)).overflow_hidden().whitespace_nowrap().text_ellipsis().child(text))
+                        .child(div().flex_shrink_0().text_xs().text_color(rgb(MUTED)).child(hint))
+                        .child(
+                            tool_icon("path-clear", "\u{E711}", 9., None)
+                                .w(px(20.))
+                                .h(px(20.))
+                                .tooltip(tip("Clear path", Some("Esc")))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.path = None;
+                                    this.path_from = None;
+                                    this.status.clear();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The right-click menu on a card: the detail panel's actions, without selecting first.
     fn card_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (i, (x, y)) = self.menu?;
@@ -2487,6 +2566,29 @@ impl GraphView {
                 this.reveal(i);
                 cx.notify();
             })));
+        // route between two cards: pick the start here, then "Find path to here" on the other card
+        if let Some(from) = self.path_from.filter(|&f| f != i) {
+            let from_name = self.graph.symbols[from].name.clone();
+            m = m.child(item("menu-path-to", format!("Find path to here from {from_name}")).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.menu = None;
+                    this.find_path(from, i);
+                    cx.notify();
+                },
+            )));
+        }
+        m = m.child(item("menu-path-from", "Find path from here\u{2026}".into()).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.menu = None;
+                this.path = None;
+                this.path_from = Some(i);
+                this.status = format!(
+                    "Path from {}: right-click another card and choose \"Find path to here\"",
+                    this.graph.symbols[i].name
+                );
+                cx.notify();
+            },
+        )));
         if kids > 0 {
             m = m.child(
                 item("menu-expand", if open { "Collapse".into() } else { format!("Expand ({kids})") }).on_click(
@@ -2565,6 +2667,7 @@ impl GraphView {
 
     fn collapse_all(&mut self) {
         self.flow = None;
+        self.path = None;
         self.expanded.clear();
         self.pinned.clear();
         self.relayout();
@@ -2573,6 +2676,13 @@ impl GraphView {
 
     /// Expand the shortest path from something already visible down to `t`, select and center it.
     fn reveal(&mut self, t: usize) {
+        self.ensure_visible(t);
+        self.selected = Some(t);
+        self.center_on(t);
+    }
+
+    /// Draw `t`: open the cards that lead to it, or pin it when no drawn card does.
+    fn ensure_visible(&mut self, t: usize) {
         if !self.view.set.contains(&t) {
             let mut next: HashMap<usize, usize> = HashMap::new(); // parent -> child toward t
             let mut queue = VecDeque::from([t]);
@@ -2610,8 +2720,54 @@ impl GraphView {
                 self.relayout();
             }
         }
-        self.selected = Some(t);
-        self.center_on(t);
+    }
+
+    /// Show the shortest route between `a` and `b`: draw every card on it, light it up and fade the rest.
+    fn find_path(&mut self, a: usize, b: usize) {
+        self.path_from = None;
+        let Some(route) = path::find(&self.graph, a, b) else {
+            self.path = None;
+            let g = &self.graph;
+            self.status = format!("No render or call path between {} and {}", g.symbols[a].name, g.symbols[b].name);
+            return;
+        };
+        self.flow = None;
+        for &n in &route.nodes {
+            self.ensure_visible(n);
+        }
+        let set = route.nodes.iter().copied().collect();
+        let edges = route.edges.iter().map(flow::key).collect();
+        let names: Vec<&str> = route.nodes.iter().map(|&n| self.graph.symbols[n].name.as_str()).collect();
+        let steps = route.edges.len();
+        self.status = format!("Path \u{b7} {} step{}: {}", steps, if steps == 1 { "" } else { "s" }, names.join(" \u{2192} "));
+        self.path = Some(PathView { route, set, edges });
+        self.fit_path();
+    }
+
+    /// Zoom and pan so the whole route is in view.
+    fn fit_path(&mut self) {
+        let Some(p) = &self.path else { return };
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for n in &p.route.nodes {
+            if let Some(&(x, y)) = self.view.pos.get(n) {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + NODE_W);
+                y1 = y1.max(y + NODE_H);
+            }
+        }
+        if x0 > x1 {
+            return;
+        }
+        let (vw, vh) = self.last_vp;
+        let left = LEFT_W + MARGIN;
+        let right = if self.showing_code() || self.cmp.is_some() { self.right_gap(vw) } else { MARGIN };
+        let aw = (vw - left - right).max(100.0);
+        let ah = (vh - TOP_BAR - 60.0).max(100.0);
+        let (w, h) = (x1 - x0, y1 - y0);
+        let z = ((aw - 80.0) / w).min((ah - 80.0) / h).clamp(0.2, 1.0);
+        self.zoom = z;
+        self.off = (left + (aw - w * z) / 2.0 - x0 * z, TOP_BAR + 30.0 + (ah - h * z) / 2.0 - y0 * z);
     }
 
     fn center_on(&mut self, i: usize) {
@@ -3707,9 +3863,11 @@ impl Render for GraphView {
         let focus = selected
             .filter(|s| trace.is_none() && self.focus_selection && self.view.set.contains(s))
             .map(|s| self.lineage(s));
-        let related = |i: usize| match trace {
-            Some(t) => t.nodes.contains(&i),
-            None => focus.as_ref().is_none_or(|(up, down)| up.contains(&i) || down.contains(&i)),
+        let path = self.path.as_ref().filter(|_| trace.is_none());
+        let related = |i: usize| match (trace, path) {
+            (Some(t), _) => t.nodes.contains(&i),
+            (None, Some(p)) => p.set.contains(&i),
+            (None, None) => focus.as_ref().is_none_or(|(up, down)| up.contains(&i) || down.contains(&i)),
         };
 
         let to_screen = |x: f32, y: f32| (x * z + ox, y * z + oy);
@@ -3742,6 +3900,9 @@ impl Render for GraphView {
                 let k = flow::key(e);
                 let level = match trace {
                     Some(tr) => u8::from(tr.edges.contains(&k)),
+                    None if path.is_some() => {
+                        if path.is_some_and(|p| p.edges.contains(&k)) { 2 } else { 0 }
+                    }
                     None => {
                         let hot = selected == Some(e.from) || selected == Some(e.to);
                         let on_path = focus.as_ref().is_none_or(|(up, down)| {
@@ -5052,6 +5213,7 @@ impl Render for GraphView {
                     this.show_functions = !this.show_functions;
                     // cards a playing trace runs through may disappear
                     this.flow = None;
+                    this.path = None;
                     this.relayout();
                     this.fit_pending = true;
                     cx.notify();
@@ -6205,6 +6367,10 @@ impl Render for GraphView {
                     "escape" => {
                         if this.menu.is_some() {
                             this.menu = None;
+                        } else if (this.path.is_some() || this.path_from.is_some()) && this.query.is_empty() {
+                            this.path = None;
+                            this.path_from = None;
+                            this.status.clear();
                         } else if this.flow.is_some() && this.query.is_empty() {
                             this.flow = None;
                         } else if this.cmp.is_some() {
@@ -6274,6 +6440,9 @@ impl Render for GraphView {
         }
         if !seq_on && !self.root.is_empty() {
             root = root.child(controls);
+        }
+        if let Some(b) = self.path_banner(vw, cx) {
+            root = root.child(b);
         }
         if let Some(m) = self.card_menu(cx) {
             root = root.child(m);

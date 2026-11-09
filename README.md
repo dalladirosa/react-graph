@@ -22,6 +22,7 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
   - **Cycles:** components or functions that render or call each other in a loop (A → B → A). Self-recursion doesn't count.
 - **Compare.** Shows two similar symbols side by side, with the differing tokens highlighted.
 - **Play flow.** Animates a trace from any symbol, either level by level ("waves") or in call-and-return order, and can also show it as a sequence diagram.
+- **Path finder.** Right-click a card and choose **Find path from here…**, then right-click another card and choose **Find path to here**. The shortest chain of renders and calls between them is drawn, lit up, with everything else faded. If the second card doesn't lead to the first, the other direction is tried. Esc clears it.
 - **Source view.** Shows the code for the selected symbol or file.
 - **Export.** **Export SVG** saves what is drawn as a picture, and **Copy Mermaid** puts it on the clipboard as a Mermaid flowchart.
 - **Open in editor.** Right-click a card and choose **Open in editor** to jump to its line in VS Code (the `code` command must be on your PATH; otherwise the file opens with the system default).
