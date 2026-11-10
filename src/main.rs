@@ -2000,6 +2000,7 @@ impl GraphView {
             (f.unused, "unused"),
             (f.memo, "memo"),
             (f.cycle, "cycle"),
+            (f.untested, "untested"),
         ];
         let kinds = ["component", "hook", "function"];
         let keys = |set: &mut dyn Iterator<Item = usize>| {
@@ -2035,6 +2036,7 @@ impl GraphView {
                     "unused" => f.unused = true,
                     "memo" => f.memo = true,
                     "cycle" => f.cycle = true,
+                    "untested" => f.untested = true,
                     _ => {}
                 }
             }
