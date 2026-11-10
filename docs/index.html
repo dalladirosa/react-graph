@@ -1,0 +1,1231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React Graph · The map for your React codebase</title>
+<meta name="description" content="A fast desktop app for Windows and macOS that maps a React codebase as an interactive graph of components, hooks and functions. It parses your code with tree-sitter and never runs it.">
+<meta property="og:title" content="React Graph">
+<meta property="og:description" content="The map for your React codebase: components, hooks and functions as an interactive graph.">
+<meta property="og:image" content="screenshot.png">
+<link rel="icon" type="image/png" href="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f6f6fb;
+    --surface: #ffffff;
+    --tint: #f0eff8;
+    --line: #e2e1ee;
+    --line-2: #cfcde0;
+    --ink: #1b1a33;
+    --text: #3d3c58;
+    --muted: #6e6d88;
+    --faint: #9b9ab2;
+    --pink: #ff1f75;
+    --purple: #8b5cf6;
+    --grad: linear-gradient(120deg, #ff1f75 0%, #c13cf0 55%, #7c5cff 100%);
+    --blue: #3b82f6;
+    --green: #10b981;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: Inter, "Segoe UI", -apple-system, system-ui, sans-serif;
+    --display: "Inter Tight", Inter, "Segoe UI", system-ui, sans-serif;
+    --max: 1200px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; }
+  img { max-width: 100%; height: auto; display: block; }
+  code, kbd { font-family: var(--mono); font-size: .86em; }
+  code { background: var(--tint); border-radius: 5px; padding: .12em .4em; color: var(--ink); }
+  kbd { border: 1px solid var(--line-2); border-bottom-width: 2px; border-radius: 5px; padding: .05em .4em; background: var(--surface); }
+  h1, h2, h3, h4 { font-family: var(--display); color: var(--ink); letter-spacing: -.02em; }
+
+  /* ---------- Frame grid (vite.dev style) ---------- */
+  .frame {
+    max-width: var(--max); margin: 0 auto;
+    border-inline: 1px solid var(--line); background: var(--bg);
+  }
+  .row { position: relative; border-bottom: 1px solid var(--line); }
+  .row::before, .row::after {
+    content: "+"; position: absolute; bottom: -.72em; z-index: 2;
+    font: 300 18px/1 var(--mono); color: var(--line-2); width: 1em; text-align: center;
+  }
+  .row::before { left: -.5em; }
+  .row::after { right: -.5em; }
+  .pad { padding: 72px 56px; }
+  @media (max-width: 760px) { .pad { padding: 52px 20px; } }
+  .label { font: 500 12px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .label b { color: var(--pink); font-weight: 500; }
+  .h2 { font-size: clamp(34px, 4.6vw, 54px); line-height: 1.04; margin: 14px 0 16px; font-weight: 600; }
+  .lead { font-size: 18px; color: var(--muted); max-width: 38em; margin: 0; }
+  .center { text-align: center; }
+  .center .lead { margin-inline: auto; }
+
+  /* ---------- Banner + nav ---------- */
+  .banner {
+    background: var(--grad); color: #fff; text-align: center;
+    font: 500 12.5px var(--mono); letter-spacing: .06em; padding: 9px 16px;
+  }
+  .banner a { text-decoration: none; }
+  .banner span { opacity: .8; }
+  nav { position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(12px); }
+  nav .frame { background: transparent; display: flex; align-items: center; gap: 28px; height: 64px; padding: 0 28px; border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; font: 700 17px var(--display); color: var(--ink); letter-spacing: .02em; text-transform: uppercase; }
+  .brand img { width: 28px; height: 28px; }
+  nav ul { position: relative; display: flex; gap: 2px; list-style: none; margin: 0 0 0 auto; padding: 4px; border-radius: 12px; }
+  nav ul li { position: relative; z-index: 1; }
+  nav ul a {
+    display: block; padding: 6px 13px; border-radius: 8px;
+    color: var(--muted); text-decoration: none; font-size: 14.5px; font-weight: 500;
+    transition: color .25s, background .25s, transform .12s;
+  }
+  nav ul a:hover { color: var(--ink); background: color-mix(in srgb, var(--tint) 80%, transparent); }
+  nav ul a:active { transform: scale(.94); }
+  nav ul a[aria-current="true"] { color: var(--ink); background: transparent; }
+  .nav-pill {
+    position: absolute; z-index: 0; top: 4px; left: 0; height: calc(100% - 8px); width: 0; border-radius: 8px;
+    background: var(--surface); box-shadow: 0 1px 2px rgba(27,26,51,.08), 0 4px 12px -4px rgba(139,92,246,.25), inset 0 0 0 1px var(--line);
+    opacity: 0; pointer-events: none;
+    transition: transform .45s cubic-bezier(.2,.8,.2,1), width .45s cubic-bezier(.2,.8,.2,1), opacity .25s;
+  }
+  .nav-pill::after {
+    content: ""; position: absolute; left: 30%; right: 30%; bottom: -5px; height: 2px; border-radius: 2px; background: var(--grad);
+  }
+  [id] { scroll-margin-top: 76px; }
+  .label.flash { animation: flash 1.1s cubic-bezier(.2,.8,.2,1); }
+  @keyframes flash {
+    0% { color: var(--muted); letter-spacing: .1em; }
+    25% { color: var(--pink); letter-spacing: .22em; }
+    100% { color: var(--muted); letter-spacing: .1em; }
+  }
+  .h2.flash { animation: rise .7s cubic-bezier(.2,.8,.2,1); }
+  @keyframes rise { from { opacity: .3; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @media (max-width: 760px) { nav ul li.opt { display: none; } nav .frame { padding: 0 16px; } }
+
+  /* ---------- Buttons ---------- */
+  .btn {
+    position: relative; display: inline-flex; align-items: center; gap: 9px;
+    padding: 11px 20px; border-radius: 10px; text-decoration: none;
+    font: 600 15px var(--sans); color: var(--ink);
+    background: var(--surface); border: 1px solid var(--line-2);
+    transition: transform .15s, box-shadow .2s, border-color .2s;
+  }
+  .btn:hover { transform: translateY(-1px); border-color: var(--faint); }
+  .btn:active { transform: translateY(0) scale(.96); transition-duration: .06s; }
+  .btn svg { transition: transform .25s cubic-bezier(.2,.8,.2,1); }
+  .btn:hover svg { transform: translateY(1px); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+  }
+  .btn svg { width: 18px; height: 18px; }
+  .btn.primary {
+    color: #fff; border: 0; background: var(--grad);
+    box-shadow: 0 8px 24px -8px rgba(255, 31, 117, .55), inset 0 1px 0 rgba(255,255,255,.25);
+  }
+  .btn.primary:hover { box-shadow: 0 12px 30px -8px rgba(193, 60, 240, .6), inset 0 1px 0 rgba(255,255,255,.25); }
+  .btn.sm { padding: 8px 15px; font-size: 14px; }
+
+  /* ---------- Hero ---------- */
+  .hero { display: grid; grid-template-columns: 1fr 1fr; }
+  .hero > div { min-width: 0; }
+  .hero-copy { padding: 72px 56px 56px; border-right: 1px solid var(--line); }
+  .hero h1 { font-size: clamp(46px, 6.4vw, 82px); line-height: .98; letter-spacing: -.035em; font-weight: 600; margin: 22px 0 22px; }
+  .hero h1 .g { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero p.lead { font-size: 18.5px; max-width: 30em; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+
+  .get {
+    margin-top: 48px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(27,26,51,.04);
+  }
+  .get-tabs { position: relative; display: flex; gap: 4px; padding: 6px 10px 0; border-bottom: 1px solid var(--line); }
+  .get-tabs .ind {
+    position: absolute; bottom: -1px; left: 0; height: 2px; width: 0; border-radius: 2px; background: var(--grad);
+    transition: transform .35s cubic-bezier(.2,.8,.2,1), width .35s cubic-bezier(.2,.8,.2,1);
+  }
+  .get-tabs button { transition: color .2s, transform .1s; }
+  .get-tabs button:hover { color: var(--ink); }
+  .get-tabs button:active { transform: scale(.95); }
+  .get-tabs button {
+    font: 500 13.5px var(--sans); color: var(--muted); background: none; border: 0; cursor: pointer;
+    padding: 9px 10px 10px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .get-tabs button[aria-selected="true"] { color: var(--ink); }
+  .get-body { padding: 14px 18px 16px; font: 13.5px/1.75 var(--mono); color: var(--ink); overflow-x: auto; white-space: nowrap; }
+  .get-body .p { color: var(--pink); user-select: none; }
+  .get-body .c { color: var(--faint); }
+  .get-body [hidden] { display: none; }
+
+  .hero-art {
+    position: relative; display: grid; place-items: center; padding: 40px 24px; overflow: hidden;
+    background:
+      radial-gradient(60% 50% at 55% 55%, rgba(193, 60, 240, .14), transparent 70%),
+      radial-gradient(40% 35% at 35% 40%, rgba(255, 31, 117, .10), transparent 70%);
+  }
+  .hero-art svg { width: 100%; max-width: 560px; height: auto; overflow: visible; }
+  .iso-card rect.body { fill: #fff; stroke: var(--line-2); stroke-width: 1; }
+  .iso-card text { font-family: var(--display); font-weight: 600; fill: var(--ink); }
+  .iso-card text.sub { font: 400 7px var(--mono); fill: var(--faint); }
+  .iso-edge { fill: none; stroke: #b9b7cf; stroke-width: 1.6; }
+  .iso-edge.ctx { stroke: var(--amber); stroke-dasharray: 4 4; }
+  .iso-edge.hot { stroke: var(--pink); stroke-width: 2.6; }
+  .iso-edge.flow { stroke: #fff; stroke-width: 2.6; stroke-dasharray: 8 400; animation: flow 3s linear infinite; }
+  @keyframes flow { from { stroke-dashoffset: 408; } to { stroke-dashoffset: 0; } }
+  .float { animation: float 5s ease-in-out infinite; }
+  .float.d2 { animation-delay: -1.6s; } .float.d3 { animation-delay: -3.2s; }
+  @keyframes float { 50% { transform: translateY(-6px); } }
+  @media (prefers-reduced-motion: reduce) { .float, .iso-edge.flow { animation: none; } .iso-edge.flow { display: none; } }
+
+  @media (max-width: 960px) {
+    .hero { grid-template-columns: 1fr; }
+    .hero-copy { border-right: 0; border-bottom: 1px solid var(--line); padding: 56px 20px 44px; }
+    .hero-art { order: -1; border-bottom: 1px solid var(--line); padding: 28px 12px; }
+  }
+
+  /* ---------- Strip ---------- */
+  .strip { display: grid; grid-template-columns: repeat(5, 1fr); }
+  .strip div { padding: 22px 16px; text-align: center; border-right: 1px solid var(--line); font: 600 15px var(--display); color: var(--ink); }
+  .strip div:last-child { border-right: 0; }
+  .strip small { display: block; font: 400 12px var(--mono); color: var(--faint); margin-top: 2px; }
+  @media (max-width: 760px) {
+    .strip { grid-template-columns: repeat(2, 1fr); }
+    .strip div { border-bottom: 1px solid var(--line); }
+    .strip div:nth-child(2n) { border-right: 0; }
+    .strip div:last-child { grid-column: span 2; border-bottom: 0; }
+  }
+  .strip-title { padding: 22px 56px; font: 500 15px var(--sans); color: var(--muted); }
+  @media (max-width: 760px) { .strip-title { padding: 18px 20px; } }
+
+  /* ---------- Showcase screenshot ---------- */
+  .showcase { position: relative; margin-top: 48px; }
+  .showcase::before {
+    content: ""; position: absolute; inset: 6% 4% -4%; z-index: 0; filter: blur(60px);
+    background: var(--grad); opacity: .28; border-radius: 40px;
+  }
+  .window {
+    position: relative; z-index: 1; border-radius: 14px; overflow: hidden; background: var(--surface);
+    border: 1px solid var(--line-2); box-shadow: 0 30px 60px -30px rgba(27,26,51,.35);
+  }
+  .window-bar { display: flex; gap: 7px; padding: 11px 14px; background: var(--tint); border-bottom: 1px solid var(--line); }
+  .window-bar i { width: 11px; height: 11px; border-radius: 50%; background: var(--line-2); }
+
+  /* ---------- Feature cells ---------- */
+  .cells { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .cell { padding: 36px 32px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-width: 0; transition: background .2s; }
+  .cell:hover { background: var(--surface); }
+  .cells > .cell:nth-child(3n) { border-right: 0; }
+  .cells > .cell:nth-last-child(-n+3) { border-bottom: 0; }
+  .cell .ic {
+    width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; margin-bottom: 18px;
+    color: var(--c, var(--pink)); background: color-mix(in srgb, var(--c, var(--pink)) 11%, white);
+    border: 1px solid color-mix(in srgb, var(--c, var(--pink)) 22%, white);
+  }
+  .cell .ic svg { width: 20px; height: 20px; }
+  .cell h3 { margin: 0 0 8px; font-size: 19px; font-weight: 600; }
+  .cell p { margin: 0; color: var(--muted); font-size: 15px; }
+  @media (max-width: 960px) {
+    .cells { grid-template-columns: repeat(2, 1fr); }
+    .cells > .cell { border-right: 1px solid var(--line) !important; border-bottom: 1px solid var(--line) !important; }
+    .cells > .cell:nth-child(2n) { border-right: 0 !important; }
+    .cells > .cell:nth-last-child(-n+1) { border-bottom: 0 !important; }
+  }
+  @media (max-width: 620px) {
+    .cells { grid-template-columns: 1fr; }
+    .cells > .cell { border-right: 0 !important; padding: 28px 20px; }
+  }
+
+  /* ---------- Tour ---------- */
+  .tour { display: grid; grid-template-columns: 360px 1fr; }
+  .tour > div { min-width: 0; }
+  .tour-list { border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+  .tour-item {
+    text-align: left; font: inherit; color: inherit; cursor: pointer; background: none; border: 0;
+    border-bottom: 1px solid var(--line); padding: 20px 28px; position: relative; transition: background .15s;
+  }
+  .tour-item:last-child { border-bottom: 0; }
+  .tour-item { transition: background .25s ease; }
+  .tour-item:hover { background: color-mix(in srgb, var(--surface) 70%, transparent); }
+  .tour-item:active { background: var(--tint); }
+  .tour-item[aria-selected="true"] { background: var(--surface); }
+  .tour-item::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--grad);
+    transform: scaleY(0); transform-origin: top; transition: transform .4s cubic-bezier(.2,.8,.2,1);
+  }
+  .tour-item[aria-selected="true"]::before { transform: scaleY(1); }
+  .tour-item b { display: block; font: 600 16.5px var(--display); color: var(--ink); transition: transform .25s cubic-bezier(.2,.8,.2,1), color .25s; }
+  .tour-item:hover b { transform: translateX(4px); }
+  .tour-item[aria-selected="true"] b { transform: none; }
+  .tour-item:active b { transform: translateX(4px) scale(.98); }
+  .tour-item > span {
+    display: grid; grid-template-rows: 0fr; opacity: 0; margin-top: 0;
+    color: var(--muted); font-size: 14.5px;
+    transition: grid-template-rows .4s cubic-bezier(.2,.8,.2,1), opacity .3s ease, margin-top .4s cubic-bezier(.2,.8,.2,1);
+  }
+  .tour-item > span > span { overflow: hidden; min-height: 0; transform: translateY(-4px); transition: transform .4s cubic-bezier(.2,.8,.2,1); }
+  .tour-item[aria-selected="true"] > span { grid-template-rows: 1fr; opacity: 1; margin-top: 4px; transition-delay: 0s, .08s, 0s; }
+  .tour-item[aria-selected="true"] > span > span { transform: none; }
+  .tour-view { padding: 36px 32px; display: flex; flex-direction: column; justify-content: flex-start;
+    background: radial-gradient(70% 60% at 60% 40%, rgba(139, 92, 246, .10), transparent 70%); }
+  /* Animated tour scenes */
+  .stage {
+    position: relative; overflow: hidden; aspect-ratio: 640 / 400; background-color: #fbfbfe;
+    background-image: radial-gradient(#dddbea 1px, transparent 1px); background-size: 18px 18px;
+  }
+  .stage svg { width: 100%; height: 100%; display: block; transition: opacity .28s ease; }
+  .stage.fading svg { opacity: 0; }
+  .stage.instant *, .stage.instant *::before { transition: none !important; animation: none !important; }
+  .stage .mono { font-family: var(--mono); }
+  .stage .sans { font-family: var(--sans); }
+  .stage .card { transition: opacity .5s, transform .5s cubic-bezier(.2,.8,.2,1); transform-box: fill-box; transform-origin: center; }
+  .stage .card .box { fill: #fff; stroke: var(--line-2); stroke-width: 1; transition: stroke .3s, fill .3s, stroke-width .3s; filter: drop-shadow(0 2px 3px rgba(27,26,51,.06)); }
+  .stage .card .k { font: 9.5px var(--mono); fill: var(--faint); }
+  .stage .card .n { font: 600 14px var(--display); fill: var(--ink); }
+  .stage .is-hl .box { stroke: var(--pink); stroke-width: 2; fill: #fff5f9; }
+  .stage .is-warn .box { stroke: var(--amber); stroke-width: 2; fill: #fffaf0; }
+  .stage .is-ok .box { stroke: var(--green); stroke-width: 2; fill: #f3fcf8; }
+  .stage .is-bad .box { stroke: var(--purple); stroke-width: 2; fill: #faf7ff; }
+  .stage .is-dim { opacity: .22; }
+  .stage .edge { fill: none; stroke: #c6c4d8; stroke-width: 1.6; transition: opacity .5s, stroke-dashoffset .7s cubic-bezier(.6,0,.2,1); }
+  .stage .edge.hot { stroke: var(--pink); stroke-width: 3; stroke-linecap: round; }
+  .stage .edge.imp { stroke: var(--green); stroke-width: 2; }
+  .stage .edge.dash { stroke-dasharray: 4 4; }
+  .stage .draw { stroke-dasharray: 1; stroke-dashoffset: 1; }
+  .stage .draw.is-on { stroke-dashoffset: 0; }
+  .stage .sq { fill: none; stroke: var(--amber); stroke-width: 1.6; transition: stroke-dashoffset .5s ease; }
+  .stage .pop { opacity: 0; transform: scale(.6); transform-box: fill-box; transform-origin: center; transition: opacity .3s, transform .5s cubic-bezier(.3,1.5,.5,1); }
+  .stage .pop.is-on { opacity: 1; transform: none; }
+  .stage .fade { opacity: 0; transition: opacity .45s, transform .6s cubic-bezier(.5,0,.2,1); }
+  .stage .fade.is-on { opacity: 1; }
+  .stage .rise { opacity: 0; transform: translateY(10px); }
+  .stage .rise.is-on { opacity: 1; transform: none; }
+  .stage .pkt { opacity: 0; transition: transform .55s cubic-bezier(.5,0,.3,1), opacity .2s; }
+  .stage .pkt.is-on { opacity: 1; transform: translate(var(--dx), var(--dy)); }
+  .stage .pkt.is-on.is-done { opacity: 0; }
+  .stage .scan { transition: transform .35s cubic-bezier(.3,.8,.3,1), opacity .3s; }
+  .stage .btn-r { transition: fill .2s, stroke .2s; }
+  .stage .is-hl .btn-r { fill: #ffe7f0; stroke: var(--pink); }
+  .stage .cur { transition: transform .65s cubic-bezier(.45,0,.2,1); }
+  .stage .cur .tip { transform-box: fill-box; transform-origin: 0 0; transition: transform .12s; }
+  .stage .cur.is-press .tip { transform: scale(.82); }
+  .stage .cur .rip { transform-box: fill-box; transform-origin: center; opacity: 0; }
+  .stage .cur.is-press .rip { animation: rip .5s ease-out; }
+  @keyframes rip { from { opacity: .45; transform: scale(.2); } to { opacity: 0; transform: scale(1.6); } }
+  .tour-view .cap { margin: 16px 0 0; color: var(--muted); font-size: 15px; }
+  @media (max-width: 960px) {
+    .tour { grid-template-columns: 1fr; }
+    .tour-list { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    .tour-item { flex: none; border-bottom: 0; border-right: 1px solid var(--line); padding: 14px 18px; }
+    .tour-item::before { top: auto; width: auto; right: 0; height: 3px; transform: scaleX(0); transform-origin: left; }
+    .tour-item[aria-selected="true"]::before { transform: scaleX(1); }
+    .tour-item:hover b { transform: none; }
+    .tour-item > span { display: none; }
+    .tour-view { padding: 20px; }
+  }
+
+  /* ---------- Health ---------- */
+  .health { display: grid; grid-template-columns: repeat(4, 1fr); }
+  .health div { padding: 28px 26px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-width: 0; }
+  .health div:nth-child(4n) { border-right: 0; }
+  .health div:nth-last-child(-n+4) { border-bottom: 0; }
+  .health h4 { margin: 0 0 6px; font-size: 16.5px; font-weight: 600; display: flex; align-items: center; gap: 9px; }
+  .health h4 svg { width: 17px; height: 17px; color: var(--c); }
+  .health p { margin: 0; font-size: 14.5px; color: var(--muted); }
+  @media (max-width: 960px) {
+    .health { grid-template-columns: repeat(2, 1fr); }
+    .health div { border-right: 1px solid var(--line) !important; border-bottom: 1px solid var(--line) !important; }
+    .health div:nth-child(2n) { border-right: 0 !important; }
+    .health div:nth-last-child(-n+2) { border-bottom: 0 !important; }
+  }
+  @media (max-width: 520px) {
+    .health { grid-template-columns: 1fr; }
+    .health div { border-right: 0 !important; border-bottom: 1px solid var(--line) !important; padding: 22px 20px; }
+    .health div:last-child { border-bottom: 0 !important; }
+  }
+
+  /* ---------- Changes ---------- */
+  .split { display: grid; grid-template-columns: 1fr 1fr; }
+  .split > div { min-width: 0; }
+  .split > div:first-child { border-right: 1px solid var(--line); }
+  @media (max-width: 960px) { .split { grid-template-columns: 1fr; } .split > div:first-child { border-right: 0; border-bottom: 1px solid var(--line); } }
+  ul.ticks { list-style: none; padding: 0; margin: 28px 0 0; display: grid; gap: 12px; color: var(--text); }
+  ul.ticks li { padding-left: 28px; position: relative; }
+  ul.ticks li::before {
+    content: ""; position: absolute; left: 2px; top: .45em; width: 14px; height: 14px; border-radius: 4px;
+    background: var(--grad); -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E") center/contain no-repeat;
+            mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E") center/contain no-repeat;
+  }
+  .legend-wrap { display: grid; place-items: center; padding: 48px 40px;
+    background-image: radial-gradient(var(--line-2) 1px, transparent 1px); background-size: 20px 20px; }
+  .legend { display: grid; gap: 14px; width: 100%; max-width: 380px; }
+  .chip {
+    display: flex; align-items: center; gap: 14px; background: var(--surface); border-radius: 10px; padding: 12px 16px;
+    border: 1.6px solid var(--b, var(--line-2)); box-shadow: 0 4px 14px -8px rgba(27,26,51,.25);
+  }
+  .chip .k { font: 400 10.5px var(--mono); color: var(--faint); display: flex; align-items: center; gap: 6px; }
+  .chip .k::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--blue); }
+  .chip .nm { font: 600 15.5px var(--display); color: var(--ink); }
+  .chip .tag { margin-left: auto; font: 500 11px var(--mono); padding: 3px 9px; border-radius: 6px; color: #fff; background: var(--b); }
+  .chip.new { --b: var(--green); }
+  .chip.edited { --b: var(--blue); }
+  .chip.touched { --b: var(--blue); border-style: dashed; }
+  .chip.touched .tag { background: var(--tint); color: var(--muted); }
+  .chip.removed { --b: var(--red); border-style: dashed; opacity: .55; }
+  .chip.removed .nm { text-decoration: line-through; }
+
+  /* ---------- Install ---------- */
+  .os { padding: 44px 48px; position: relative; }
+  @media (max-width: 760px) { .os { padding: 36px 20px; } }
+  .os.mine { background: var(--surface); }
+  .os.mine::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--grad); }
+  .os header { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+  .os header svg { width: 26px; height: 26px; color: var(--ink); }
+  .os h3 { margin: 0; font-size: 24px; font-weight: 600; }
+  .os .badge { margin-left: auto; font: 500 11px var(--mono); color: var(--pink); background: #ffe7f0; padding: 3px 10px; border-radius: 999px; visibility: hidden; }
+  .os.mine .badge { visibility: visible; }
+  .file { padding: 12px 0; border-top: 1px solid var(--line); font-size: 15px; }
+  .file code { display: inline-block; margin-bottom: 3px; overflow-wrap: anywhere; }
+  .file div { color: var(--muted); }
+  .note { margin-top: 16px; font-size: 14px; color: var(--text); background: #fff8eb; border: 1px solid #fde7bd; border-radius: 10px; padding: 12px 14px; }
+  .note p { margin: 0; }
+  .os .btn { margin-top: 22px; }
+  pre {
+    margin: 10px 0 0; background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; font: 13.5px/1.75 var(--mono); color: var(--ink);
+  }
+  pre .c { color: var(--faint); }
+  pre .p { color: var(--pink); user-select: none; }
+  .note pre { background: #fff; border-color: #fde7bd; padding: 9px 12px; font-size: 12.5px; }
+  .two p { color: var(--muted); }
+  .two h3 { font-size: 28px; margin: 12px 0 10px; font-weight: 600; }
+
+  /* ---------- Final CTA ---------- */
+  .final { position: relative; overflow: hidden; text-align: center; padding: 104px 24px; }
+  .final::before {
+    content: ""; position: absolute; left: 50%; top: 50%; width: 760px; height: 340px; transform: translate(-50%, -50%);
+    background: var(--grad); filter: blur(90px); opacity: .22; border-radius: 50%;
+  }
+  .final > * { position: relative; }
+  .final img { width: 72px; height: 72px; margin: 0 auto 22px; filter: drop-shadow(0 12px 24px rgba(193,60,240,.35)); }
+  .final .cta { justify-content: center; }
+  .final .lead { margin-inline: auto; }
+
+  footer .frame { display: flex; flex-wrap: wrap; gap: 14px 28px; align-items: center; padding: 28px 28px 40px; font-size: 14px; color: var(--faint); border-bottom: 0; }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--ink); }
+  footer .sp { margin-left: auto; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.4-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5Z"/></symbol>
+    <symbol id="i-windows" viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.1 10.4 4v7.1H3zm8.4-1.2L21 2.5v8.6h-9.6zM3 12.1h7.4v7.1L3 18.1zm8.4 0H21v8.6l-9.6-1.4z"/></symbol>
+    <symbol id="i-apple" viewBox="0 0 24 24" fill="currentColor"><path d="M16.37 12.6c-.02-2.3 1.88-3.4 1.97-3.46a4.24 4.24 0 0 0-3.34-1.8c-1.42-.15-2.77.83-3.49.83-.73 0-1.83-.81-3.01-.79a4.46 4.46 0 0 0-3.77 2.29c-1.61 2.79-.41 6.92 1.16 9.18.77 1.1 1.68 2.35 2.87 2.3 1.15-.05 1.59-.74 2.98-.74s1.78.74 3 .72c1.24-.02 2.02-1.12 2.78-2.23a9.8 9.8 0 0 0 1.26-2.6 4.02 4.02 0 0 1-2.41-3.7ZM14.1 5.86A4 4 0 0 0 15.04 3a4.1 4.1 0 0 0-2.67 1.38 3.83 3.83 0 0 0-.96 2.78 3.4 3.4 0 0 0 2.69-1.3Z"/></symbol>
+  </defs>
+</svg>
+
+<div class="banner"><a href="https://github.com/dalladirosa/react-graph/releases/latest">REACT GRAPH 0.4.0 <span>·</span> EXPORT MENU, NEXT.JS ROUTES, HTML VIEWER →</a></div>
+
+<nav>
+  <div class="frame">
+    <a class="brand" href="#top"><img src="icon.png" alt="">React Graph</a>
+    <ul>
+      <li class="opt"><a href="#features">Features</a></li>
+      <li class="opt"><a href="#tour">Tour</a></li>
+      <li class="opt"><a href="#health">Code health</a></li>
+      <li><a href="#install">Install</a></li>
+      <li><a href="https://github.com/dalladirosa/react-graph">GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<main class="frame" id="top">
+
+  <!-- Hero -->
+  <div class="row hero">
+    <div class="hero-copy">
+      <div class="label">Desktop app <b>·</b> Windows &amp; macOS</div>
+      <h1>The map for your <span class="g">React</span> codebase</h1>
+      <p class="lead">React Graph draws your components, hooks and functions as an interactive graph, showing what renders, calls and passes what. It reads your code and never runs it.</p>
+      <div class="cta">
+        <a class="btn primary" id="dl-main" href="https://github.com/dalladirosa/react-graph/releases/latest"><svg><use href="#i-download"/></svg><span>Download</span></a>
+        <a class="btn" href="https://github.com/dalladirosa/react-graph"><svg><use href="#i-github"/></svg>View on GitHub</a>
+      </div>
+
+      <div class="get">
+        <div class="get-tabs" role="tablist">
+          <button role="tab" aria-selected="true" data-k="win">Windows</button>
+          <button role="tab" aria-selected="false" data-k="mac">macOS</button>
+          <button role="tab" aria-selected="false" data-k="src">From source</button>
+        </div>
+        <div class="get-body">
+          <div data-k="win"><span class="c"># installer, or a portable .zip</span><br>react-graph-0.4.0-setup.exe</div>
+          <div data-k="mac" hidden><span class="c"># Apple Silicon (M1 or later)</span><br>react-graph-0.4.0-macos-arm64.dmg</div>
+          <div data-k="src" hidden><span class="p">$ </span>cargo run --release -- path/to/my-app</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-art" aria-hidden="true">
+      <svg viewBox="0 0 560 470">
+        <defs>
+          <filter id="soft" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="7"/></filter>
+          <linearGradient id="gpink" x1="0" x2="1"><stop offset="0" stop-color="#ff1f75"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient>
+        </defs>
+
+        <!-- base plate (iso) -->
+        <g transform="translate(280 80) matrix(0.866 0.5 -0.866 0.5 0 0)">
+          <rect x="0" y="0" width="330" height="330" rx="18" fill="rgba(255,255,255,.55)" stroke="#d6d4e6" stroke-width="1.2"/>
+          <rect x="14" y="14" width="302" height="302" rx="12" fill="none" stroke="#e4e2f0" stroke-dasharray="3 6"/>
+          <!-- card shadows -->
+          <g filter="url(#soft)" fill="rgba(80,60,160,.22)">
+            <rect x="24" y="137" width="96" height="56" rx="8"/>
+            <rect x="168" y="30" width="110" height="56" rx="8"/>
+            <rect x="168" y="137" width="110" height="56" rx="8"/>
+            <rect x="168" y="244" width="110" height="56" rx="8"/>
+          </g>
+        </g>
+
+        <!-- lifted layer -->
+        <g transform="translate(280 62) matrix(0.866 0.5 -0.866 0.5 0 0)">
+          <!-- edges -->
+          <path class="iso-edge ctx" d="M120 165 C146 165 142 58 168 58"/>
+          <path class="iso-edge" d="M120 165 C146 165 142 272 168 272"/>
+          <path class="iso-edge hot" d="M120 165 L168 165"/>
+          <path class="iso-edge flow" d="M120 165 L168 165"/>
+          <!-- side branch off plate -->
+          <path class="iso-edge" d="M278 58 C300 58 300 58 316 58" stroke-dasharray="2 4"/>
+
+          <!-- App -->
+          <g class="iso-card">
+            <rect class="body" x="24" y="137" width="96" height="56" rx="8" stroke="#ff1f75" stroke-width="1.6"/>
+            <path d="M32 137 h80 a8 8 0 0 1 8 8 v4 h-96 v-4 a8 8 0 0 1 8 -8z" fill="#3b82f6"/>
+            <text x="34" y="170" font-size="14">App</text>
+            <text class="sub" x="34" y="183">App.tsx:41</text>
+          </g>
+          <!-- useAuth hook -->
+          <g class="iso-card">
+            <rect class="body" x="168" y="30" width="110" height="56" rx="8"/>
+            <path d="M176 30 h94 a8 8 0 0 1 8 8 v4 h-110 v-4 a8 8 0 0 1 8 -8z" fill="#8b5cf6"/>
+            <text x="178" y="63" font-size="13">useAuth</text>
+            <text class="sub" x="178" y="76">hook · reads context</text>
+          </g>
+          <!-- Router -->
+          <g class="iso-card">
+            <rect class="body" x="168" y="137" width="110" height="56" rx="8" stroke="#ff1f75" stroke-width="1.6"/>
+            <path d="M176 137 h94 a8 8 0 0 1 8 8 v4 h-110 v-4 a8 8 0 0 1 8 -8z" fill="#3b82f6"/>
+            <text x="178" y="170" font-size="13">Router</text>
+            <text class="sub" x="178" y="183">component</text>
+          </g>
+          <!-- formatDate function -->
+          <g class="iso-card">
+            <rect class="body" x="168" y="244" width="110" height="56" rx="8"/>
+            <path d="M176 244 h94 a8 8 0 0 1 8 8 v4 h-110 v-4 a8 8 0 0 1 8 -8z" fill="#10b981"/>
+            <text x="178" y="277" font-size="13">formatDate</text>
+            <text class="sub" x="178" y="290">function</text>
+          </g>
+        </g>
+
+        <!-- floating callouts (screen space) -->
+        <g class="float">
+          <g transform="translate(330 26)">
+            <rect width="200" height="34" rx="10" fill="#fff" stroke="#e2e1ee"/>
+            <rect x="1" y="1" width="198" height="32" rx="9" fill="none" stroke="url(#gpink)" stroke-width="1.4" opacity=".7"/>
+            <circle cx="18" cy="17" r="4" fill="#ff1f75"/>
+            <text x="30" y="21.5" font-family="JetBrains Mono, monospace" font-size="11" fill="#1b1a33">Path · App → Router</text>
+          </g>
+        </g>
+        <g class="float d2">
+          <g transform="translate(320 418)">
+            <rect width="176" height="34" rx="10" fill="#fff" stroke="#e2e1ee"/>
+            <path d="M16 23 l6 -11 l6 11 z" fill="#f59e0b"/>
+            <text x="36" y="21.5" font-family="JetBrains Mono, monospace" font-size="11" fill="#1b1a33">missing dep `limit`</text>
+          </g>
+        </g>
+        <g class="float d3">
+          <g transform="translate(6 74)">
+            <rect width="150" height="34" rx="10" fill="#fff" stroke="#e2e1ee"/>
+            <rect x="12" y="10" width="36" height="14" rx="4" fill="#10b981"/>
+            <text x="18" y="21" font-family="JetBrains Mono, monospace" font-size="9" fill="#fff">new</text>
+            <text x="56" y="21.5" font-family="JetBrains Mono, monospace" font-size="11" fill="#1b1a33">Streak.tsx</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Strip -->
+  <div class="row strip-title">Understands the way modern React apps are written</div>
+  <div class="row strip">
+    <div>React<small>.tsx · .jsx</small></div>
+    <div>TypeScript<small>.ts · .js</small></div>
+    <div>Next.js<small>app/ · pages/</small></div>
+    <div>tsconfig paths<small>@/ · ~/</small></div>
+    <div>Git<small>diff vs HEAD</small></div>
+  </div>
+
+  <!-- Showcase -->
+  <div class="row pad center">
+    <div class="label">See it <b>·</b> in seconds</div>
+    <h2 class="h2">Open a folder. Get the whole picture.</h2>
+    <p class="lead">A whole 83-file app, mapped: 160 cards from 2 entry points. <code>node_modules</code> and build folders are skipped, and the graph rebuilds as you save.</p>
+    <div class="showcase">
+      <div class="window">
+        <img src="img/no-tests-filter.png" width="1878" height="998" alt="React Graph in light mode with a whole 83-file project expanded: 160 cards for components, hooks and functions, linked by render, call and context edges">
+      </div>
+    </div>
+  </div>
+
+  <!-- Features -->
+  <div class="row pad" id="features" style="padding-bottom:48px">
+    <div class="label">Features</div>
+    <h2 class="h2">Everything a code map should do</h2>
+    <p class="lead">And a few things code maps usually don't.</p>
+  </div>
+  <div class="row cells">
+    <div class="cell" style="--c:var(--blue)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg></div>
+      <h3>Graph view</h3>
+      <p>Cards for components, hooks and functions, linked by render, call and prop edges. Expand, collapse, <b>Dim others</b>, zoom and pan.</p>
+    </div>
+    <div class="cell" style="--c:var(--purple)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg></div>
+      <h3>Group by file</h3>
+      <p>One card per file and one link per pair of files, with how they connect: “renders 2 · calls 1”.</p>
+    </div>
+    <div class="cell" style="--c:var(--amber)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
+      <h3>Context links</h3>
+      <p>Each context provider is linked to everything that reads it, even through custom hooks.</p>
+    </div>
+    <div class="cell" style="--c:var(--ink)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M9 9v6M9 9l6 6V9"/></svg></div>
+      <h3>Next.js aware</h3>
+      <p>Routes become entry points with their URL. Components get <code>server</code> / <code>client</code> badges, and layouts nest.</p>
+    </div>
+    <div class="cell" style="--c:var(--green)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></div>
+      <h3>Live reload</h3>
+      <p>Save a file and the graph rebuilds. Your selection, open cards and view stay put.</p>
+    </div>
+    <div class="cell" style="--c:var(--pink)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>
+      <h3>Play flow</h3>
+      <p>Animate a trace from any symbol, level by level or call by call, or view it as a sequence diagram.</p>
+    </div>
+    <div class="cell" style="--c:var(--blue)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></div>
+      <h3>Changes since HEAD</h3>
+      <p>New, edited and removed symbols are marked on the graph, with the problems your edits added or fixed.</p>
+    </div>
+    <div class="cell" style="--c:var(--purple)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4.1 12 6"/><path d="m5.1 8-2.9-.8"/><path d="m6 12-1.9 2"/><path d="M7.2 2.2 8 5.1"/><path d="M9.04 12.18a.5.5 0 0 1 .64-.64l11 4a.5.5 0 0 1-.02.94l-4.67 1.5a1 1 0 0 0-.65.65l-1.5 4.67a.5.5 0 0 1-.94.02z"/></svg></div>
+      <h3>Open in editor</h3>
+      <p>Right-click a card to jump to its line in VS Code. Compare two similar symbols side by side.</p>
+    </div>
+    <div class="cell" style="--c:var(--green)">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></svg></div>
+      <h3>Export</h3>
+      <p>Save as SVG, copy as Mermaid, or save one self-contained HTML page you can pan, zoom and search.</p>
+    </div>
+  </div>
+
+  <!-- Tour -->
+  <div class="row pad" id="tour" style="padding-bottom:48px">
+    <div class="label">Tour</div>
+    <h2 class="h2">Answers, not just boxes and lines</h2>
+    <p class="lead">Select a card and the detail panel explains it: who uses it, which APIs it hits, which tests cover it, and what looks wrong.</p>
+  </div>
+  <div class="row tour">
+    <div class="tour-list" role="tablist" aria-label="Feature tour">
+      <button class="tour-item" role="tab" aria-selected="true" data-scene="path" data-alt="A path drawn from App through Header to Logo, with the other cards faded">
+        <b>Path finder</b><span>Right-click one card, then another. The shortest chain of renders and calls between them lights up.</span>
+      </button>
+      <button class="tour-item" role="tab" aria-selected="false" data-scene="drill" data-alt="The detail panel for Sidebar warning that the user prop is only passed on through several components">
+        <b>Prop drilling</b><span>Finds a prop that components only hand on without reading, and names the whole route.</span>
+      </button>
+      <button class="tour-item" role="tab" aria-selected="false" data-scene="next" data-alt="A Next.js project with page and layout cards showing their URLs">
+        <b>Next.js routes</b><span>Pages and layouts appear as entry points with their URL, each under the nearest layout above it.</span>
+      </button>
+      <button class="tour-item" role="tab" aria-selected="false" data-scene="data" data-alt="The Data section of the detail panel listing fetch calls with method and path">
+        <b>Data calls</b><span>Every <code>fetch</code>, <code>axios</code>, query hook or store a symbol reaches, with method and path.</span>
+      </button>
+      <button class="tour-item" role="tab" aria-selected="false" data-scene="tests" data-alt="The Tests section listing test files that import the selected symbol">
+        <b>Test coverage</b><span>See which test files import a symbol, and filter for code no test touches.</span>
+      </button>
+      <button class="tour-item" role="tab" aria-selected="false" data-scene="rules" data-alt="Warnings for rules of React, such as a hook called conditionally">
+        <b>Rules of React</b><span>Conditional hooks, effects with no cleanup, derived state, and list items without a <code>key</code>.</span>
+      </button>
+      <button class="tour-item" role="tab" aria-selected="false" data-scene="export" data-alt="The exported HTML viewer showing the graph in a browser">
+        <b>HTML export</b><span>One file, no dependencies. Click a card to light up what it uses and what uses it.</span>
+      </button>
+    </div>
+    <div class="tour-view">
+      <div class="window stage" id="tour-stage" role="img"></div>
+      <p class="cap" id="tour-cap" hidden></p>
+    </div>
+  </div>
+
+  <!-- Health -->
+  <div class="row pad" id="health" style="padding-bottom:48px">
+    <div class="label">Code health</div>
+    <h2 class="h2">Filters that find the problems for you</h2>
+    <p class="lead">Each filter in the Project panel shows a count. Click it to see only the symbols that match.</p>
+  </div>
+  <div class="row health">
+    <div style="--c:var(--blue)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>Duplicates</h4><p>Similar code elsewhere, matched by structure, so renamed copies still show up.</p></div>
+    <div style="--c:var(--purple)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 10 5-10 5L2 7Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>Identical</h4><p>An exact structural twin, where only names or literals differ.</p></div>
+    <div style="--c:var(--amber)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>Warnings</h4><p>Hook dependency bugs, props that defeat <code>memo</code>, prop drilling, <code>lazy()</code> without <code>Suspense</code>.</p></div>
+    <div style="--c:var(--muted)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="m2 2 20 20"/></svg>Unused</h4><p>Nothing renders, calls or passes it.</p></div>
+    <div style="--c:var(--pink)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>Memoized</h4><p>Wrapped in <code>memo</code>, <code>useCallback</code> or <code>useMemo</code>.</p></div>
+    <div style="--c:var(--red)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>Cycles</h4><p>Components or functions that render or call each other in a loop.</p></div>
+    <div style="--c:var(--purple)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v2.34"/><path d="M14 2v6.5l5.7 9.5a2 2 0 0 1-1.7 3H6a2 2 0 0 1-1.7-3L8 12"/><path d="M8.5 2h7"/><path d="m2 2 20 20"/></svg>No tests</h4><p>No test file imports it, even through barrels and path aliases.</p></div>
+    <div style="--c:var(--green)"><h4><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>Data</h4><p>Calls an API, a data-fetching hook or a store itself.</p></div>
+  </div>
+
+  <!-- Changes -->
+  <div class="row split" id="changes">
+    <div class="pad">
+      <div class="label">Changes</div>
+      <h2 class="h2">Review your edits before you commit</h2>
+      <p class="lead">In a git repository, the graph is compared with HEAD and kept current as you save, commit or switch branches.</p>
+      <ul class="ticks">
+        <li>Cards show what's new, edited, or affected by a change.</li>
+        <li>Removed symbols and lost links stay visible as dashed red ghosts.</li>
+        <li>The Changes strip counts problems your edits introduced (⚠) or fixed (✓).</li>
+        <li>Select a card to read what it gained or lost: “now renders Streak”.</li>
+      </ul>
+    </div>
+    <div class="legend-wrap">
+      <div class="legend">
+        <div class="chip new"><div><div class="k">component</div><div class="nm">Streak</div></div><span class="tag">new</span></div>
+        <div class="chip edited"><div><div class="k">component</div><div class="nm">Dashboard</div></div><span class="tag">edited</span></div>
+        <div class="chip touched"><div><div class="k">component</div><div class="nm">AppShell</div></div><span class="tag">uses a change</span></div>
+        <div class="chip removed"><div><div class="k">component</div><div class="nm">MyTasks</div></div><span class="tag">removed</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Install -->
+  <div class="row pad" id="install" style="padding-bottom:48px">
+    <div class="label">Install</div>
+    <h2 class="h2">Download React Graph</h2>
+    <p class="lead">Free, from the <a href="https://github.com/dalladirosa/react-graph/releases/latest">Releases page</a> on GitHub.</p>
+  </div>
+  <div class="row split">
+    <div class="os" id="os-win">
+      <header><svg><use href="#i-windows"/></svg><h3>Windows</h3><span class="badge">Your system</span></header>
+      <div class="file"><code>react-graph-&lt;version&gt;-setup.exe</code><div>Installer with a Start Menu entry and an uninstaller. No admin rights needed.</div></div>
+      <div class="file"><code>react-graph-&lt;version&gt;-windows-x64-portable.zip</code><div>A single <code>react-graph.exe</code> you can run from anywhere.</div></div>
+      <div class="note"><p>The builds aren't code-signed yet, so SmartScreen may warn the first time. Click <b>More info → Run anyway</b>.</p></div>
+      <a class="btn sm" href="https://github.com/dalladirosa/react-graph/releases/latest"><svg><use href="#i-download"/></svg>Download for Windows</a>
+    </div>
+    <div class="os" id="os-mac">
+      <header><svg><use href="#i-apple"/></svg><h3>macOS</h3><span class="badge">Your system</span></header>
+      <div class="file"><code>react-graph-&lt;version&gt;-macos-arm64.dmg</code><div>Open it and drag <b>React Graph</b> onto <b>Applications</b>. Needs Apple Silicon (M1 or later).</div></div>
+      <div class="note">
+        <p>The app isn't notarized yet. The first time, open it, click <b>Done</b>, then choose <b>Open Anyway</b> in <b>System Settings → Privacy &amp; Security</b>. Or run this once:</p>
+        <pre>xattr -dr com.apple.quarantine "/Applications/React Graph.app"</pre>
+      </div>
+      <a class="btn sm" href="https://github.com/dalladirosa/react-graph/releases/latest"><svg><use href="#i-download"/></svg>Download for macOS</a>
+    </div>
+  </div>
+
+  <!-- Usage / source -->
+  <div class="row split two">
+    <div class="pad">
+      <div class="label">Usage</div>
+      <h3>Open a folder and go</h3>
+      <p>Use the project menu in the title bar (<kbd>Ctrl</kbd>+<kbd>O</kbd>, or <kbd>⌘</kbd><kbd>O</kbd> on a Mac), or pass a folder on the command line. Each project remembers its open cards, filters and selection.</p>
+<pre><span class="c"># Windows</span>
+react-graph.exe C:\path\to\my-app
+<span class="c"># macOS</span>
+"/Applications/React Graph.app/Contents/MacOS/react-graph" ~/code/my-app</pre>
+    </div>
+    <div class="pad">
+      <div class="label">Build from source</div>
+      <h3>Rust, all the way down</h3>
+      <p>Built with <a href="https://www.gpui.rs">GPUI</a> and <a href="https://tree-sitter.github.io/">tree-sitter</a>. You need stable Rust (2024 edition), plus the MSVC build tools on Windows or the Xcode Command Line Tools on macOS.</p>
+<pre><span class="p">$ </span>git clone https://github.com/dalladirosa/react-graph
+<span class="p">$ </span>cd react-graph
+<span class="p">$ </span>cargo run --release -- path/to/my-app</pre>
+    </div>
+  </div>
+
+  <!-- Final CTA -->
+  <div class="row final">
+    <img src="icon.png" alt="">
+    <h2 class="h2">Start mapping your app</h2>
+    <p class="lead">Free for Windows and macOS. Your code never leaves your machine.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/dalladirosa/react-graph/releases/latest"><svg><use href="#i-download"/></svg>Download React Graph</a>
+      <a class="btn" href="https://github.com/dalladirosa/react-graph"><svg><use href="#i-github"/></svg>Star on GitHub</a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="frame">
+    <a class="brand" href="#top" style="font-size:14px"><img src="icon.png" alt="" style="width:22px;height:22px">React Graph</a>
+    <a href="https://github.com/dalladirosa/react-graph">GitHub</a>
+    <a href="https://github.com/dalladirosa/react-graph/releases">Releases</a>
+    <a href="https://github.com/dalladirosa/react-graph/issues">Issues</a>
+    <span class="sp">Icons from <a href="https://lucide.dev">Lucide</a> (ISC).</span>
+  </div>
+</footer>
+
+<script>
+  // Tour tabs: each tab plays a small animated scene
+  (function () {
+    const items = document.querySelectorAll('.tour-item');
+    const stage = document.getElementById('tour-stage');
+    const cap = document.getElementById('tour-cap');
+    const narrow = matchMedia('(max-width: 960px)');
+    const still = matchMedia('(prefers-reduced-motion: reduce)');
+    const ease = 'cubic-bezier(.2,.8,.2,1)';
+    items.forEach(b => { const s = b.querySelector('span'); s.innerHTML = '<span>' + s.innerHTML + '</span>'; });
+
+    // ---------- drawing helpers ----------
+    const K = { component: '#3b82f6', hook: '#8b5cf6', function: '#10b981', layout: '#ff1f75', page: '#3b82f6', test: '#9b9ab2' };
+    let G = {};
+    function card(id, x, y, name, kind, o = {}) {
+      const w = o.w || 132; G[id] = { x, y, w };
+      return `<g transform="translate(${x} ${y})"><g data-a="${id}" class="card ${o.cls || ''}">` +
+        `<rect class="box" width="${w}" height="54" rx="9"/><circle cx="14" cy="16" r="3.5" fill="${K[kind]}"/>` +
+        `<text class="k" x="23" y="19.5">${o.kl || kind}</text><text class="n" x="12" y="41">${name}</text></g></g>`;
+    }
+    function edge(id, a, b, cls = '') {
+      const A = G[a], B = G[b], x1 = A.x + A.w, y1 = A.y + 27, x2 = B.x, y2 = B.y + 27, m = (x1 + x2) / 2;
+      const len = /dash/.test(cls) ? '' : ' pathLength="1"';
+      return `<path data-a="${id}" class="edge ${cls}" d="M${x1} ${y1} C${m} ${y1} ${m} ${y2} ${x2} ${y2}"${len}/>`;
+    }
+    function chip(id, x, y, text, o = {}) {
+      const h = o.h || 26, fs = o.fs || 11, w = o.w || Math.round(text.length * fs * 0.6 + (o.pad || 20));
+      return `<g transform="translate(${x} ${y})"><g data-a="${id}" class="${o.cls || 'pop'}">` +
+        `<rect width="${w}" height="${h}" rx="${o.r ?? 7}" fill="${o.bg || '#fff'}" stroke="${o.stroke || 'none'}"/>` +
+        `<text x="${w / 2}" y="${h / 2 + fs * 0.36}" text-anchor="middle" font-size="${fs}" fill="${o.fg || '#1b1a33'}" class="mono">${text}</text></g></g>`;
+    }
+    function menu(id, x, y, text) {
+      const w = Math.round(text.length * 6.9 + 44);
+      return `<g transform="translate(${x} ${y})"><g data-a="${id}" class="pop"><rect width="${w}" height="32" rx="9" fill="#fff" stroke="#e2e1ee" filter="url(#sh)"/>` +
+        `<circle cx="16" cy="16" r="4" fill="#ff1f75"/><text x="28" y="20.5" font-size="12" fill="#1b1a33" class="sans">${text}</text></g></g>`;
+    }
+    const cursor = (x, y) => `<g data-a="cur" class="cur" style="transform: translate(${x}px, ${y}px)"><circle class="rip" r="16" fill="#ff1f75"/>` +
+      `<path class="tip" d="M0 0 L0 17 L4.6 12.6 L8 20 L11 18.8 L7.6 11.6 L13.6 11.6 Z" fill="#1b1a33" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"/></g>`;
+    const defs = `<defs><filter id="sh" x="-20%" y="-30%" width="140%" height="180%"><feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#2b2050" flood-opacity=".13"/></filter></defs>`;
+
+    // ---------- scene actions ----------
+    let root = null;
+    const q = n => n.split(' ').flatMap(k => [...root.querySelectorAll(`[data-a="${k}"]`)]);
+    const on = (n, s = 'on') => q(n).forEach(e => e.classList.add('is-' + s));
+    const off = (n, s = 'on') => q(n).forEach(e => e.classList.remove('is-' + s));
+    const mv = (n, x, y) => q(n).forEach(e => e.style.transform = `translate(${x}px, ${y}px)`);
+    const press = () => q('cur').forEach(c => { c.classList.remove('is-press'); void c.getBoundingClientRect(); c.classList.add('is-press'); setTimeout(() => c.classList.remove('is-press'), 480); });
+
+    // ---------- scenes ----------
+    const SC = {
+      path: {
+        dur: 7600,
+        svg() {
+          const c = [card('App', 30, 173, 'App', 'component'), card('Feed', 254, 63, 'Feed', 'component'), card('Header', 254, 173, 'Header', 'component'),
+            card('Footer', 254, 283, 'Footer', 'component'), card('Card', 478, 63, 'Card', 'component'), card('Logo', 478, 173, 'Logo', 'component'),
+            card('Legal', 478, 283, 'Legal', 'component')].join('');
+          return edge('e1', 'App', 'Feed') + edge('e2', 'App', 'Header') + edge('e3', 'App', 'Footer') + edge('e4', 'Feed', 'Card') +
+            edge('e5', 'Header', 'Logo') + edge('e6', 'Footer', 'Legal') + edge('h1', 'App', 'Header', 'hot draw') + edge('h2', 'Header', 'Logo', 'hot draw') + c +
+            menu('m1', 66, 236, 'Find path from here…') + menu('m2', 448, 236, 'Find path to here') +
+            chip('pill', 160, 352, 'Path · 2 steps: App → Header → Logo', { cls: 'fade', h: 32, r: 16, fs: 12, stroke: '#ff1f75', w: 320 }) + cursor(600, 372);
+        },
+        steps: [
+          [300, () => mv('cur', 100, 198)],
+          [1000, () => { press(); on('App', 'hl'); on('m1'); }],
+          [1700, () => { off('m1'); mv('cur', 548, 198); }],
+          [2400, () => { press(); on('Logo', 'hl'); on('m2'); }],
+          [3100, () => { off('m2'); on('Feed Footer Card Legal e1 e3 e4 e6', 'dim'); on('h1'); }],
+          [3600, () => { on('h2'); on('Header', 'hl'); }],
+          [4200, () => { on('pill'); mv('cur', 600, 372); }],
+        ],
+      },
+
+      drill: {
+        dur: 7600,
+        svg() {
+          const xs = [16, 142, 268, 394, 520], names = ['App', 'Layout', 'Sidebar', 'UserMenu', 'Avatar'];
+          const c = names.map((n, i) => card(n, xs[i], 150, n, 'component', { w: 104 })).join('');
+          const e = names.slice(1).map((n, i) => edge('e' + i, names[i], n)).join('');
+          const warn = { fs: 10, pad: 16, bg: '#fff4dc', fg: '#b45309' };
+          return e + c +
+            chip('w1', 144, 214, 'only passes it', warn) + chip('w2', 270, 214, 'only passes it', warn) + chip('w3', 396, 214, 'only passes it', warn) +
+            chip('rd', 524, 214, 'reads user', { fs: 10, pad: 16, bg: '#e7f8f1', fg: '#047857' }) +
+            `<g data-a="tok" class="fade" style="transform: translate(33px, 108px)"><rect width="70" height="26" rx="13" fill="#ff1f75"/>` +
+            `<text x="35" y="17.5" text-anchor="middle" class="mono" font-size="12" fill="#fff">user</text></g>` +
+            `<g transform="translate(60 286)"><g data-a="call" class="pop"><rect width="520" height="72" rx="11" fill="#fffaf0" stroke="#fde7bd"/>` +
+            `<rect x="0" y="12" width="4" height="48" rx="2" fill="#f59e0b"/>` +
+            `<text x="22" y="30" class="sans" font-size="13.5" font-weight="600" fill="#1b1a33">⚠  user is handed down by 3 components that never read it</text>` +
+            `<text x="22" y="54" class="mono" font-size="11.5" fill="#6e6d88">App → Layout → Sidebar → UserMenu → Avatar</text></g></g>`;
+        },
+        steps: [
+          [300, () => on('tok')],
+          [900, () => mv('tok', 159, 108)],
+          [1300, () => { on('Layout', 'warn'); on('w1'); }],
+          [1900, () => mv('tok', 285, 108)],
+          [2300, () => { on('Sidebar', 'warn'); on('w2'); }],
+          [2900, () => mv('tok', 411, 108)],
+          [3300, () => { on('UserMenu', 'warn'); on('w3'); }],
+          [3900, () => mv('tok', 537, 108)],
+          [4300, () => { on('Avatar', 'ok'); on('rd'); }],
+          [4900, () => on('call')],
+        ],
+      },
+
+      next: {
+        dur: 7600,
+        svg() {
+          const c = card('Root', 24, 173, 'RootLayout', 'layout', { w: 150, cls: 'rise' }) + card('Home', 245, 63, 'HomePage', 'page', { w: 150, cls: 'rise' }) +
+            card('Blog', 245, 283, 'BlogLayout', 'layout', { w: 150, cls: 'rise' }) + card('Post', 466, 283, 'PostPage', 'page', { w: 150, cls: 'rise' }) +
+            card('Counter', 466, 63, 'Counter', 'component', { w: 150, cls: 'rise' });
+          const url = { bg: '#ffe7f0', fg: '#d6145f', h: 22, fs: 11 };
+          const srv = { h: 18, fs: 9.5, r: 5, w: 48, bg: '#f0eff8', fg: '#6e6d88' };
+          return edge('a1', 'Root', 'Home', 'draw') + edge('a2', 'Root', 'Blog', 'draw') + edge('a3', 'Blog', 'Post', 'draw') + edge('a4', 'Home', 'Counter', 'draw') + c +
+            chip('u1', 24, 145, '/  layout', url) + chip('u2', 245, 35, '/', url) + chip('u3', 245, 255, '/blog', url) + chip('u4', 466, 255, '/blog/[slug]', url) +
+            chip('s1', 118, 181, 'server', srv) + chip('s2', 339, 71, 'server', srv) + chip('s3', 339, 291, 'server', srv) + chip('s4', 560, 291, 'server', srv) +
+            chip('cl', 560, 71, 'client', { ...srv, bg: '#f3edff', fg: '#6d28d9' }) +
+            chip('uc', 480, 128, '"use client"', { bg: '#f3edff', fg: '#6d28d9', fs: 11 });
+        },
+        steps: [
+          [200, () => on('Root')],
+          [600, () => on('a1 a2')],
+          [900, () => on('Home Blog')],
+          [1300, () => on('a3 a4')],
+          [1600, () => on('Post Counter')],
+          [2200, () => on('u1')], [2400, () => on('u2')], [2600, () => on('u3')], [2800, () => on('u4')],
+          [3400, () => on('s1 s2 s3 s4')],
+          [4100, () => on('uc')],
+          [4600, () => { on('cl'); on('Counter', 'bad'); }],
+        ],
+      },
+
+      data: {
+        dur: 7200,
+        svg() {
+          const c = card('Page', 30, 173, 'OrdersPage', 'component', { w: 140 }) + card('Hook', 250, 173, 'useOrders', 'hook');
+          const ys = [96, 187, 278];
+          const api = [['GET  /api/orders', '#e7f8f1', '#047857'], ['POST /api/orders/{}', '#e8f0ff', '#1d4ed8'], ['useQuery  orders', '#f3edff', '#6d28d9']];
+          let s = edge('e', 'Page', 'Hook') + edge('back', 'Page', 'Hook', 'hot draw');
+          ys.forEach((y, i) => { s += `<line class="edge dash" x1="382" y1="200" x2="450" y2="${y + 13}"/>`; });
+          s += c;
+          ys.forEach((y, i) => {
+            s += chip('c' + i, 450, y, api[i][0], { bg: api[i][1], fg: api[i][2], w: 160 });
+            s += `<circle data-a="p${i}" class="pkt" cx="382" cy="200" r="5" fill="#ff1f75" style="--dx: 68px; --dy: ${y + 13 - 200}px"/>`;
+          });
+          return s + chip('db', 124, 181, 'data', { h: 18, fs: 9.5, r: 5, w: 38, bg: '#e7f8f1', fg: '#047857' }) +
+            chip('via', 30, 244, '3 calls · via useOrders', { fs: 10.5, stroke: '#e2e1ee', fg: '#6e6d88' });
+        },
+        steps: [
+          [500, () => on('p0')], [1050, () => { on('p0', 'done'); on('c0'); }],
+          [1300, () => on('p1')], [1850, () => { on('p1', 'done'); on('c1'); }],
+          [2100, () => on('p2')], [2650, () => { on('p2', 'done'); on('c2'); }],
+          [3300, () => { on('back'); on('Page', 'hl'); }],
+          [3800, () => on('db via')],
+        ],
+      },
+
+      tests: {
+        dur: 7600,
+        svg() {
+          const c = card('CT', 24, 110, 'Cart.test.tsx', 'test', { w: 160, kl: 'test file' }) + card('AT', 24, 250, 'api.test.ts', 'test', { w: 160, kl: 'test file' }) +
+            card('Cart', 450, 30, 'Cart', 'component', { w: 150 }) + card('useCart', 450, 120, 'useCart', 'hook', { w: 150 }) +
+            card('fmt', 450, 210, 'formatPrice', 'function', { w: 150 }) + card('Checkout', 450, 300, 'Checkout', 'component', { w: 150 });
+          const ok = { w: 18, h: 18, r: 9, fs: 11, bg: '#10b981', fg: '#fff' };
+          return `<text x="24" y="92" class="mono" font-size="10.5" fill="#9b9ab2" letter-spacing="1">TEST FILES</text>` +
+            edge('i1', 'CT', 'Cart', 'imp draw') + edge('i2', 'CT', 'useCart', 'imp draw') + edge('i3', 'AT', 'fmt', 'imp draw') + c +
+            chip('k1', 572, 38, '✓', ok) + chip('k2', 572, 128, '✓', ok) + chip('k3', 572, 218, '✓', ok) +
+            chip('nt', 296, 314, 'no test imports it', { fs: 10.5, bg: '#f3edff', fg: '#6d28d9' }) +
+            chip('sum', 24, 352, 'Filter · No tests: 1 symbol', { cls: 'fade', fs: 11, stroke: '#e2e1ee', fg: '#3d3c58' });
+        },
+        steps: [
+          [400, () => on('i1')], [1000, () => { on('k1'); on('Cart', 'ok'); }],
+          [1300, () => on('i2')], [1900, () => { on('k2'); on('useCart', 'ok'); }],
+          [2200, () => on('i3')], [2800, () => { on('k3'); on('fmt', 'ok'); }],
+          [3500, () => { on('Checkout', 'bad'); on('nt'); }],
+          [4100, () => on('sum')],
+        ],
+      },
+
+      rules: {
+        dur: 7600,
+        svg() {
+          const k = t => `<tspan fill="#8b5cf6">${t}</tspan>`, h = t => `<tspan fill="#ff1f75">${t}</tspan>`, f = t => `<tspan fill="#2563eb">${t}</tspan>`, st = t => `<tspan fill="#059669">${t}</tspan>`;
+          const lines = [
+            `${k('function')} ${f('Profile')}({ user, items }) {`,
+            `  ${k('if')} (!user) ${k('return')} ${k('null')};`,
+            `  ${k('const')} [open, setOpen] = ${h('useState')}(${k('false')});`,
+            `  ${h('useEffect')}(() =&gt; {`,
+            `    window.${f('addEventListener')}(${st("'resize'")}, onResize);`,
+            `  }, []);`,
+            `  ${k('return')} items.${f('map')}(i =&gt; &lt;${f('Row')} {...i} /&gt;);`,
+            `}`,
+          ];
+          const B = i => 100 + i * 32, X = c => 92 + c * 7.8;
+          const sq = (id, c1, c2, line) => {
+            const y = B(line) + 6; let d = `M${X(c1)} ${y}`, up = true;
+            for (let x = X(c1) + 3; x <= X(c2); x += 3) { d += ` L${x.toFixed(1)} ${y + (up ? -2 : 2)}`; up = !up; }
+            return `<path data-a="${id}" class="sq draw" d="${d}" pathLength="1"/>`;
+          };
+          const row = (id, line, fill) => `<rect data-a="${id}" class="fade" x="37" y="${B(line) - 20}" width="566" height="29" fill="${fill}"/>`;
+          const tag = { h: 20, fs: 10, pad: 16, bg: '#fff4dc', fg: '#b45309' };
+          let s = `<rect x="36" y="24" width="568" height="352" rx="12" fill="#fff" stroke="#e2e1ee" filter="url(#sh)"/>` +
+            `<path d="M36 58 V36 a12 12 0 0 1 12 -12 H592 a12 12 0 0 1 12 12 V58 Z" fill="#f6f6fb"/><line x1="36" x2="604" y1="58" y2="58" stroke="#e2e1ee"/>` +
+            `<circle cx="56" cy="41" r="4.5" fill="#d9d8e6"/><circle cx="70" cy="41" r="4.5" fill="#d9d8e6"/><circle cx="84" cy="41" r="4.5" fill="#d9d8e6"/>` +
+            `<text x="104" y="45" class="mono" font-size="11.5" fill="#6e6d88">Profile.tsx</text>` +
+            row('r2', 2, 'rgba(245,158,11,.08)') + row('r4', 4, 'rgba(245,158,11,.08)') + row('r6', 6, 'rgba(245,158,11,.08)') +
+            `<rect data-a="scan" class="scan fade" x="37" y="${B(0) - 20}" width="566" height="29" fill="rgba(139,92,246,.09)" style="transform: translate(0px, 0px)"/>`;
+          lines.forEach((t, i) => {
+            s += `<text x="74" y="${B(i)}" text-anchor="end" class="mono" font-size="12" fill="#b9b8cc">${i + 1}</text>`;
+            s += `<text x="92" y="${B(i)}" class="mono" font-size="13" fill="#1b1a33" style="white-space: pre">${t}</text>`;
+          });
+          return s + sq('q2', 26, 41, 2) + sq('q4', 11, 27, 4) + sq('q6', 24, 38, 6) +
+            chip('t2', 482, B(2) - 15, 'hook after return', tag) + chip('t4', 482, B(4) - 15, 'no cleanup', tag) + chip('t6', 482, B(6) - 15, 'missing key', tag);
+        },
+        steps: [
+          [200, () => on('scan')],
+          [550, () => mv('scan', 0, 32)], [900, () => mv('scan', 0, 64)],
+          [1200, () => on('q2 r2 t2')],
+          [1900, () => mv('scan', 0, 96)], [2250, () => mv('scan', 0, 128)],
+          [2550, () => on('q4 r4 t4')],
+          [3250, () => mv('scan', 0, 160)], [3600, () => mv('scan', 0, 192)],
+          [3900, () => on('q6 r6 t6')],
+          [4600, () => mv('scan', 0, 224)], [4900, () => off('scan')],
+        ],
+      },
+
+      export: {
+        dur: 8400,
+        svg() {
+          const c = card('App', 36, 170, 'App', 'component', { w: 92 }) + card('List', 196, 110, 'List', 'component', { w: 92 }) + card('Item', 196, 230, 'Item', 'component', { w: 92 });
+          const bc = card('bApp', 346, 170, 'App', 'component', { w: 92 }) + card('bList', 506, 110, 'List', 'component', { w: 92 }) + card('bItem', 506, 230, 'Item', 'component', { w: 92 });
+          const app = `<rect x="20" y="36" width="290" height="320" rx="12" fill="#fff" stroke="#e2e1ee" filter="url(#sh)"/>` +
+            `<rect x="36" y="52" width="16" height="16" rx="4" fill="#1b1a33"/><text x="60" y="65" class="sans" font-size="12" font-weight="600" fill="#1b1a33">React Graph</text>` +
+            `<g data-a="btn"><rect class="btn-r" x="214" y="47" width="80" height="26" rx="7" fill="#fff" stroke="#cfcde0"/>` +
+            `<text x="254" y="64" text-anchor="middle" class="sans" font-size="11.5" fill="#1b1a33">Export ▾</text></g>` +
+            edge('x1', 'App', 'List') + edge('x2', 'App', 'Item') + c;
+          const browser = `<g data-a="br" class="rise"><rect x="330" y="36" width="290" height="320" rx="12" fill="#fff" stroke="#e2e1ee" filter="url(#sh)"/>` +
+            `<rect x="342" y="46" width="266" height="22" rx="11" fill="#f6f6fb" stroke="#e2e1ee"/>` +
+            `<text x="356" y="61" class="mono" font-size="10.5" fill="#6e6d88">file:///…/graph.html</text>` +
+            edge('y1', 'bApp', 'bList') + edge('y2', 'bApp', 'bItem') + edge('z1', 'bApp', 'bList', 'hot draw') + edge('z2', 'bApp', 'bItem', 'hot draw') + bc + `</g>`;
+          const dd = `<g transform="translate(150 80)"><g data-a="menu" class="pop"><rect width="150" height="96" rx="9" fill="#fff" stroke="#e2e1ee" filter="url(#sh)"/>` +
+            `<rect data-a="mhl" class="fade" x="6" y="35" width="138" height="26" rx="6" fill="#ffe7f0"/>` +
+            `<text x="16" y="26" class="sans" font-size="12" fill="#3d3c58">Save as SVG</text>` +
+            `<text x="16" y="53" class="sans" font-size="12" fill="#1b1a33" font-weight="600">Save as HTML</text>` +
+            `<text x="16" y="80" class="sans" font-size="12" fill="#3d3c58">Copy as Mermaid</text></g></g>`;
+          const file = `<g data-a="file" class="fade" style="transform: translate(196px, 186px)"><rect width="112" height="30" rx="8" fill="#fff" stroke="#ff1f75" filter="url(#sh)"/>` +
+            `<path d="M12 8 h8 l4 4 v10 h-12 z" fill="#ffe7f0" stroke="#ff1f75"/><text x="32" y="19.5" class="mono" font-size="11" fill="#1b1a33">graph.html</text></g>`;
+          return app + browser + dd + file + cursor(600, 372);
+        },
+        steps: [
+          [300, () => mv('cur', 252, 60)],
+          [1000, () => { press(); on('btn', 'hl'); on('menu'); }],
+          [1600, () => { mv('cur', 230, 130); on('mhl'); }],
+          [2300, () => { press(); off('menu'); off('btn', 'hl'); on('file'); }],
+          [2600, () => mv('file', 362, 186)],
+          [3200, () => { off('file'); on('br'); }],
+          [3900, () => mv('cur', 392, 197)],
+          [4600, () => { press(); on('bApp', 'hl'); on('z1 z2'); }],
+          [5100, () => on('bList bItem', 'hl')],
+        ],
+      },
+    };
+
+    // ---------- player ----------
+    let current = 'path', timers = [], visible = true;
+    const clear = () => { timers.forEach(clearTimeout); timers = []; };
+    function render(key) {
+      G = {};
+      stage.innerHTML = `<svg viewBox="0 0 640 400" aria-hidden="true">${defs}${SC[key].svg()}</svg>`;
+      root = stage.querySelector('svg');
+      void root.getBoundingClientRect();
+    }
+    function play(key) {
+      clear();
+      render(key);
+      const sc = SC[key];
+      if (still.matches) {
+        stage.classList.add('instant');
+        sc.steps.forEach(([, f]) => f());
+        return;
+      }
+      stage.classList.remove('instant');
+      sc.steps.forEach(([t, f]) => timers.push(setTimeout(f, t)));
+      // Fade out at the end and replay from the start
+      timers.push(setTimeout(() => {
+        stage.classList.add('fading');
+        timers.push(setTimeout(() => { stage.classList.remove('fading'); if (visible) play(key); }, 320));
+      }, sc.dur));
+    }
+    function show(key, animate) {
+      current = key;
+      if (!animate || still.matches) { play(key); return; }
+      clear();
+      stage.classList.add('fading');
+      timers.push(setTimeout(() => { stage.classList.remove('fading'); play(key); }, 260));
+    }
+
+    function select(btn, animate) {
+      items.forEach(b => b.setAttribute('aria-selected', b === btn ? 'true' : 'false'));
+      stage.setAttribute('aria-label', btn.dataset.alt);
+      if (btn.dataset.scene !== current || !animate) show(btn.dataset.scene, animate);
+      cap.innerHTML = btn.querySelector('span > span').innerHTML;
+      cap.hidden = !narrow.matches;
+      if (animate && narrow.matches && !still.matches) {
+        cap.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 350, easing: ease });
+        btn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+      }
+    }
+    items.forEach(b => b.addEventListener('click', () => select(b, true)));
+    narrow.addEventListener('change', () => {
+      const b = document.querySelector('.tour-item[aria-selected="true"]');
+      cap.innerHTML = b.querySelector('span > span').innerHTML; cap.hidden = !narrow.matches;
+    });
+    select(items[0], false);
+
+    // Only run while the tour is on screen; restart the scene when it comes back into view
+    new IntersectionObserver(es => {
+      const was = visible; visible = es[0].isIntersecting;
+      if (visible && !was) play(current);
+      if (!visible) clear();
+    }, { threshold: 0.15 }).observe(stage);
+  })();
+
+  // Hero install tabs
+  (function () {
+    const tabs = document.querySelectorAll('.get-tabs button');
+    const panes = document.querySelectorAll('.get-body [data-k]');
+    const ind = document.createElement('span');
+    ind.className = 'ind';
+    document.querySelector('.get-tabs').appendChild(ind);
+    const still = matchMedia('(prefers-reduced-motion: reduce)');
+    function moveInd() {
+      const t = document.querySelector('.get-tabs button[aria-selected="true"]');
+      ind.style.width = t.offsetWidth + 'px';
+      ind.style.transform = 'translateX(' + t.offsetLeft + 'px)';
+    }
+    window.__pickGet = function (k, animate) {
+      tabs.forEach(t => t.setAttribute('aria-selected', t.dataset.k === k ? 'true' : 'false'));
+      panes.forEach(p => {
+        const show = p.dataset.k === k, wasHidden = p.hidden;
+        p.hidden = !show;
+        if (show && wasHidden && animate && !still.matches)
+          p.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }],
+            { duration: 320, easing: 'cubic-bezier(.2,.8,.2,1)' });
+      });
+      moveInd();
+    };
+    tabs.forEach(t => t.addEventListener('click', () => window.__pickGet(t.dataset.k, true)));
+    // Place the underline without sliding in from the left on first paint
+    ind.style.transition = 'none'; moveInd(); ind.offsetWidth; ind.style.transition = '';
+    addEventListener('resize', moveInd);
+    document.fonts && document.fonts.ready.then(moveInd);
+  })();
+
+  // Navbar: sliding pill, smooth scroll, current-section tracking
+  (function () {
+    const ul = document.querySelector('nav ul');
+    const links = [...ul.querySelectorAll('a[href^="#"]')];
+    const sections = links.map(a => document.querySelector(a.getAttribute('href')));
+    const pill = document.createElement('span');
+    pill.className = 'nav-pill';
+    ul.prepend(pill);
+    const still = matchMedia('(prefers-reduced-motion: reduce)');
+    let current = null, lockUntil = 0, clicks = 0;
+
+    function setActive(a, instant) {
+      if (a === current && !instant) return;
+      current = a;
+      links.forEach(l => l.setAttribute('aria-current', l === a ? 'true' : 'false'));
+      const li = a && a.parentElement;
+      if (!a || !li.offsetWidth) { pill.style.opacity = 0; return; }
+      if (instant) pill.style.transition = 'none';
+      pill.style.width = li.offsetWidth + 'px';
+      pill.style.transform = 'translateX(' + li.offsetLeft + 'px)';
+      pill.style.opacity = 1;
+      if (instant) { pill.offsetWidth; pill.style.transition = ''; }
+    }
+
+    function spy() {
+      if (Date.now() < lockUntil) return;
+      const line = 120;
+      let found = null;
+      sections.forEach((s, i) => { if (s && s.getBoundingClientRect().top <= line) found = links[i]; });
+      if (innerHeight + scrollY >= document.documentElement.scrollHeight - 4) found = links[links.length - 1];
+      setActive(found);
+    }
+
+    function flash(section) {
+      if (still.matches) return;
+      [section.querySelector('.label'), section.querySelector('.h2')].forEach(el => {
+        if (!el) return;
+        el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+      });
+    }
+
+    links.forEach((a, i) => a.addEventListener('click', e => {
+      const target = sections[i];
+      if (!target) return;
+      e.preventDefault();
+      setActive(a);
+      lockUntil = Date.now() + 4000;
+      target.scrollIntoView({ behavior: still.matches ? 'auto' : 'smooth', block: 'start' });
+      history.replaceState(null, '', a.getAttribute('href'));
+      const myClick = ++clicks;
+      let done = false;
+      const arrive = () => {
+        if (done || myClick !== clicks) return;
+        done = true; lockUntil = 0; flash(target); spy();
+      };
+      if ('onscrollend' in window) addEventListener('scrollend', arrive, { once: true });
+      // Fallback: arrive once the page has stopped moving for 150ms
+      const startY = scrollY, t0 = Date.now();
+      let lastY = scrollY, steady = 0;
+      (function watch() {
+        if (done || myClick !== clicks) return;
+        const moved = Math.abs(scrollY - startY) >= 1 || Date.now() - t0 > 600;
+        steady = Math.abs(scrollY - lastY) < 1 ? steady + 1 : 0;
+        lastY = scrollY;
+        if (moved && steady >= 3) arrive(); else setTimeout(watch, 50);
+      })();
+    }));
+
+    // Brand returns to the top and clears the pill
+    document.querySelectorAll('a.brand').forEach(b => b.addEventListener('click', e => {
+      e.preventDefault();
+      lockUntil = Date.now() + 1200;
+      setActive(null);
+      scrollTo({ top: 0, behavior: still.matches ? 'auto' : 'smooth' });
+      history.replaceState(null, '', location.pathname + location.search);
+    }));
+
+    addEventListener('scroll', spy, { passive: true });
+    addEventListener('resize', () => setActive(current, true));
+    document.fonts && document.fonts.ready.then(() => setActive(current, true));
+    spy();
+  })();
+
+  // Highlight the visitor's platform
+  (function () {
+    const p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent;
+    const label = document.querySelector('#dl-main span');
+    if (/mac/i.test(p)) { document.getElementById('os-mac').classList.add('mine'); label.textContent = 'Download for macOS'; window.__pickGet('mac'); }
+    else if (/win/i.test(p)) { document.getElementById('os-win').classList.add('mine'); label.textContent = 'Download for Windows'; }
+  })();
+</script>
+</body>
+</html>
