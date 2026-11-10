@@ -87,9 +87,9 @@ To build the packages locally:
 ```bash
 cargo build --release
 # Windows, with Inno Setup 6 (https://jrsoftware.org/isinfo.php) installed:
-iscc /DAppVersion=0.4.0 installer/react-graph.iss   # writes dist/react-graph-0.4.0-setup.exe
+iscc /DAppVersion=0.5.0 installer/react-graph.iss   # writes dist/react-graph-0.5.0-setup.exe
 # macOS:
-installer/macos/bundle.sh 0.4.0                     # writes dist/React Graph.app and dist/react-graph-0.4.0-macos-arm64.dmg
+installer/macos/bundle.sh 0.5.0                     # writes dist/React Graph.app and dist/react-graph-0.5.0-macos-arm64.dmg
 ```
 
 ## Releasing
