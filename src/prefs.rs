@@ -17,7 +17,7 @@ pub struct Prefs {
     pub recent: Vec<PathBuf>,
 }
 
-fn dir() -> Option<PathBuf> {
+pub(crate) fn dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
@@ -91,7 +91,7 @@ pub fn display(p: &Path) -> String {
 }
 
 /// Same folder, ignoring the `\\?\` prefix, a trailing separator and (on Windows) case.
-fn same(a: &Path, b: &Path) -> bool {
+pub(crate) fn same(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| {
         let s = display(p);
         let s = s.trim_end_matches(['/', '\\']);

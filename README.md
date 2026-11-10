@@ -10,21 +10,27 @@ Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it
 
 - **Graph view.** Components, hooks and functions are shown as cards, with edges for render, call and prop relations. Expand or collapse nodes, use **Dim others** to focus on one, zoom, and pan with the minimap.
 - **Context links.** A component that provides a context (`<ThemeContext.Provider>`) is linked, with a dashed amber edge, to everything that reads it: `useContext(ThemeContext)`, and the components and hooks that call a custom hook doing so.
+- **Next.js.** App Router (`app/`) and Pages Router (`pages/`) projects are recognised. `page`, `layout`, `loading`, `error`, `not-found`, `route` and `_app` files are marked as entry points with their URL (`/blog/[slug]`; route groups and slots don't count), are never reported as unused, and each page and layout hangs off the nearest layout above it. Components get a `server` / `client` badge: Server Components by default, client with `"use client"` or when a client component renders them, and Server Actions with `"use server"`. A Server Component that calls `useState`, `useEffect` and the like, or puts `onClick` on an element, gets a warning.
 - **Path aliases.** `paths` and `baseUrl` from `tsconfig.json` / `jsconfig.json` (including `extends`) are followed, so `import { Button } from "@/ui/Button"` resolves like a relative import. Without a config, `@/` and `~/` are assumed to mean `src/`.
 - **Live reload.** The graph rebuilds when a source file or tsconfig in the open folder changes. Selection, expanded cards and the view stay where they are.
 - **Project panel.** A file tree with symbol counts. Search by typing anywhere, and use the tabs to show only components, hooks or functions (Ctrl+click, or ⌘-click on a Mac, combines kinds).
 - **Code-health filters.** Each filter shows how many symbols match:
   - **Duplicates:** similar code exists elsewhere (structural fingerprints, so renamed copies still match)
   - **Identical:** an exact structural twin exists, where only names or literals differ
-  - **Warnings:** hook dependency problems, and props that defeat a `memo` child (an inline `{}`, `[]` or `() => …`, or a value built in the render body, passed to a component wrapped in `memo`)
+  - **Warnings:** hook dependency problems, and props that defeat a `memo` child (an inline `{}`, `[]` or `() => …`, or a value built in the render body, passed to a component wrapped in `memo`), and **prop drilling** (a prop that two or more components only hand on to a child, without reading it, before something finally uses it; the hint names the whole route), `lazy()` components rendered with no `<Suspense>` above them, and route pages with no error boundary (no `errorElement` on the route or its parents, and no `ErrorBoundary` around the page). Components loaded with `lazy(() => import(...))` get a `lazy` badge. A component that renders its `children` inside a `<Suspense>` or an `ErrorBoundary` covers what is passed to it, and a router (`Routes`, `RouterProvider`, `Outlet`) shown inside one covers its pages. A boundary around `render(<App />)`, outside any component, can't be seen. Four rules of React are checked too: hooks called conditionally, in a loop, in a callback, after an early return or outside a component or hook; effects that add a listener, interval, subscription or WebSocket but return no cleanup; state an effect only derives from other values (compute it while rendering instead); and `.map()` list items without a `key`.
   - **Unused:** nothing renders, calls or passes it
   - **Memoized:** wrapped in `memo`, `useCallback` or `useMemo`
   - **Cycles:** components or functions that render or call each other in a loop (A → B → A). Self-recursion doesn't count.
+  - **No tests:** no test file imports it. Test files are `*.test.*`, `*.spec.*` and anything in a `__tests__` folder; imports through barrels and path aliases count, and `import * as x` covers the whole file. Only top-level symbols are flagged, and the filter stays empty in a project with no tests. Select a symbol to see the tests that import it under **Tests**, and click one to open it in your editor.
+
+  - **Data:** calls out to an API (`fetch`, `axios.get(...)`), a data-fetching hook (`useQuery`, `useSWR`, `useMutation`) or a store (redux, zustand `use...Store`, jotai, recoil) itself. Cards get a `data` badge, and the detail panel lists each call with its method and path (`POST /api/orders/{}`), including those made by the hooks and functions the symbol calls ("via useTodos"). Detected by well-known names only.
 - **Compare.** Shows two similar symbols side by side, with the differing tokens highlighted.
 - **Play flow.** Animates a trace from any symbol, either level by level ("waves") or in call-and-return order, and can also show it as a sequence diagram.
+- **Path finder.** Right-click a card and choose **Find path from here…**, then right-click another card and choose **Find path to here**. The shortest chain of renders and calls between them is drawn, lit up, with everything else faded. If the second card doesn't lead to the first, the other direction is tried. Esc clears it.
 - **Source view.** Shows the code for the selected symbol or file.
-- **Export.** **Export SVG** saves what is drawn as a picture, and **Copy Mermaid** puts it on the clipboard as a Mermaid flowchart.
+- **Export.** **Export SVG** saves what is drawn as a picture, **Export HTML** saves it as one self-contained page (no network, no dependencies) that you can pan, zoom and search, where clicking a card lights up everything it uses and everything that uses it, and **Copy Mermaid** puts it on the clipboard as a Mermaid flowchart.
 - **Open in editor.** Right-click a card and choose **Open in editor** to jump to its line in VS Code (the `code` command must be on your PATH; otherwise the file opens with the system default).
+- **Saved views.** Each project remembers its open cards, filters, selected symbol, picked file and the "Hooks & functions" / "Dim others" switches, and puts them back the next time you open it. Cards that no longer exist are dropped, and renaming or editing code around a symbol doesn't lose it (symbols are matched by file and name, not by line).
 - **Light and dark themes**, and a list of recently opened projects.
 
 ## Install
@@ -64,7 +70,7 @@ react-graph.exe C:\path\to\my-app                                        # Windo
 "/Applications/React Graph.app/Contents/MacOS/react-graph" ~/code/my-app   # macOS
 ```
 
-`node_modules` and other build folders are skipped. Settings (theme and recent projects) are stored in `%APPDATA%\react-graph\settings.txt` on Windows and `~/.config/react-graph/settings.txt` on macOS.
+`node_modules` and other build folders are skipped. Settings (theme and recent projects) are stored in `%APPDATA%\react-graph\settings.txt` on Windows and `~/.config/react-graph/settings.txt` on macOS; saved views are in `views.txt` next to it.
 
 ## Build from source
 

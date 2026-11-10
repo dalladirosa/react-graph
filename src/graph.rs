@@ -3,6 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::alias::AliasMap;
+use crate::drill::{self, DrillHint};
+
+use crate::cover;
+
+use crate::lint::{self, LintHint};
+
+use crate::data::DataUse;
+
+use crate::next::{self, Directive, Entry, Env};
 use crate::similar::{self, Shape};
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -213,16 +222,49 @@ pub struct Symbol {
     pub dep_hooks: Vec<DepInfo>,
     /// props this component passes to a `memo` component that are new on every render
     pub prop_hints: Vec<PropHint>,
+    /// props this component only hands on to a child, as part of a long chain (prop drilling)
+    pub drill_hints: Vec<DrillHint>,
     /// binds a computed value, not a function: `const rows = useMemo(() => filter(...), deps)`
     pub is_value: bool,
     /// other symbols of the same kind with an identical or near-identical body, best match first
     pub similar: Vec<Similar>,
     /// member of a render / call cycle: index into `Graph::cycles`
     pub cycle: Option<usize>,
+    /// test files that import this symbol (indexes into `Graph::test_files`); top-level symbols only,
+    /// see `Graph::tests_of`
+    pub tests: Vec<usize>,
+
+    /// loaded with `lazy(() => import("..."))`: a code-split chunk
+    pub lazy: bool,
+    /// renders its `children` inside a `<Suspense>`: whatever is passed to it is suspended
+    pub provides_suspense: bool,
+    /// renders its `children` inside an error boundary: whatever is passed to it is caught
+    pub provides_boundary: bool,
+    /// missing Suspense / error boundary above it (see `cover`)
+    pub cover_hints: Vec<Hint>,
+
+    /// rules of React broken here: hooks out of order, effects without cleanup, derived state, missing keys
+    pub lint_hints: Vec<LintHint>,
+
+    /// HTTP calls, data-fetching hooks and stores used directly in this symbol
+    pub data: Vec<DataUse>,
+
+    /// Next.js (App Router): where it runs
+    pub env: Option<Env>,
+    /// Next.js: a file the framework loads itself (page, layout, route handler, ...)
+    pub entry: Option<Entry>,
+    /// Next.js: interactive code in a Server Component
+    pub next_hints: Vec<Hint>,
+    /// browser-only hooks and event handlers used directly in this symbol: (name, line)
+    pub(crate) client_uses: Vec<(String, usize)>,
+    /// has a `"use server"` directive of its own
+    pub(crate) server_action: bool,
     /// byte range of the function node in its file (what `similar` fingerprints), for side-by-side compare
     pub func: Option<(usize, usize)>,
     /// structural fingerprint; only kept until similar bodies are matched
     shape: Shape,
+    /// what the component does with its props; only kept until prop drilling is resolved
+    pub(crate) forwards: Option<drill::Forwards>,
 }
 
 /// Another symbol whose body has (nearly) the same structure: a candidate to merge or extract.
@@ -236,6 +278,10 @@ pub struct Similar {
 }
 
 impl Symbol {
+    /// The pages, layouts and handlers Next.js loads itself are used by the framework.
+    pub fn is_entry(&self) -> bool {
+        self.entry.is_some()
+    }
     pub fn is_memoized(&self) -> bool {
         !self.wraps.is_empty() && self.wraps.iter().any(|w| *w != Wrap::ForwardRef)
     }
@@ -244,6 +290,13 @@ impl Symbol {
         self.deps.as_ref().map_or(0, |d| d.warnings())
             + self.dep_hooks.iter().map(|d| d.warnings()).sum::<usize>()
             + self.prop_hints.len()
+            + self.drill_hints.len()
+
+            + self.cover_hints.len()
+
+            + self.lint_hints.len()
+
+            + self.next_hints.len()
     }
 }
 
@@ -259,7 +312,16 @@ pub struct Edge {
     pub site: usize,
     /// `Context` edges: index into `Graph::contexts`
     pub ctx: Option<usize>,
+    /// `Renders` edges: written inside a `<Suspense>` (or a component that renders its children in one)
+    pub suspended: bool,
+    /// `Renders` edges: written inside an `ErrorBoundary`, or a route with an `errorElement`
+    pub caught: bool,
+    /// `Renders` edges: the page of a route (`element: <Home />`, `<Route element={<Home />} />`)
+    pub route: bool,
 }
+
+/// How many calls away `Graph::data_of` looks for data access.
+const DATA_DEPTH: usize = 4;
 
 /// A `createContext` declaration.
 #[derive(Clone, Debug)]
@@ -275,10 +337,15 @@ pub struct Graph {
     pub files: usize,
     /// relative paths (forward slashes) of every parsed source file
     pub file_list: Vec<String>,
+    /// relative paths of the test files (`*.test.*`, `*.spec.*`, `__tests__/`); read for their imports only
+    pub test_files: Vec<String>,
     /// every `createContext` found, for `Edge::ctx`
     pub contexts: Vec<ContextDecl>,
     /// groups of symbols that render or call each other in a loop (A -> B -> A), members sorted
     pub cycles: Vec<Vec<usize>>,
+    /// props that travel through components that only forward them (the hints on the symbols come from these)
+    #[allow(dead_code)]
+    pub drills: Vec<drill::Chain>,
     out: Vec<Vec<usize>>,
     inc: Vec<Vec<usize>>,
 }
@@ -289,6 +356,40 @@ impl Graph {
     }
     pub fn in_edges(&self, i: usize) -> impl Iterator<Item = &Edge> {
         self.inc[i].iter().map(move |&e| &self.edges[e])
+    }
+    /// Test files that import `i`, or the top-level symbol it is defined in.
+    pub fn tests_of(&self, i: usize) -> &[usize] {
+        let mut top = i;
+        while let Some(p) = self.symbols[top].parent {
+            top = p;
+        }
+        &self.symbols[top].tests
+    }
+    /// A top-level symbol that no test file imports. Never true when the project has no tests at all.
+    pub fn untested(&self, i: usize) -> bool {
+        !self.test_files.is_empty() && self.symbols[i].parent.is_none() && self.symbols[i].tests.is_empty()
+    }
+
+    /// What `i` reaches out to: its own data uses first, then those of the hooks and functions it
+    /// calls (up to `DATA_DEPTH` calls away), each with the first callee that leads to it.
+    pub fn data_of(&self, i: usize) -> Vec<(DataUse, Option<usize>)> {
+        let mut out: Vec<(DataUse, Option<usize>)> = self.symbols[i].data.iter().map(|d| (d.clone(), None)).collect();
+        let mut seen = HashSet::from([i]);
+        // (symbol, depth, first callee on the way)
+        let mut queue: std::collections::VecDeque<(usize, usize, Option<usize>)> = std::collections::VecDeque::from([(i, 0, None)]);
+        while let Some((n, depth, via)) = queue.pop_front() {
+            if depth >= DATA_DEPTH {
+                continue;
+            }
+            for e in self.out_edges(n).filter(|e| e.kind == EdgeKind::Calls || (e.kind == EdgeKind::Defines && depth == 0)) {
+                if seen.insert(e.to) {
+                    let first = via.or(Some(e.to));
+                    out.extend(self.symbols[e.to].data.iter().map(|d| (d.clone(), first)));
+                    queue.push_back((e.to, depth + 1, first));
+                }
+            }
+        }
+        out
     }
     /// "renders", "calls", ... or "context · ThemeContext"
     pub fn edge_label(&self, e: &Edge) -> String {
@@ -312,6 +413,24 @@ struct RawRef {
     event_prop: bool,
     /// For renders: props with a value that is new on every render
     unstable: Vec<UnstableProp>,
+    /// For renders: tags of the elements it is written inside, outermost first (`Suspense`,
+    /// `ErrorBoundary`, any component), and `ERR_SCOPE` for a route that has an `errorElement`
+    wrappers: Vec<String>,
+    /// For renders: a router (`Routes`, `RouterProvider`, `Outlet`, ...) that shows pages
+    host: bool,
+    /// For renders: the page of a route
+    route: bool,
+}
+
+/// Stands in for a route object / `<Route>` with an `errorElement` among a ref's wrappers.
+const ERR_SCOPE: &str = "<errorElement>";
+
+/// Elements that show the pages of a router. A boundary around one covers every page.
+const ROUTER_HOSTS: &[&str] = &["RouterProvider", "Routes", "Router", "BrowserRouter", "HashRouter", "MemoryRouter", "Outlet"];
+
+/// `ErrorBoundary`, `AppErrorBoundary`
+fn is_boundary_name(n: &str) -> bool {
+    n.ends_with("ErrorBoundary")
 }
 
 /// `<Ctx.Provider>` / `useContext(Ctx)`: resolved to a `createContext` once all files are known.
@@ -325,7 +444,7 @@ struct RawCtx {
 }
 
 /// `onClick` / `onSave` (but not `one` or `online`)
-fn is_event_prop(name: &str) -> bool {
+pub(crate) fn is_event_prop(name: &str) -> bool {
     name.strip_prefix("on").and_then(|r| r.chars().next()).is_some_and(|c| c.is_ascii_uppercase())
 }
 
@@ -354,6 +473,10 @@ struct Ctx<'a> {
     comp_alias: &'a mut HashMap<String, String>,
     /// bindings of the enclosing components / hooks, innermost last
     scopes: Vec<Scope>,
+    /// tags of the JSX elements being visited inside, outermost first (reset inside each symbol)
+    wrappers: Vec<String>,
+    /// the element that is the page of a route (`element: <Home />`)
+    route_node: Option<usize>,
 }
 
 /// Names declared directly in a component / hook body, with their origin.
@@ -367,7 +490,7 @@ fn lookup<'s>(scopes: &'s [Scope], name: &str) -> Option<&'s (Origin, Option<Str
 }
 
 /// `useMemo` / `React.useMemo` => "useMemo"
-fn callee_name<'a>(call: Node, src: &'a str) -> Option<&'a str> {
+pub(crate) fn callee_name<'a>(call: Node, src: &'a str) -> Option<&'a str> {
     let f = call.child_by_field_name("function")?;
     match f.kind() {
         "identifier" => Some(text(f, src)),
@@ -376,7 +499,7 @@ fn callee_name<'a>(call: Node, src: &'a str) -> Option<&'a str> {
     }
 }
 
-fn call_args(call: Node) -> Vec<Node> {
+pub(crate) fn call_args(call: Node) -> Vec<Node> {
     match call.child_by_field_name("arguments") {
         Some(a) => {
             let mut c = a.walk();
@@ -386,12 +509,12 @@ fn call_args(call: Node) -> Vec<Node> {
     }
 }
 
-fn is_fn(n: Node) -> bool {
+pub(crate) fn is_fn(n: Node) -> bool {
     matches!(n.kind(), "arrow_function" | "function_expression" | "function")
 }
 
 /// `x as T`, `x!`, `(x)`, `x satisfies T` => x
-fn strip_expr(mut n: Node) -> Node {
+pub(crate) fn strip_expr(mut n: Node) -> Node {
     while matches!(
         n.kind(),
         "parenthesized_expression" | "as_expression" | "non_null_expression" | "satisfies_expression"
@@ -436,7 +559,7 @@ fn unwrap_wrappers<'t>(value: Node<'t>, src: &str) -> Option<Unwrapped<'t>> {
 }
 
 /// Every name bound by a pattern (`{ a, b: c, ...rest }`, `[x, y = 1]`, `id`).
-fn pattern_names(n: Node, src: &str, out: &mut Vec<String>) {
+pub(crate) fn pattern_names(n: Node, src: &str, out: &mut Vec<String>) {
     match n.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => out.push(text(n, src).to_string()),
         "pair_pattern" => {
@@ -574,7 +697,7 @@ fn build_scope(func: Node, kind: SymKind, src: &str) -> Scope {
 }
 
 /// Identifiers read inside `n` that are not declared inside it (in order, deduplicated).
-fn free_refs(n: Node, src: &str) -> Vec<String> {
+pub(crate) fn free_refs(n: Node, src: &str) -> Vec<String> {
     fn walk(n: Node, src: &str, refs: &mut Vec<String>, declared: &mut Vec<String>) {
         let mut skip: Option<usize> = None;
         match n.kind() {
@@ -633,7 +756,7 @@ fn free_refs(n: Node, src: &str) -> Vec<String> {
 }
 
 /// `user?.profile.id` => "user"
-fn root_ident(mut n: Node, src: &str) -> Option<String> {
+pub(crate) fn root_ident(mut n: Node, src: &str) -> Option<String> {
     loop {
         n = strip_expr(n);
         match n.kind() {
@@ -785,7 +908,7 @@ fn kind_for(name: &str) -> SymKind {
     }
 }
 
-fn text<'a>(n: Node, src: &'a str) -> &'a str {
+pub(crate) fn text<'a>(n: Node, src: &'a str) -> &'a str {
     n.utf8_text(src.as_bytes()).unwrap_or("")
 }
 
@@ -861,7 +984,108 @@ fn has_route_entries(node: Node, src: &str) -> bool {
     node.children(&mut c).filter(|ch| !is_fn(*ch)).any(|ch| has_route_entries(ch, src))
 }
 
+/// The tag of a JSX element: `Suspense`, `Card`, and `Suspense` for `React.Suspense`.
+fn tag_name<'a>(el: Node, src: &'a str) -> Option<&'a str> {
+    let n = el.child_by_field_name("name")?;
+    match n.kind() {
+        "identifier" => Some(text(n, src)),
+        "member_expression" => n.child_by_field_name("property").map(|p| text(p, src)),
+        _ => None,
+    }
+}
+
+/// Does this element (`jsx_element`, `jsx_opening_element` or self-closing) have an attribute called `name`?
+fn has_attr(el: Node, src: &str, names: &[&str]) -> bool {
+    let el = if el.kind() == "jsx_element" { el.child_by_field_name("open_tag").unwrap_or(el) } else { el };
+    let mut c = el.walk();
+    let found = el.children(&mut c).any(|a| {
+        a.kind() == "jsx_attribute" && a.named_child(0).is_some_and(|p| names.contains(&text(p, src)))
+    });
+    found
+}
+
+/// A route that has its own error UI: `{ path, element, errorElement }` or `<Route errorElement={...} />`.
+/// Everything inside it (its page, its child routes) is covered.
+fn is_error_scope(node: Node, src: &str) -> bool {
+    const KEYS: &[&str] = &["errorElement", "ErrorBoundary"];
+    match node.kind() {
+        "object" => {
+            let mut c = node.walk();
+            let found = node.children(&mut c).any(|p| {
+                p.kind() == "pair"
+                    && p.child_by_field_name("key")
+                        .is_some_and(|k| KEYS.contains(&text(k, src).trim_matches(|c| c == '"' || c == '\'')))
+            });
+            found
+        }
+        "jsx_element" | "jsx_self_closing_element" => {
+            let open = if node.kind() == "jsx_element" { node.child_by_field_name("open_tag") } else { Some(node) };
+            open.is_some_and(|o| tag_name(o, src) == Some("Route") && has_attr(o, src, KEYS))
+        }
+        _ => false,
+    }
+}
+
+/// Is `children` read anywhere inside `n`?
+fn reads_children(n: Node, src: &str) -> bool {
+    match n.kind() {
+        "identifier" | "property_identifier" | "shorthand_property_identifier" => text(n, src) == "children",
+        _ => {
+            let mut c = n.walk();
+            let kids: Vec<Node> = n.children(&mut c).collect();
+            kids.into_iter().any(|k| reads_children(k, src))
+        }
+    }
+}
+
 fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
+    // a route with an `errorElement` covers its page and its child routes, attributes included
+    let scoped = is_error_scope(node, cx.src);
+    if scoped {
+        cx.wrappers.push(ERR_SCOPE.to_string());
+    }
+    // `<Suspense fallback={...}>children</Suspense>`: the children are inside the element, its attributes are not
+    if node.kind() == "jsx_element" {
+        let mut c = node.walk();
+        let kids: Vec<Node> = node.children(&mut c).collect();
+        let tag = kids.iter().find(|k| k.kind() == "jsx_opening_element").and_then(|o| tag_name(*o, cx.src)).map(str::to_string);
+        for k in kids.iter().filter(|k| k.kind() == "jsx_opening_element") {
+            visit(*k, owner, cx);
+        }
+        let inner: Vec<&Node> = kids.iter().filter(|k| !matches!(k.kind(), "jsx_opening_element" | "jsx_closing_element")).collect();
+        match tag.filter(|t| t.starts_with(|c: char| c.is_uppercase())) {
+            Some(tag) => {
+                // a component that renders its children inside a boundary passes that boundary on to them
+                if let Some(o) = owner {
+                    if inner.iter().any(|k| reads_children(**k, cx.src)) {
+                        if tag == "Suspense" {
+                            cx.symbols[o].provides_suspense = true;
+                        } else if is_boundary_name(&tag) {
+                            cx.symbols[o].provides_boundary = true;
+                        }
+                    }
+                }
+                cx.wrappers.push(tag);
+                for k in inner {
+                    visit(*k, owner, cx);
+                }
+                cx.wrappers.pop();
+            }
+            None => {
+                for k in inner {
+                    visit(*k, owner, cx);
+                }
+            }
+        }
+    } else {
+        visit_node(node, owner, cx);
+    }
+    if scoped {
+        cx.wrappers.pop();
+    }
+}
+
+fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
     match node.kind() {
         "function_declaration" => {
             if let Some(name) = node.child_by_field_name("name") {
@@ -944,6 +1168,10 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
         // route objects: `{ Component: Home }` renders Home just like `{ element: <Home /> }`
         "pair" => {
             if let (Some(owner), Some((key, value))) = (owner, route_entry(node, cx.src)) {
+                // the page of the route (not its error UI)
+                if key == "element" {
+                    cx.route_node = Some(value.id());
+                }
                 if value.kind() == "identifier" && matches!(key, "Component" | "ErrorBoundary") {
                     cx.refs.push(RawRef {
                         owner,
@@ -954,7 +1182,22 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         via: None,
                         event_prop: false,
                         unstable: Vec::new(),
+                        wrappers: cx.wrappers.clone(),
+                        host: false,
+                        route: key == "Component",
                     });
+                }
+            }
+        }
+        // <Route element={<Home />} />: the page of a route
+        "jsx_attribute" => {
+            let is_route_element = node.named_child(0).is_some_and(|n| text(n, cx.src) == "element")
+                && node.parent().and_then(|p| tag_name(p, cx.src)) == Some("Route");
+            if is_route_element {
+                let mut c = node.walk();
+                let value = node.children(&mut c).find(|k| k.kind() == "jsx_expression").and_then(|e| e.named_child(0)).map(strip_expr);
+                if let Some(v) = value.filter(|v| matches!(v.kind(), "jsx_element" | "jsx_self_closing_element")) {
+                    cx.route_node = Some(v.id());
                 }
             }
         }
@@ -983,7 +1226,20 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         provide,
                     });
                 }
+                // <button onClick={...}>: an event handler on a DOM element
+                if n.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    let mut c = node.walk();
+                    for a in node.children(&mut c).filter(|a| a.kind() == "jsx_attribute") {
+                        if let Some(p) = a.named_child(0).filter(|p| p.kind() == "property_identifier" && is_event_prop(text(*p, cx.src))) {
+                            cx.symbols[owner].client_uses.push((text(p, cx.src).to_string(), a.start_position().row + 1));
+                        }
+                    }
+                }
                 if n.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    // the element that is a route's page: itself, or (for `<A><B/></A>`) its jsx_element
+                    let route = cx.route_node.is_some_and(|id| {
+                        node.id() == id || (node.kind() == "jsx_opening_element" && node.parent().is_some_and(|p| p.id() == id))
+                    });
                     cx.refs.push(RawRef {
                         owner,
                         name: n.to_string(),
@@ -993,6 +1249,9 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         via: None,
                         event_prop: false,
                         unstable: unstable_props(node, &cx.scopes, cx.src),
+                        wrappers: cx.wrappers.clone(),
+                        host: tag_name(node, cx.src).is_some_and(|t| ROUTER_HOSTS.contains(&t)),
+                        route,
                     });
                     // onClick={handleAdd} => <Name> receives handleAdd
                     let mut c = node.walk();
@@ -1016,6 +1275,9 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                                         via: Some(n.to_string()),
                                         event_prop,
                                         unstable: Vec::new(),
+                                        wrappers: Vec::new(),
+                                        host: false,
+                                        route: false,
                                     });
                                 }
                             }
@@ -1039,6 +1301,32 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                 if DEP_HOOKS.contains(&h) {
                     let info = analyze_deps(node, h, None, cx.src, &cx.scopes);
                     cx.symbols[owner].dep_hooks.push(info);
+                    if is_effect(h) {
+                        let hints = {
+                            let scopes = &cx.scopes;
+                            let is_setter = |n: &str| matches!(lookup(scopes, n), Some((Origin::Setter, _)));
+                            lint::effect_rules(node, h, &is_setter, lint::enclosing_fn(node), cx.src)
+                        };
+                        cx.symbols[owner].lint_hints.extend(hints);
+                    }
+                }
+            }
+            // items.map(item => <li />): every item needs a key
+            if let Some(owner) = owner {
+                let hints = lint::missing_key(node, cx.src);
+                cx.symbols[owner].lint_hints.extend(hints);
+            }
+
+            // fetch(...), axios.get(...), useQuery(...), useSelector(...)
+            if let Some(owner) = owner {
+                if let Some(u) = crate::data::uses(node, cx.src) {
+                    cx.symbols[owner].data.push(u);
+                }
+            }
+            // browser-only hooks
+            if let (Some(owner), Some(h)) = (owner, callee) {
+                if next::CLIENT_HOOKS.contains(&h) {
+                    cx.symbols[owner].client_uses.push((h.to_string(), node.start_position().row + 1));
                 }
             }
             // useContext(Ctx) / use(Ctx)
@@ -1066,6 +1354,9 @@ fn visit(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                         via: None,
                         event_prop: false,
                         unstable: Vec::new(),
+                        wrappers: Vec::new(),
+                        host: false,
+                        route: false,
                     });
                 }
             }
@@ -1091,11 +1382,29 @@ fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> us
         deps: None,
         dep_hooks: Vec::new(),
         prop_hints: Vec::new(),
+        drill_hints: Vec::new(),
         is_value: false,
         similar: Vec::new(),
         cycle: None,
+        tests: Vec::new(),
+
+        lazy: false,
+        provides_suspense: false,
+        provides_boundary: false,
+        cover_hints: Vec::new(),
+
+        lint_hints: Vec::new(),
+
+        data: Vec::new(),
+
+        env: None,
+        entry: None,
+        next_hints: Vec::new(),
+        client_uses: Vec::new(),
+        server_action: false,
         func: None,
         shape: Shape::default(),
+        forwards: None,
     });
     cx.symbols.len() - 1
 }
@@ -1110,11 +1419,33 @@ fn enter_fn(id: usize, func: Node, body: Node, cx: &mut Ctx) {
     cx.symbols[id].shape = similar::shape(&roots, |n| defines_symbol(n, src));
     cx.symbols[id].func = Some((func.start_byte(), func.end_byte()));
     let kind = cx.symbols[id].kind;
+    let real_body = func.child_by_field_name("body").unwrap_or(body);
+    let name = cx.symbols[id].name.clone();
+    cx.symbols[id].lint_hints = lint::hook_rules(real_body, kind, &name, cx.src);
+
+    // `async function save() { "use server"; ... }`
+    if let Some(b) = func.child_by_field_name("body").filter(|b| b.kind() == "statement_block") {
+        let mut c = b.walk();
+        let first = b.named_children(&mut c).find(|s| s.kind() != "comment");
+        if first.is_some_and(|s| directive_of(s, cx.src) == Some(Directive::Server)) {
+            cx.symbols[id].server_action = true;
+        }
+    }
     let scoped = matches!(kind, SymKind::Component | SymKind::Hook);
     if scoped {
-        cx.scopes.push(build_scope(func, kind, cx.src));
+        let scope = build_scope(func, kind, cx.src);
+        if kind == SymKind::Component {
+            let names: HashSet<String> = scope.bindings.keys().cloned().collect();
+            // `const C = (props) => ...` is entered with the function itself as its body: the parameters aren't reads
+            let real_body = func.child_by_field_name("body").unwrap_or(body);
+            cx.symbols[id].forwards = Some(drill::analyze(func, real_body, &names, cx.src));
+        }
+        cx.scopes.push(scope);
     }
+    // elements around the declaration are not around what its body renders
+    let outer = std::mem::take(&mut cx.wrappers);
     visit(body, Some(id), cx);
+    cx.wrappers = outer;
     if scoped {
         cx.scopes.pop();
     }
@@ -1195,6 +1526,14 @@ enum Imported {
 struct Import {
     spec: String,
     name: Imported,
+    /// `const X = lazy(() => import("spec"))`
+    lazy: bool,
+}
+
+impl Import {
+    fn name_is_namespace(&self) -> bool {
+        matches!(self.name, Imported::Namespace)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1217,6 +1556,21 @@ struct Module {
     aliases: HashMap<String, String>,
     /// top-level `const ThemeContext = createContext(...)`
     contexts: HashMap<String, usize>,
+    /// `"use client"` / `"use server"` at the top of the file
+    directive: Option<Directive>,
+}
+
+/// `"use client"` / `"use server"` as a statement.
+fn directive_of(st: Node, src: &str) -> Option<Directive> {
+    if st.kind() != "expression_statement" {
+        return None;
+    }
+    let s = st.named_child(0).filter(|s| s.kind() == "string")?;
+    match string_value(s, src).as_str() {
+        "use client" => Some(Directive::Client),
+        "use server" => Some(Directive::Server),
+        _ => None,
+    }
 }
 
 /// `"./Button"` => `./Button`; identifiers pass through.
@@ -1279,7 +1633,7 @@ fn collect_declarators(decl: Node, src: &str, m: &mut Module) {
         if is_create_context(value, src) {
             m.contexts.insert(name, d.start_position().row + 1);
         } else if let Some(spec) = lazy_import_spec(value, src) {
-            m.imports.insert(name, Import { spec, name: Imported::Default });
+            m.imports.insert(name, Import { spec, name: Imported::Default, lazy: true });
         } else if let Some(Unwrapped::Ident { target }) = unwrap_wrappers(value, src) {
             if target != name {
                 m.aliases.insert(name, target);
@@ -1298,11 +1652,11 @@ fn collect_import(st: Node, src: &str, m: &mut Module) {
         for part in parts {
             match part.kind() {
                 "identifier" => {
-                    m.imports.insert(text(part, src).into(), Import { spec: spec.clone(), name: Imported::Default });
+                    m.imports.insert(text(part, src).into(), Import { spec: spec.clone(), name: Imported::Default, lazy: false });
                 }
                 "namespace_import" => {
                     if let Some(id) = part.named_child(0) {
-                        m.imports.insert(text(id, src).into(), Import { spec: spec.clone(), name: Imported::Namespace });
+                        m.imports.insert(text(id, src).into(), Import { spec: spec.clone(), name: Imported::Namespace, lazy: false });
                     }
                 }
                 "named_imports" => {
@@ -1311,7 +1665,7 @@ fn collect_import(st: Node, src: &str, m: &mut Module) {
                         let Some(name) = s.child_by_field_name("name").map(|n| string_value(n, src)) else { continue };
                         let local = s.child_by_field_name("alias").map(|a| text(a, src).to_string()).unwrap_or_else(|| name.clone());
                         let imported = if name == "default" { Imported::Default } else { Imported::Named(name) };
-                        m.imports.insert(local, Import { spec: spec.clone(), name: imported });
+                        m.imports.insert(local, Import { spec: spec.clone(), name: imported, lazy: false });
                     }
                 }
                 _ => {}
@@ -1372,7 +1726,17 @@ fn collect_export(st: Node, src: &str, m: &mut Module) {
 fn collect_module(root: Node, src: &str) -> Module {
     let mut m = Module::default();
     let mut c = root.walk();
+    // directives come first, before any import (comments and other directives aside)
+    let mut prologue = true;
     for st in root.named_children(&mut c) {
+        if prologue {
+            match (st.kind(), directive_of(st, src)) {
+                (_, Some(d)) => m.directive = m.directive.or(Some(d)),
+                ("comment", _) => {}
+                ("expression_statement", _) if st.named_child(0).is_some_and(|s| s.kind() == "string") => {}
+                _ => prologue = false,
+            }
+        }
         match st.kind() {
             "import_statement" => collect_import(st, src, &mut m),
             "export_statement" => collect_export(st, src, &mut m),
@@ -1545,6 +1909,8 @@ fn parse_chunk(root: &Path, paths: &[PathBuf]) -> Part {
             memo_marks: &mut part.memo_marks,
             comp_alias: &mut part.comp_alias,
             scopes: Vec::new(),
+            wrappers: Vec::new(),
+            route_node: None,
         };
         visit(tree.root_node(), None, &mut cx);
     }
@@ -1734,7 +2100,7 @@ fn add_context_edges(
         for &(p, line) in providers {
             for &to in &all {
                 if p != to && seen.insert((p, to, c)) {
-                    edges.push(Edge { from: p, to, kind: EdgeKind::Context, line, site: p, ctx: Some(c) });
+                    edges.push(Edge { from: p, to, kind: EdgeKind::Context, line, site: p, ctx: Some(c), suspended: false, caught: false, route: false });
                 }
             }
         }
@@ -1747,31 +2113,104 @@ fn is_skipped_dir(name: &str) -> bool {
     matches!(name, "node_modules" | ".git" | "dist" | "build" | ".next" | "coverage" | ".turbo" | ".cache")
 }
 
-/// A file `build` parses.
-fn is_source_file(p: &Path) -> bool {
+fn is_script(p: &Path) -> bool {
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(ext, "ts" | "tsx" | "js" | "jsx") && !p.to_string_lossy().ends_with(".d.ts")
+}
+
+/// A test file: `Card.test.tsx`, `Card.spec.js`, or anything inside a `__tests__` folder.
+pub fn is_test_file(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    matches!(ext, "ts" | "tsx" | "js" | "jsx") && !s.ends_with(".d.ts") && !s.contains(".test.") && !s.contains(".spec.")
+    is_script(p)
+        && (s.contains(".test.") || s.contains(".spec.") || p.components().any(|c| c.as_os_str() == "__tests__"))
+}
+
+/// A file `build` parses into symbols (test files are only read for what they import).
+fn is_source_file(p: &Path) -> bool {
+    is_script(p) && !is_test_file(p)
 }
 
 /// Would a change to `p` change what `build` returns: a source file, or the tsconfig that
 /// decides how imports resolve, outside the skipped folders. For the file watcher.
 pub fn affects_graph(p: &Path) -> bool {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    (is_source_file(p) || matches!(name, "tsconfig.json" | "jsconfig.json"))
+    (is_script(p) || matches!(name, "tsconfig.json" | "jsconfig.json"))
         && !p.components().any(|c| is_skipped_dir(&c.as_os_str().to_string_lossy()))
+}
+
+/// Imports of each test file (relative path, module facts), in path order.
+fn parse_test_modules(root: &Path, paths: &[PathBuf]) -> Vec<(String, Module)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let nthreads = 8.min(paths.len());
+    let chunk = paths.len().div_ceil(nthreads).max(1);
+    let parts: Vec<Vec<(String, Module)>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| {
+                std::thread::Builder::new()
+                    .stack_size(16 << 20)
+                    .spawn_scoped(sc, move || {
+                        let mut parser = Parser::new();
+                        parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()).expect("load tsx grammar");
+                        c.iter()
+                            .filter_map(|p| {
+                                let src = std::fs::read_to_string(p).ok()?;
+                                let tree = parser.parse(&src, None)?;
+                                let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
+                                Some((rel, collect_module(tree.root_node(), &src)))
+                            })
+                            .collect()
+                    })
+                    .expect("spawn parser thread")
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("parser thread")).collect()
+    });
+    parts.into_iter().flatten().collect()
+}
+
+/// (symbol, test file index) for every symbol a test file imports. `import * as X from "./x"`
+/// counts for every top-level symbol of that file.
+fn test_links(
+    symbols: &[Symbol],
+    modules: &HashMap<String, Module>,
+    file_list: &[String],
+    aliases: &AliasMap,
+    test_files: &[String],
+) -> Vec<(usize, usize)> {
+    let resolver = Resolver::new(symbols, modules, file_list, aliases);
+    let mut out = Vec::new();
+    for (t, file) in test_files.iter().enumerate() {
+        let Some(m) = modules.get(file) else { continue };
+        let mut names: Vec<&String> = m.imports.keys().collect();
+        names.sort();
+        for name in names {
+            let imp = &m.imports[name];
+            if imp.name_is_namespace() {
+                if let Some(f) = resolver.resolve_spec(file, &imp.spec) {
+                    out.extend(symbols.iter().enumerate().filter(|(_, s)| s.parent.is_none() && s.file == f).map(|(i, _)| (i, t)));
+                }
+            } else if let Some(i) = resolver.resolve_import(file, imp, 0) {
+                out.push((i, t));
+            }
+        }
+    }
+    out
 }
 
 pub fn build(root: &Path) -> Graph {
     // 1. list files (skipping heavy folders)
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| !is_skipped_dir(&e.file_name().to_string_lossy()));
-    let mut paths: Vec<PathBuf> = walker
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .filter(|p| is_source_file(p))
-        .collect();
+    let all: Vec<PathBuf> =
+        walker.filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).map(|e| e.into_path()).collect();
+    // judged by the path inside the project: a folder called `my.test.app` or `__tests__` above it says nothing
+    let inside = |p: &PathBuf| p.strip_prefix(root).unwrap_or(p).to_path_buf();
+    let mut paths: Vec<PathBuf> = all.iter().filter(|p| is_source_file(&inside(p))).cloned().collect();
+    let mut test_paths: Vec<PathBuf> = all.into_iter().filter(|p| is_test_file(&inside(p))).collect();
     paths.sort();
+    test_paths.sort();
 
     // 2. read + parse in parallel (file reads over WSL/network are slow)
     let nthreads = 16.min(paths.len().max(1));
@@ -1844,22 +2283,56 @@ pub fn build(root: &Path) -> Graph {
 
     let mut edges: Vec<Edge> = Vec::new();
     let mut prop_hints: Vec<(usize, PropHint)> = Vec::new();
-    let mut seen: HashSet<(usize, usize, EdgeKind)> = HashSet::new();
-    // refs arrive in source order per file, so the first one kept is the first use
-    let mut push = |from: usize, to: usize, kind: EdgeKind, line: usize, site: usize, edges: &mut Vec<Edge>| {
-        if from != to && seen.insert((from, to, kind)) {
-            edges.push(Edge { from, to, kind, line, site, ctx: None });
+    let mut hops: Vec<drill::Hop> = Vec::new();
+    let mut seen: HashMap<(usize, usize, EdgeKind), usize> = HashMap::new();
+    // refs arrive in source order per file, so the first one kept is the first use. A symbol used
+    // several times is only suspended / caught where every use is.
+    let mut push = |from: usize, to: usize, kind: EdgeKind, line: usize, site: usize, g: (bool, bool, bool), edges: &mut Vec<Edge>| {
+        if from == to {
+            return;
+        }
+        match seen.get(&(from, to, kind)) {
+            Some(&i) => {
+                edges[i].suspended &= g.0;
+                edges[i].caught &= g.1;
+                edges[i].route |= g.2;
+            }
+            None => {
+                seen.insert((from, to, kind), edges.len());
+                edges.push(Edge { from, to, kind, line, site, ctx: None, suspended: g.0, caught: g.1, route: g.2 });
+            }
         }
     };
+    let none = (false, false, false);
+    // wrapper tag (as written in a component) -> the component it is
+    let mut resolved: HashMap<(usize, &str), usize> = HashMap::new();
+    let (mut host_suspended, mut host_caught) = (false, false);
 
     for (i, s) in symbols.iter().enumerate() {
         if let Some(p) = s.parent {
-            push(p, i, EdgeKind::Defines, s.line, p, &mut edges);
+            push(p, i, EdgeKind::Defines, s.line, p, none, &mut edges);
         }
     }
 
     for r in &refs {
         let owner = r.owner;
+        // inside a Suspense / error boundary: written there, or in a component that renders its children in one
+        let (mut suspended, mut caught) = (false, false);
+        for w in &r.wrappers {
+            if w == "Suspense" {
+                suspended = true;
+            } else if w == ERR_SCOPE || is_boundary_name(w) {
+                caught = true;
+            } else if let Some(&t) = resolved.get(&(owner, w.as_str())) {
+                suspended |= symbols[t].provides_suspense;
+                caught |= symbols[t].provides_boundary;
+            }
+        }
+        // a router inside a boundary: it covers every page, even those the config defines elsewhere
+        if r.host {
+            host_suspended |= suspended;
+            host_caught |= caught;
+        }
         let cands: &[usize] = by_name.get(r.name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
         // 1. same file, visible from owner
         let target = cands
@@ -1925,10 +2398,57 @@ pub fn build(root: &Path) -> Graph {
                 }
             }
         };
-        push(from, t, kind, r.line, owner, &mut edges);
+        if kind == EdgeKind::Renders {
+            resolved.entry((owner, r.name.as_str())).or_insert(t);
+        }
+        push(from, t, kind, r.line, owner, (suspended, caught, r.route), &mut edges);
+        // `<Child prop={own} />`: the value goes on to `t`
+        if kind == EdgeKind::Renders && r.via.is_none() && t != owner {
+            if let Some(f) = &symbols[owner].forwards {
+                hops.extend(f.passes.iter().filter(|p| p.child == r.name && p.elem_line == r.line).map(|p| drill::Hop {
+                    from: owner,
+                    to: t,
+                    own: p.own.clone(),
+                    child_prop: p.child_prop.clone(),
+                    line: p.line,
+                }));
+            }
+        }
     }
 
     let contexts = add_context_edges(&symbols, &modules, &resolver, &ctx_refs, &mut edges);
+
+    // code-split chunks: whatever a `lazy(() => import(...))` binding points at
+    let mut lazies: Vec<usize> = Vec::new();
+    for (file, m) in &modules {
+        lazies.extend(m.imports.values().filter(|i| i.lazy).filter_map(|i| resolver.resolve_import(file, i, 0)));
+    }
+    drop(resolver);
+    for i in lazies {
+        symbols[i].lazy = true;
+    }
+    cover::add_hints(&mut symbols, &edges, host_suspended, host_caught);
+
+    // test files: which symbols they import (through barrels and path aliases, like any other import)
+    let test_mods = parse_test_modules(root, &test_paths);
+    let test_files: Vec<String> = test_mods.iter().map(|(f, _)| f.clone()).collect();
+    modules.extend(test_mods);
+    let links = test_links(&symbols, &modules, &file_list, &alias_map, &test_files);
+    for (sym, t) in links {
+        if !symbols[sym].tests.contains(&t) {
+            symbols[sym].tests.push(t);
+        }
+    }
+
+
+    // Next.js: routes, server / client components, layout nesting
+    {
+        let facts: HashMap<&str, next::FileFacts> = modules
+            .iter()
+            .map(|(f, m)| (f.as_str(), next::FileFacts { directive: m.directive, default_export: m.exports.get("default").cloned() }))
+            .collect();
+        next::annotate(root, &mut symbols, &mut edges, &file_list, &facts);
+    }
 
     for (owner, h) in prop_hints {
         let have = &mut symbols[owner].prop_hints;
@@ -1941,6 +2461,11 @@ pub fn build(root: &Path) -> Graph {
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); symbols.len()];
     for e in edges.iter().filter(|e| matches!(e.kind, EdgeKind::Renders | EdgeKind::Calls)) {
         adj[e.from].push(e.to);
+    }
+    let drills = drill::find_chains(&symbols, &hops);
+    drill::add_hints(&mut symbols, &hops, &drills);
+    for s in symbols.iter_mut() {
+        s.forwards = None;
     }
     let cycles = find_cycles(&adj);
     for (c, members) in cycles.iter().enumerate() {
@@ -1957,7 +2482,7 @@ pub fn build(root: &Path) -> Graph {
         inc[e.to].push(ei);
     }
     file_list.sort();
-    Graph { symbols, edges, files, file_list, contexts, cycles, out, inc }
+    Graph { symbols, edges, files, file_list, test_files, contexts, cycles, drills, out, inc }
 }
 
 #[cfg(test)]
@@ -2166,7 +2691,9 @@ mod tests {
     fn only_graph_inputs_count_as_changes() {
         let hit = |p: &str| affects_graph(Path::new(p));
         assert!(hit("src/App.tsx") && hit("C:/proj/src/a/b.js") && hit("tsconfig.json") && hit("web/jsconfig.json"));
-        assert!(!hit("README.md") && !hit("src/App.test.tsx") && !hit("src/types.d.ts") && !hit("package.json"));
+        // test files change which symbols count as tested
+        assert!(hit("src/App.test.tsx") && hit("src/__tests__/a.ts"));
+        assert!(!hit("README.md") && !hit("src/types.d.ts") && !hit("package.json"));
         assert!(!hit("node_modules/react/index.js") && !hit("C:/proj/dist/app.js") && !hit(".git/HEAD"));
     }
 
@@ -2305,5 +2832,638 @@ mod tests {
         assert!(similar_to(&g, "src/context/AuthContext.tsx", "useAuth").is_empty());
         // same-name components with different bodies are not duplicates
         assert!(similar_to(&g, "src/features/projects/Toolbar.tsx", "Toolbar").is_empty());
+    }
+
+    fn drilling() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drilling"))
+    }
+
+    fn drill_names(g: &Graph, c: &drill::Chain) -> Vec<String> {
+        c.through.iter().map(|&t| g.symbols[t].name.clone()).collect()
+    }
+
+    #[test]
+    fn prop_drilling_chains_are_found() {
+        let g = drilling();
+        let mut chains: Vec<(String, Vec<String>, String)> = g
+            .drills
+            .iter()
+            .map(|c| (g.symbols[c.origin].name.clone(), drill_names(&g, c), g.symbols[c.end].name.clone()))
+            .collect();
+        chains.sort();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            chains,
+            [
+                // useState value in App, forwarded by three components, read by Avatar
+                ("App".to_string(), s(&["Layout", "Sidebar", "UserMenu"]), "Avatar".to_string()),
+                // `props.items` style
+                ("Dashboard".to_string(), s(&["Panel", "Table"]), "Row".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn forwarding_components_get_a_warning() {
+        let g = drilling();
+        for n in ["Layout", "Sidebar", "UserMenu", "Panel", "Table"] {
+            let s = sym(&g, n);
+            assert_eq!(s.drill_hints.len(), 1, "{n}: {:?}", s.drill_hints);
+            assert_eq!(s.warnings(), 1, "{n}");
+        }
+        let h = &sym(&g, "Sidebar").drill_hints[0];
+        assert_eq!(h.prop, "user");
+        assert!(h.text.contains("App \u{2192} Layout \u{2192} Sidebar \u{2192} UserMenu \u{2192} Avatar"), "{}", h.text);
+        // the line of `<UserMenu user={user} />`
+        assert_eq!(h.line, 9);
+        // `theme` is forwarded one step to a component that reads it: no chain
+        assert!(sym(&g, "Sidebar").drill_hints.iter().all(|h| h.prop != "theme"));
+        // origin and the component that finally uses it are not flagged
+        for n in ["App", "Avatar", "Dashboard", "Row"] {
+            assert!(sym(&g, n).drill_hints.is_empty(), "{n}");
+        }
+    }
+
+    #[test]
+    fn short_chains_and_used_props_are_not_drilling() {
+        let g = drilling();
+        // one forwarding level is normal
+        for n in ["Shallow", "Badge"] {
+            assert!(sym(&g, n).drill_hints.is_empty(), "{n}");
+        }
+        // Toolbar reads `title` itself, so only Menu forwards it: one level
+        for n in ["Toolbar", "Menu", "Item"] {
+            assert!(sym(&g, n).drill_hints.is_empty(), "{n}");
+        }
+    }
+
+    #[test]
+    fn complex_react_drilling_is_consistent() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        for c in &g.drills {
+            assert!(c.through.len() >= drill::MIN_THROUGH);
+        }
+    }
+
+    #[test]
+    fn arrow_function_components_drill_too() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drilling_arrow"));
+        // `(props) => <Table items={props.items} />`, with and without a block body
+        assert_eq!(g.drills.len(), 1, "{:?}", g.drills);
+        assert_eq!(drill_names(&g, &g.drills[0]), ["Panel", "Table"]);
+        assert_eq!(sym(&g, "Dash").drill_hints.len(), 0);
+        assert_eq!(sym(&g, "Panel").drill_hints.len(), 1);
+        assert_eq!(sym(&g, "Row").drill_hints.len(), 0);
+    }
+
+    fn tests_fixture() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tests"))
+    }
+
+    fn test_names(g: &Graph, name: &str) -> Vec<String> {
+        let i = g.symbols.iter().position(|s| s.name == name).unwrap_or_else(|| panic!("no symbol {name}"));
+        let mut v: Vec<String> = g.tests_of(i).iter().map(|&t| g.test_files[t].clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_files_are_found_but_not_parsed_as_source() {
+        let g = tests_fixture();
+        assert_eq!(
+            g.test_files,
+            ["Card.test.tsx", "__tests__/Button.test.tsx", "__tests__/helpers.tsx", "hooks/useCounter.spec.ts", "math.test.ts"]
+        );
+        // neither tests nor helpers inside `__tests__` become symbols or files of the graph
+        assert!(g.symbols.iter().all(|s| !s.file.contains("test") && !s.file.contains("spec") && s.name != "renderWithTheme"));
+        assert!(g.file_list.iter().all(|f| !f.contains("__tests__") && !f.contains(".test.") && !f.contains(".spec.")));
+    }
+
+    #[test]
+    fn imports_link_symbols_to_their_tests() {
+        let g = tests_fixture();
+        assert_eq!(test_names(&g, "Card"), ["Card.test.tsx"]);
+        // through a barrel, from a `__tests__` folder
+        assert_eq!(test_names(&g, "Button"), ["__tests__/Button.test.tsx"]);
+        // default import
+        assert_eq!(test_names(&g, "useCounter"), ["hooks/useCounter.spec.ts"]);
+        // `import * as math` covers every export of the file
+        assert_eq!(test_names(&g, "add"), ["math.test.ts"]);
+        assert_eq!(test_names(&g, "sub"), ["math.test.ts"]);
+        // a handler defined inside a tested component counts as tested
+        assert_eq!(test_names(&g, "onClick"), ["Card.test.tsx"]);
+    }
+
+    #[test]
+    fn untested_symbols_are_flagged() {
+        let g = tests_fixture();
+        let flagged: Vec<&str> = {
+            let mut v: Vec<&str> = (0..g.symbols.len()).filter(|&i| g.untested(i)).map(|i| g.symbols[i].name.as_str()).collect();
+            v.sort();
+            v
+        };
+        // imported by name only: its neighbours in the same file are not covered
+        assert_eq!(flagged, ["CardSkeleton", "IconButton", "Lonely"]);
+    }
+
+    #[test]
+    fn nothing_is_untested_in_a_project_without_tests() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/memo"));
+        assert!(g.test_files.is_empty());
+        assert!((0..g.symbols.len()).all(|i| !g.untested(i)));
+    }
+
+    #[test]
+    fn complex_react_reducer_test_is_linked() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        assert!(g.test_files.iter().any(|f| f.ends_with("boardReducer.test.ts")));
+        let reducer = idx(&g, "src/features/board/boardReducer.ts", "boardReducer");
+        assert!(g.tests_of(reducer).iter().any(|&t| g.test_files[t].ends_with("boardReducer.test.ts")));
+    }
+
+    #[test]
+    fn a_project_folder_named_like_a_test_is_still_a_project() {
+        let base = std::env::temp_dir().join(format!("react-graph-odd-root-{}", std::process::id()));
+        for dir in ["my.test.app", "__tests__/proj", "a.spec.b"] {
+            let root = base.join(dir);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/App.tsx"), "export function App() { return <div />; }
+").unwrap();
+            std::fs::write(root.join("src/App.test.tsx"), "import { App } from \"./App\";
+test(\"a\", () => { void App; });
+").unwrap();
+            let g = build(&root);
+            assert_eq!((g.files, g.symbols.len(), g.test_files.len()), (1, 1, 1), "{dir}");
+            assert_eq!(g.tests_of(0).len(), 1, "{dir}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn cover(dir: &str) -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir))
+    }
+
+    fn hinted(g: &Graph) -> Vec<String> {
+        let mut v: Vec<String> = g.symbols.iter().filter(|s| !s.cover_hints.is_empty()).map(|s| s.name.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn lazy_chunks_are_marked_and_checked_for_suspense() {
+        let g = cover("boundaries");
+        let mut lazy: Vec<&str> = g.symbols.iter().filter(|s| s.lazy).map(|s| s.name.as_str()).collect();
+        lazy.sort();
+        assert_eq!(lazy, ["Billing", "Charts", "Help", "Reports"]);
+        assert!(!sym(&g, "App").lazy);
+        // Reports: inside <Suspense>. Charts: inside <Shell>, which renders its children in one.
+        // Billing: bare. Help: once inside, once bare: the bare use counts.
+        let bare: Vec<String> = hinted(&g).into_iter().filter(|n| sym(&g, n).lazy).collect();
+        assert_eq!(bare, ["Billing", "Help"]);
+        let t = &sym(&g, "Billing").cover_hints[0];
+        assert!(t.warn && t.text.contains("`Billing`") && t.text.contains("`App`") && t.text.contains("Suspense"), "{}", t.text);
+        assert_eq!(sym(&g, "Billing").warnings(), 1);
+    }
+
+    #[test]
+    fn components_that_render_children_in_a_boundary_pass_it_on() {
+        let g = cover("boundaries");
+        assert!(sym(&g, "Shell").provides_suspense && !sym(&g, "Shell").provides_boundary);
+        assert!(!sym(&g, "App").provides_suspense && !sym(&g, "Spinner").provides_suspense);
+        // a fallback is outside its own Suspense
+        let shell = idx(&g, "App.tsx", "Shell");
+        let spinner = idx(&g, "App.tsx", "Spinner");
+        let e = g.out_edges(shell).find(|e| e.to == spinner).unwrap();
+        assert!(!e.suspended);
+        // Charts is rendered by App, inside <Shell>
+        let app = idx(&g, "App.tsx", "App");
+        let charts = idx(&g, "pages/Charts.tsx", "Charts");
+        assert!(g.out_edges(app).find(|e| e.to == charts).unwrap().suspended);
+    }
+
+    #[test]
+    fn route_pages_need_an_error_boundary() {
+        let g = cover("boundaries");
+        let mut routes: Vec<&str> =
+            g.symbols.iter().filter(|s| s.file.starts_with("routes/") && !s.cover_hints.is_empty()).map(|s| s.name.as_str()).collect();
+        routes.sort();
+        // Home has an errorElement, PageA inherits its parent's, PageC sits in an ErrorBoundary
+        assert_eq!(routes, ["PageB"]);
+        let h = &sym(&g, "PageB").cover_hints[0];
+        assert!(h.text.contains("`PageB`") && h.text.contains("errorElement"), "{}", h.text);
+        // the error UI itself is not a page
+        assert!(sym(&g, "Oops").cover_hints.is_empty());
+    }
+
+    #[test]
+    fn a_router_inside_a_boundary_covers_its_pages() {
+        let g = cover("boundaries-global");
+        // <ErrorBoundary><Routes /></ErrorBoundary>: PageX is covered, though its route is built outside the JSX
+        assert!(sym(&g, "PageX").cover_hints.is_empty());
+        // <Suspense><Outlet /></Suspense> covers route pages, not a lazy chunk rendered bare elsewhere
+        assert_eq!(hinted(&g), ["Other"]);
+    }
+
+    #[test]
+    fn complex_react_boundaries_are_all_covered() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        let lazy: Vec<&str> = g.symbols.iter().filter(|s| s.lazy).map(|s| s.name.as_str()).collect();
+        assert!(lazy.len() >= 5, "{lazy:?}");
+        // pages are wrapped in <Protected> (Suspense around its children), and Routes sits in an ErrorBoundary
+        assert!(g.symbols.iter().all(|s| s.cover_hints.is_empty()), "{:?}", hinted(&g));
+        assert!(sym(&g, "Protected").provides_suspense);
+    }
+
+    /// A throwaway project folder with the given files.
+    fn tempdir_project(files: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!("react-graph-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        for (f, text) in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn jsx_routes_and_member_tags_are_understood() {
+        let root = tempdir_project(&[
+            (
+                "App.tsx",
+                "import * as React from \"react\";
+import { Home, A, B, Oops } from \"./pages\";
+const Lazy = React.lazy(() => import(\"./Lazy\"));
+export function App() {
+  return (
+    <Routes>
+      <Route path=\"/\" element={<Home />} errorElement={<Oops />}>
+        <Route path=\"a\" element={<A />} />
+      </Route>
+      <Route path=\"/b\" element={<B />} />
+      <React.Suspense fallback={null}><Lazy /></React.Suspense>
+    </Routes>
+  );
+}
+",
+            ),
+            (
+                "pages.tsx",
+                "export function Home() { return <i />; }
+export function A() { return <i />; }
+export function B() { return <i />; }
+export function Oops() { return <i />; }
+",
+            ),
+            ("Lazy.tsx", "export default function Lazy() { return <i />; }
+"),
+        ]);
+        let g = build(&root);
+        let mut flagged = hinted(&g);
+        flagged.sort();
+        // Home has an errorElement, A sits in Home's route, B has none; <React.Suspense> covers the lazy page
+        assert_eq!(flagged, ["B"], "{flagged:?}");
+        assert!(sym(&g, "Lazy").lazy);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn lint_hits(g: &Graph) -> Vec<(String, &'static str, usize)> {
+        let mut v: Vec<_> = g
+            .symbols
+            .iter()
+            .flat_map(|s| s.lint_hints.iter().map(move |h| (s.name.clone(), h.rule, h.line)))
+            .collect();
+        v.sort_by_key(|(_, _, l)| *l);
+        v
+    }
+
+    fn lint_fixture() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lint"))
+    }
+
+    #[test]
+    fn hooks_out_of_order_are_flagged() {
+        let hits: Vec<_> = lint_hits(&lint_fixture()).into_iter().filter(|h| h.1 == "hook-order").collect();
+        let n = |s: &str| s.to_string();
+        assert_eq!(
+            hits,
+            [
+                (n("Conditional"), "hook-order", 6),  // in an if
+                (n("Conditional"), "hook-order", 8),  // in a ternary
+                (n("Conditional"), "hook-order", 9),  // behind &&
+                (n("Conditional"), "hook-order", 11), // in a loop
+                (n("Conditional"), "hook-order", 14), // in an effect callback
+                (n("EarlyReturn"), "hook-order", 21), // after `if (!ready) return null`
+                (n("notAHook"), "hook-order", 36),    // in a plain function
+            ]
+        );
+        let g = lint_fixture();
+        let texts: Vec<&str> = sym(&g, "Conditional").lint_hints.iter().map(|h| h.text.as_str()).collect();
+        assert!(texts[0].contains("`useEffect` is called conditionally"), "{}", texts[0]);
+        assert!(texts[3].contains("in a loop"), "{}", texts[3]);
+        assert!(texts[4].contains("nested function or callback"), "{}", texts[4]);
+        assert!(sym(&g, "EarlyReturn").lint_hints[0].text.contains("after an early return"));
+        assert!(sym(&g, "notAHook").lint_hints[0].text.contains("neither a component nor a custom hook"));
+        // hooks in the right place, a custom hook, and an early return below every hook are fine
+        for ok in ["Fine", "useGood"] {
+            assert!(sym(&g, ok).lint_hints.is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn effects_that_never_clean_up_are_flagged() {
+        let g = lint_fixture();
+        let hits: Vec<_> = lint_hits(&g).into_iter().filter(|h| h.1 == "effect-cleanup").collect();
+        // a listener and a subscription with no cleanup; the interval returns one; `document.title` registers nothing
+        assert_eq!(hits.iter().map(|h| h.2).collect::<Vec<_>>(), [46, 53]);
+        assert!(sym(&g, "Leaky").lint_hints[0].text.contains("an event listener"));
+        assert!(sym(&g, "Leaky").lint_hints[1].text.contains("a subscription"));
+        assert_eq!(sym(&g, "Leaky").warnings(), 2);
+        // `{ once: true }` listeners remove themselves
+        assert!(sym(&g, "Once").lint_hints.is_empty(), "{:?}", sym(&g, "Once").lint_hints);
+    }
+
+    #[test]
+    fn state_derived_in_an_effect_is_flagged() {
+        let g = lint_fixture();
+        let hits: Vec<_> = lint_hits(&g).into_iter().filter(|h| h.1 == "derived-state").collect();
+        // `setFiltered(f(items, query))` with [items, query]; not a constant reset, an updater, or async work
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].2, 66);
+        let t = &sym(&g, "Derived").lint_hints[0].text;
+        assert!(t.contains("`setFiltered`") && t.contains("`items`, `query`"), "{t}");
+        // `setV(1)` with no deps in Fine is a mount effect, not derived state
+        assert!(sym(&g, "Fine").lint_hints.is_empty());
+        // a draft the user also edits is local state that is re-synced, not derived
+        assert!(sym(&g, "Drawer").lint_hints.is_empty(), "{:?}", sym(&g, "Drawer").lint_hints);
+    }
+
+    #[test]
+    fn list_items_need_a_key() {
+        let g = lint_fixture();
+        let hits: Vec<_> = lint_hits(&g).into_iter().filter(|h| h.1 == "missing-key").collect();
+        // `<li>` with no key and a bare fragment; keyed items, non-JSX results and spread props are fine
+        assert_eq!(hits.iter().map(|h| h.2).collect::<Vec<_>>(), [83, 86]);
+        assert!(sym(&g, "List").lint_hints[1].text.contains("Fragment"));
+    }
+
+    #[test]
+    fn complex_react_has_no_lint_hits() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        // hooks there are called at the top of components and hooks, effects clean up, lists have keys, and
+        // TaskDetailsDrawer's draft (re-synced by an effect, but also typed into) is not derived state
+        let hits = lint_hits(&g);
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    fn data_fixture() -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/data"))
+    }
+
+    fn own_data(g: &Graph, name: &str) -> Vec<String> {
+        sym(g, name).data.iter().map(|d| format!("{}:{}", d.kind.label(), d.label)).collect()
+    }
+
+    #[test]
+    fn http_calls_are_found_with_method_and_path() {
+        let g = data_fixture();
+        assert_eq!(own_data(&g, "getProducts"), ["http:GET /api/products"]);
+        // template literals keep the path, `${}` becomes `{}`; the method is upper-cased
+        assert_eq!(own_data(&g, "createOrder"), ["http:POST /api/orders/{}"]);
+        assert_eq!(own_data(&g, "loadUser"), ["http:GET /api/users/{}"]);
+        assert_eq!(own_data(&g, "lookup"), ["http:GET (dynamic url)"]);
+        assert!(own_data(&g, "cached").is_empty(), "Map.get is not a request");
+        // `fetch()`, `axios.get()` and `useQuery()` with no arguments are not calls to list
+        let nothing = std::env::temp_dir().join(format!("react-graph-data-{}", std::process::id()));
+        std::fs::create_dir_all(&nothing).unwrap();
+        std::fs::write(nothing.join("A.tsx"), "export function A() { fetch(); axios.get(); useQuery(); useSWR(); return <p />; }").unwrap();
+        let g2 = build(&nothing);
+        assert!(own_data(&g2, "A").is_empty(), "{:?}", own_data(&g2, "A"));
+        let _ = std::fs::remove_dir_all(&nothing);
+    }
+
+    #[test]
+    fn query_and_store_hooks_are_found() {
+        let g = data_fixture();
+        assert_eq!(own_data(&g, "useTodos"), ["query:todos"]);
+        assert_eq!(own_data(&g, "useAddTodo"), ["query:mutation: mutation"]);
+        assert_eq!(own_data(&g, "Cart"), ["store:redux", "store:redux", "store:useCartStore"]);
+        assert!(own_data(&g, "Plain").is_empty());
+    }
+
+    #[test]
+    fn data_reaches_through_calls_and_nested_functions() {
+        let g = data_fixture();
+        let cart = idx(&g, "Cart.tsx", "Cart");
+        let all: Vec<(String, Option<String>)> = g
+            .data_of(cart)
+            .into_iter()
+            .map(|(d, via)| (d.label, via.map(|v| g.symbols[v].name.clone())))
+            .collect();
+        let has = |label: &str, via: Option<&str>| all.iter().any(|(l, v)| l == label && v.as_deref() == via);
+        assert!(has("redux", None));
+        // useDeep -> useTodos -> useQuery(["todos"]): found two calls away, through the first callee
+        assert!(has("todos", Some("useDeep")), "{all:?}");
+        // the nested `refresh` is defined in Cart, and calls getProducts / loadUser
+        assert!(has("GET /api/products", Some("refresh")), "{all:?}");
+        assert!(has("GET /api/users/{}", Some("refresh")), "{all:?}");
+        assert!(g.data_of(idx(&g, "Plain.tsx", "Plain")).is_empty());
+    }
+
+    #[test]
+    fn data_uses_have_their_line() {
+        let g = data_fixture();
+        assert_eq!(sym(&g, "getProducts").data[0].line, 4);
+        assert_eq!(sym(&g, "useTodos").data[0].line, 5);
+    }
+
+    #[test]
+    fn complex_react_data_access_is_found() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        // nothing may panic or produce an empty label
+        for s in &g.symbols {
+            assert!(s.data.iter().all(|d| !d.label.is_empty()));
+        }
+    }
+
+    fn next_fixture(dir: &str) -> Graph {
+        build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir))
+    }
+
+    fn entries(g: &Graph) -> Vec<(String, &'static str, String)> {
+        let mut v: Vec<_> = g
+            .symbols
+            .iter()
+            .filter_map(|s| s.entry.as_ref().map(|e| (s.name.clone(), e.kind.label(), e.route.clone())))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn app_router_files_are_entries_with_their_routes() {
+        let g = next_fixture("nextjs");
+        let t = |a: &str, b: &'static str, c: &str| (a.to_string(), b, c.to_string());
+        let mut want = vec![
+            t("RootLayout", "layout", "/"),
+            t("Home", "page", "/"),
+            t("Loading", "loading", "/"),
+            t("BlogLayout", "layout", "/blog"),
+            t("Post", "page", "/blog/[slug]"),
+            t("Cart", "page", "/cart"), // `(shop)` is a route group: not in the URL
+            t("Dashboard", "page", "/dashboard"),
+            t("Contact", "page", "/contact"),
+            t("GET", "route handler", "/api/hello"), // `helper` in the same file is not a handler
+        ];
+        want.sort();
+        assert_eq!(entries(&g), want);
+        assert!(sym(&g, "Home").is_entry() && !sym(&g, "Nav").is_entry());
+    }
+
+    #[test]
+    fn layouts_wrap_what_is_below_them() {
+        let g = next_fixture("nextjs");
+        let from = |name: &str| -> Vec<String> {
+            let i = g.symbols.iter().position(|s| s.name == name).unwrap();
+            let mut v: Vec<String> = g.out_edges(i).filter(|e| e.kind == EdgeKind::Renders).map(|e| g.symbols[e.to].name.clone()).collect();
+            v.sort();
+            v
+        };
+        // the root layout wraps the pages next to it and the layouts / pages below, but a page under
+        // /blog hangs off the blog layout instead
+        assert_eq!(from("RootLayout"), ["BlogLayout", "Cart", "Contact", "Dashboard", "Home", "Loading", "Nav"]);
+        assert_eq!(from("BlogLayout"), ["Post"]);
+        // nothing renders a layout twice
+        let n = g.edges.iter().filter(|e| e.kind == EdgeKind::Renders && g.symbols[e.to].name == "Post").count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn server_and_client_components_are_told_apart() {
+        let g = next_fixture("nextjs");
+        let env = |n: &str| sym(&g, n).env;
+        assert_eq!(env("Counter"), Some(Env::Client { implicit: false }));
+        // no directive, but the client Counter renders it: it ships to the browser
+        assert_eq!(env("Label"), Some(Env::Client { implicit: true }));
+        for n in ["Home", "Feed", "Nav", "RootLayout", "Dashboard"] {
+            assert_eq!(env(n), Some(Env::Server), "{n}");
+        }
+        // a "use server" file and a function with its own directive
+        assert_eq!(env("save"), Some(Env::Action));
+        assert_eq!(env("submit"), Some(Env::Action));
+        assert_eq!(env("Contact"), Some(Env::Server));
+    }
+
+    #[test]
+    fn interactive_server_components_are_flagged() {
+        let g = next_fixture("nextjs");
+        let flagged: Vec<&str> = g.symbols.iter().filter(|s| !s.next_hints.is_empty()).map(|s| s.name.as_str()).collect();
+        assert_eq!(flagged, ["Dashboard"]);
+        let h = &sym(&g, "Dashboard").next_hints[0];
+        assert!(h.warn && h.text.contains("`useState`") && h.text.contains("Server Component") && h.text.contains("use client"), "{}", h.text);
+        // the same hook in a client component is fine
+        assert!(sym(&g, "Counter").next_hints.is_empty());
+    }
+
+    #[test]
+    fn pages_router_files_are_entries() {
+        let g = next_fixture("nextpages");
+        let t = |a: &str, b: &'static str, c: &str| (a.to_string(), b, c.to_string());
+        let mut want = vec![
+            t("MyApp", "_app", "(_app)"),
+            t("Index", "page", "/"),
+            t("About", "page", "/about"),
+            t("Post", "page", "/posts/[id]"),
+            t("handler", "api", "/api/users"),
+        ];
+        want.sort();
+        assert_eq!(entries(&g), want);
+        // no App Router: no server / client split
+        assert!(g.symbols.iter().all(|s| s.env.is_none() && s.next_hints.is_empty()));
+    }
+
+    #[test]
+    fn other_projects_are_not_next() {
+        for dir in ["memo", "routes", "flow"] {
+            let g = next_fixture(dir);
+            assert!(g.symbols.iter().all(|s| s.entry.is_none() && s.env.is_none()), "{dir}");
+        }
+    }
+
+    #[test]
+    fn route_paths() {
+        assert_eq!(next::app_route("app", "app/page.tsx"), "/");
+        assert_eq!(next::app_route("src/app", "src/app/(auth)/@modal/login/page.tsx"), "/login");
+        assert_eq!(next::app_route("app", "app/shop/[...all]/page.tsx"), "/shop/[...all]");
+        assert_eq!(next::pages_route("pages", "pages/index.tsx"), "/");
+        assert_eq!(next::pages_route("pages", "pages/blog/index.tsx"), "/blog");
+        assert_eq!(next::pages_route("src/pages", "src/pages/a/[b].tsx"), "/a/[b]");
+    }
+
+    #[test]
+    fn directives_only_count_at_the_top() {
+        let src = |s: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()).unwrap();
+            let t = parser.parse(s, None).unwrap();
+            collect_module(t.root_node(), s).directive
+        };
+        assert_eq!(src("'use client'\nimport a from 'a'"), Some(Directive::Client));
+        assert_eq!(src("// header\n\"use server\";\nexport const x = 1;"), Some(Directive::Server));
+        assert_eq!(src("import a from 'a';\n'use client';"), None);
+        assert_eq!(src("const x = 1;"), None);
+    }
+
+    #[test]
+    fn complex_react_is_not_next() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../complex-react");
+        if !root.exists() {
+            return;
+        }
+        let g = build(&root);
+        assert!(g.symbols.iter().all(|s| s.entry.is_none() && s.env.is_none() && s.next_hints.is_empty()));
+    }
+
+    #[test]
+    fn unreachable_code_is_neither_server_nor_client() {
+        let g = next_fixture("nextjs");
+        // nothing under app/ renders it, and it has no directive: it says nothing about where it runs
+        let orphan = sym(&g, "Orphan");
+        assert_eq!(orphan.env, None);
+        assert!(orphan.next_hints.is_empty());
+        // ...while an unreferenced file that does say "use client" is a client component
+        assert_eq!(sym(&g, "Island").env, Some(Env::Client { implicit: false }));
+        // a project with an app/ folder and a pages/ folder: pages/ files are not Server Components
+        let torture = tempdir_project(&[
+            ("app/layout.tsx", "export default function Root({ children }: any) { return <html>{children}</html>; }"),
+            ("pages/old.tsx", "import { useState } from \"react\";
+export default function Old() { const [a] = useState(0); return <b onClick={() => {}}>{a}</b>; }"),
+        ]);
+        let g2 = build(&torture);
+        assert_eq!(sym(&g2, "Root").env, Some(Env::Server));
+        assert_eq!(sym(&g2, "Old").env, None);
+        assert!(sym(&g2, "Old").next_hints.is_empty());
+        let _ = std::fs::remove_dir_all(&torture);
     }
 }

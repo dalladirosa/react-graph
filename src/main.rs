@@ -3,12 +3,23 @@
 
 mod alias;
 mod compare;
+mod drill;
+
+mod cover;
+
+mod data;
 mod export;
 mod flow;
 mod graph;
+mod path;
+
+mod lint;
+
+mod next;
 mod prefs;
 mod similar;
 mod source;
+mod views;
 
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, Hsla, IntoElement, KeyDownEvent,
@@ -87,6 +98,9 @@ fn icon_svg(glyph: &str) -> &'static str {
         "\u{E8C8}" => "icons/copy.svg",
         "\u{E945}" => "icons/zap.svg",
         "\u{E8EE}" => "icons/repeat.svg",
+        "\u{E783}" => "icons/flask-conical-off.svg",
+
+        "\u{E774}" => "icons/database.svg",
         "\u{ED1A}" => "icons/eye-off.svg",
         "\u{E706}" => "icons/sun.svg",
         "\u{E708}" => "icons/moon.svg",
@@ -121,8 +135,8 @@ macro_rules! bundled {
     };
 }
 const ICONS: &[(&str, &[u8])] = bundled!(
-    "chevron-down.svg", "chevron-right.svg", "copy.svg", "eye-off.svg", "file.svg", "filter-x.svg", "folder.svg",
-    "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
+    "chevron-down.svg", "chevron-right.svg", "copy.svg", "database.svg", "eye-off.svg", "file.svg", "filter-x.svg",
+    "flask-conical-off.svg", "folder.svg", "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
 );
 
 /// Serves the bundled icons to gpui's `svg()` element.
@@ -350,8 +364,20 @@ struct GraphView {
     seq_follow: bool,
     /// right-click menu on a card: (card, window position)
     menu: Option<(usize, (f32, f32))>,
+    /// "Find path" start, picked from a card's menu: "Find path to here" on another card completes the route
+    path_from: Option<usize>,
+    /// the shortest route being shown: its cards and links stay lit, everything else fades
+    path: Option<PathView>,
     /// theme and recent projects, saved between runs
     prefs: prefs::Prefs,
+    /// per project: open cards, filters, selection, saved between runs
+    views: views::Store,
+    /// the view as last restored or saved (what the saver compares against)
+    last_view: Option<views::View>,
+    /// symbol keys of the loaded graph, by index (see `views::keys`)
+    sym_keys: Vec<views::SymKey>,
+    /// saves the view a second after it changes; dropping it stops it
+    view_saver: Option<gpui::Task<()>>,
     /// open drop-down from the sidebar header
     popup: Option<Popup>,
     /// the popup a press outside just closed, and when: a press on its own toggle button
@@ -387,13 +413,18 @@ struct Filters {
     memo: bool,
     /// part of a render / call loop (A renders B renders A)
     cycle: bool,
+    /// top-level symbol that no test file imports
+    untested: bool,
+
+    /// calls out to an API, a data-fetching hook or a store itself
+    data: bool,
     /// Component, Hook, Function
     kinds: [bool; 3],
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.kinds.iter().any(|&k| k)
+        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.untested || self.data || self.kinds.iter().any(|&k| k)
     }
 }
 
@@ -403,6 +434,15 @@ fn kind_index(k: SymKind) -> usize {
         SymKind::Hook => 1,
         SymKind::Function => 2,
     }
+}
+
+/// A route between two symbols (see `path`).
+struct PathView {
+    route: path::Route,
+    /// the route's symbols, for quick lookups
+    set: HashSet<usize>,
+    /// the route's links
+    edges: HashSet<flow::EdgeKey>,
 }
 
 /// An animated trace through the graph (see `flow`).
@@ -746,7 +786,13 @@ impl GraphView {
             seq_scroll: (0.0, 0.0),
             seq_follow: true,
             menu: None,
+            path_from: None,
+            path: None,
             prefs: prefs::Prefs::load(),
+            views: views::Store::load(),
+            last_view: None,
+            sym_keys: Vec::new(),
+            view_saver: None,
             popup: None,
             popup_closed: None,
             watcher: None,
@@ -824,11 +870,42 @@ impl GraphView {
         .detach();
     }
 
+    /// Save the drawn graph as one HTML page you can open anywhere and share.
+    fn export_html(&mut self, cx: &mut Context<Self>) {
+        let page = export::html(&self.drawn(), &folder_name(&self.root_path));
+        let rx = cx.prompt_for_new_path(&self.root_path, Some("react-graph.html"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let msg = match std::fs::write(&path, page) {
+                    Ok(()) => format!("Saved {}", prefs::display(&path)),
+                    Err(e) => format!("Could not save {}: {e}", prefs::display(&path)),
+                };
+                this.update(cx, |this, cx| {
+                    this.status = msg;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// Open the symbol's file at its line in VS Code; without the `code` command, in whatever
     /// the system opens that kind of file with.
     fn open_in_editor(&mut self, i: usize, cx: &mut Context<Self>) {
         let Some(s) = self.graph.symbols.get(i) else { return };
         let (path, line) = (self.root_path.join(&s.file), s.line);
+        self.open_file_at(path, line, cx);
+    }
+
+    /// Open a test file in the editor.
+    fn open_test(&mut self, t: usize, cx: &mut Context<Self>) {
+        let Some(f) = self.graph.test_files.get(t) else { return };
+        let path = self.root_path.join(f);
+        self.open_file_at(path, 1, cx);
+    }
+
+    fn open_file_at(&mut self, path: PathBuf, line: usize, cx: &mut Context<Self>) {
         let (p, task) = (path.clone(), cx.background_spawn(async move { open_with_code(&path, line) }));
         cx.spawn(async move |this, cx| {
             if !task.await {
@@ -1802,9 +1879,13 @@ impl GraphView {
         let shown = root.to_string_lossy().to_string();
         self.root = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
         self.root_path = root.clone();
+        self.last_view = None;
+        self.view_saver = None;
         self.code = CodeView::default();
         self.cmp = None;
         self.flow = None;
+        self.path = None;
+        self.path_from = None;
         self.file_panel = false;
         self.selected = None;
         self.scope_seen = None;
@@ -1851,8 +1932,10 @@ impl GraphView {
                 }
                 this.graph = g;
                 this.loading = false;
+                this.restore_view();
                 this.relayout();
                 this.fit_pending = true;
+                this.start_view_saver(cx);
                 // files changed while this was loading
                 if std::mem::take(&mut this.reload_pending) {
                     this.reload_graph(cx);
@@ -1940,6 +2023,114 @@ impl GraphView {
         .detach();
     }
 
+    /// What would be saved for this project right now.
+    fn snapshot_view(&self) -> views::View {
+        let f = &self.filters;
+        let on = [
+            (f.dup, "dup"),
+            (f.exact, "exact"),
+            (f.warn, "warn"),
+            (f.unused, "unused"),
+            (f.memo, "memo"),
+            (f.cycle, "cycle"),
+            (f.untested, "untested"),
+            (f.data, "data"),
+        ];
+        let kinds = ["component", "hook", "function"];
+        let keys = |set: &mut dyn Iterator<Item = usize>| {
+            let mut v: Vec<usize> = set.filter(|&i| i < self.sym_keys.len()).collect();
+            v.sort_unstable();
+            v.into_iter().map(|i| self.sym_keys[i].clone()).collect::<Vec<_>>()
+        };
+        views::View {
+            filters: on.iter().filter(|(b, _)| *b).map(|(_, n)| n.to_string()).collect(),
+            kinds: kinds.iter().enumerate().filter(|(i, _)| f.kinds[*i]).map(|(_, n)| n.to_string()).collect(),
+            show_functions: self.show_functions,
+            dim_others: self.focus_selection,
+            focus_file: self.focus_file.clone(),
+            selected: self.selected.and_then(|i| self.sym_keys.get(i).cloned()),
+            expanded: keys(&mut self.expanded.iter().copied()),
+            pinned: keys(&mut self.pinned.iter().copied()),
+        }
+    }
+
+    /// Put back the view this project had when it was last open (nothing saved: leave the defaults).
+    /// Cards that no longer exist are dropped.
+    fn restore_view(&mut self) {
+        self.sym_keys = views::keys(&self.graph);
+        if let Some(v) = self.views.get(&self.root_path).cloned() {
+            let index = views::index(&self.graph);
+            let pick = |k: &views::SymKey| index.get(k).copied();
+            let mut f = Filters::default();
+            for name in &v.filters {
+                match name.as_str() {
+                    "dup" => f.dup = true,
+                    "exact" => f.exact = true,
+                    "warn" => f.warn = true,
+                    "unused" => f.unused = true,
+                    "memo" => f.memo = true,
+                    "cycle" => f.cycle = true,
+                    "untested" => f.untested = true,
+                    "data" => f.data = true,
+                    _ => {}
+                }
+            }
+            for k in &v.kinds {
+                match k.as_str() {
+                    "component" => f.kinds[0] = true,
+                    "hook" => f.kinds[1] = true,
+                    "function" => f.kinds[2] = true,
+                    _ => {}
+                }
+            }
+            self.filters = f;
+            self.show_functions = v.show_functions;
+            self.focus_selection = v.dim_others;
+            self.focus_file = v.focus_file.filter(|f| self.graph.file_list.contains(f));
+            self.expanded = v.expanded.iter().filter_map(pick).collect();
+            self.pinned = v.pinned.iter().filter_map(pick).collect();
+            self.selected = v.selected.as_ref().and_then(pick);
+            // the picked file open in the explorer
+            if let Some(f) = self.focus_file.clone() {
+                let mut acc = String::new();
+                for seg in f.split('/').take(f.split('/').count().saturating_sub(1)) {
+                    if !acc.is_empty() {
+                        acc.push('/');
+                    }
+                    acc.push_str(seg);
+                    self.open_dirs.insert(acc.clone());
+                }
+            }
+        }
+        self.last_view = Some(self.snapshot_view());
+    }
+
+    /// Write the view when it changed since the last write.
+    fn save_view(&mut self) {
+        if self.loading || self.root.is_empty() || self.graph.symbols.is_empty() {
+            return;
+        }
+        let v = self.snapshot_view();
+        if self.last_view.as_ref() == Some(&v) {
+            return;
+        }
+        self.views.put(&self.root_path, v.clone());
+        self.views.save();
+        self.last_view = Some(v);
+    }
+
+    /// Check once a second whether the view changed, and save it if so.
+    fn start_view_saver(&mut self, cx: &mut Context<Self>) {
+        self.view_saver = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                if this.update(cx, |this, _| this.save_view()).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
     /// Swap in a rebuilt graph, carrying symbol indexes over by (file, name, nth with that name).
     fn apply_reload(&mut self, g: Graph, took: std::time::Duration) {
         fn keys(g: &Graph) -> Vec<(String, String, usize)> {
@@ -1966,6 +2157,8 @@ impl GraphView {
         // anything holding indexes into the old graph
         self.cmp = None;
         self.flow = None;
+        self.path = None;
+        self.path_from = None;
         self.menu = None;
         self.hover_card = None;
 
@@ -1985,6 +2178,7 @@ impl GraphView {
             *self.file_syms.entry(s.file.clone()).or_default() += 1;
         }
         self.graph = g;
+        self.sym_keys = views::keys(&self.graph);
         self.set_scope(self.filter_scope);
         // the code panel shows the file as it is now
         if let Some(f) = self.code.file.clone() {
@@ -2079,7 +2273,9 @@ impl GraphView {
 
     /// Nothing references `i` except the symbol that defines it.
     fn is_unused(&self, i: usize) -> bool {
-        !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
+        // pages, layouts and route handlers are loaded by Next.js itself
+        !self.graph.symbols[i].is_entry()
+            && !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
     }
 
     /// Follow selection changes. The selection's own links are drawn (see `relayout`), so the
@@ -2169,6 +2365,9 @@ impl GraphView {
             && (!f.memo || s.is_memoized())
             && (!f.unused || self.is_unused(i))
             && (!f.cycle || s.cycle.is_some())
+            && (!f.untested || self.graph.untested(i))
+
+            && (!f.data || !s.data.is_empty())
     }
 
     /// What the canvas starts from while filtering: every match, and every card on a path to one
@@ -2417,6 +2616,65 @@ impl GraphView {
         }
     }
 
+    /// The strip over the canvas while a route is shown (or waiting for its end): what it is, and how to close it.
+    fn path_banner(&self, vw: f32, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let g = &self.graph;
+        let name = |i: usize| g.symbols[i].name.clone();
+        let (text, hint) = match (&self.path, self.path_from) {
+            (Some(p), _) => {
+                let steps = p.route.edges.len();
+                let route = p.route.nodes.iter().map(|&n| name(n)).collect::<Vec<_>>().join(" \u{2192} ");
+                let dir = if p.route.reversed { " (reverse direction)" } else { "" };
+                (format!("Path \u{b7} {steps} step{}{dir}: {route}", if steps == 1 { "" } else { "s" }), "Esc to clear")
+            }
+            (None, Some(f)) => (
+                format!("Path from {}: right-click the other card, then \"Find path to here\"", name(f)),
+                "Esc to cancel",
+            ),
+            (None, None) => return None,
+        };
+        let right = if self.showing_code() || self.cmp.is_some() { self.right_gap(vw) } else { MARGIN };
+        Some(
+            div()
+                .id("path-banner")
+                .occlude()
+                .absolute()
+                .top(px(TOP_BAR - 8.))
+                .left(px(LEFT_W + MARGIN))
+                .right(px(right))
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(
+                    card()
+                        .max_w_full()
+                        .px_3()
+                        .py(px(6.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .text_sm()
+                        .child(div().flex_shrink_0().text_color(rgb(ACCENT)).child("\u{2937}"))
+                        .child(div().min_w(px(0.)).overflow_hidden().whitespace_nowrap().text_ellipsis().child(text))
+                        .child(div().flex_shrink_0().text_xs().text_color(rgb(MUTED)).child(hint))
+                        .child(
+                            tool_icon("path-clear", "\u{E711}", 9., None)
+                                .w(px(20.))
+                                .h(px(20.))
+                                .tooltip(tip("Clear path", Some("Esc")))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.path = None;
+                                    this.path_from = None;
+                                    this.status.clear();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The right-click menu on a card: the detail panel's actions, without selecting first.
     fn card_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (i, (x, y)) = self.menu?;
@@ -2486,6 +2744,29 @@ impl GraphView {
                 this.reveal(i);
                 cx.notify();
             })));
+        // route between two cards: pick the start here, then "Find path to here" on the other card
+        if let Some(from) = self.path_from.filter(|&f| f != i) {
+            let from_name = self.graph.symbols[from].name.clone();
+            m = m.child(item("menu-path-to", format!("Find path to here from {from_name}")).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.menu = None;
+                    this.find_path(from, i);
+                    cx.notify();
+                },
+            )));
+        }
+        m = m.child(item("menu-path-from", "Find path from here\u{2026}".into()).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.menu = None;
+                this.path = None;
+                this.path_from = Some(i);
+                this.status = format!(
+                    "Path from {}: right-click another card and choose \"Find path to here\"",
+                    this.graph.symbols[i].name
+                );
+                cx.notify();
+            },
+        )));
         if kids > 0 {
             m = m.child(
                 item("menu-expand", if open { "Collapse".into() } else { format!("Expand ({kids})") }).on_click(
@@ -2564,6 +2845,7 @@ impl GraphView {
 
     fn collapse_all(&mut self) {
         self.flow = None;
+        self.path = None;
         self.expanded.clear();
         self.pinned.clear();
         self.relayout();
@@ -2572,6 +2854,13 @@ impl GraphView {
 
     /// Expand the shortest path from something already visible down to `t`, select and center it.
     fn reveal(&mut self, t: usize) {
+        self.ensure_visible(t);
+        self.selected = Some(t);
+        self.center_on(t);
+    }
+
+    /// Draw `t`: open the cards that lead to it, or pin it when no drawn card does.
+    fn ensure_visible(&mut self, t: usize) {
         if !self.view.set.contains(&t) {
             let mut next: HashMap<usize, usize> = HashMap::new(); // parent -> child toward t
             let mut queue = VecDeque::from([t]);
@@ -2609,8 +2898,54 @@ impl GraphView {
                 self.relayout();
             }
         }
-        self.selected = Some(t);
-        self.center_on(t);
+    }
+
+    /// Show the shortest route between `a` and `b`: draw every card on it, light it up and fade the rest.
+    fn find_path(&mut self, a: usize, b: usize) {
+        self.path_from = None;
+        let Some(route) = path::find(&self.graph, a, b) else {
+            self.path = None;
+            let g = &self.graph;
+            self.status = format!("No render or call path between {} and {}", g.symbols[a].name, g.symbols[b].name);
+            return;
+        };
+        self.flow = None;
+        for &n in &route.nodes {
+            self.ensure_visible(n);
+        }
+        let set = route.nodes.iter().copied().collect();
+        let edges = route.edges.iter().map(flow::key).collect();
+        let names: Vec<&str> = route.nodes.iter().map(|&n| self.graph.symbols[n].name.as_str()).collect();
+        let steps = route.edges.len();
+        self.status = format!("Path \u{b7} {} step{}: {}", steps, if steps == 1 { "" } else { "s" }, names.join(" \u{2192} "));
+        self.path = Some(PathView { route, set, edges });
+        self.fit_path();
+    }
+
+    /// Zoom and pan so the whole route is in view.
+    fn fit_path(&mut self) {
+        let Some(p) = &self.path else { return };
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for n in &p.route.nodes {
+            if let Some(&(x, y)) = self.view.pos.get(n) {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + NODE_W);
+                y1 = y1.max(y + NODE_H);
+            }
+        }
+        if x0 > x1 {
+            return;
+        }
+        let (vw, vh) = self.last_vp;
+        let left = LEFT_W + MARGIN;
+        let right = if self.showing_code() || self.cmp.is_some() { self.right_gap(vw) } else { MARGIN };
+        let aw = (vw - left - right).max(100.0);
+        let ah = (vh - TOP_BAR - 60.0).max(100.0);
+        let (w, h) = (x1 - x0, y1 - y0);
+        let z = ((aw - 80.0) / w).min((ah - 80.0) / h).clamp(0.2, 1.0);
+        self.zoom = z;
+        self.off = (left + (aw - w * z) / 2.0 - x0 * z, TOP_BAR + 30.0 + (ah - h * z) / 2.0 - y0 * z);
     }
 
     fn center_on(&mut self, i: usize) {
@@ -2924,6 +3259,40 @@ fn kind_name(k: SymKind) -> &'static str {
         SymKind::Component => "component",
         SymKind::Hook => "hook",
         SymKind::Function => "function",
+    }
+}
+
+/// text / background of the `lazy` badge (a code-split chunk)
+const LAZY_FG: u32 = 0x6d28d9;
+const LAZY_BG: u32 = 0xede9fe;
+
+/// text / background of the `data` badge and the Data filter
+const DATA_FG: u32 = 0x0369a1;
+const DATA_BG: u32 = 0xe0f2fe;
+
+fn data_color(k: data::DataKind) -> u32 {
+    match k {
+        data::DataKind::Http => 0x0369a1,
+        data::DataKind::Query => 0x7e22ce,
+        data::DataKind::Store => 0xb45309,
+    }
+}
+
+/// (text, background) for a Server / Client Component badge
+fn env_colors(e: next::Env) -> (u32, u32) {
+    match e {
+        next::Env::Server => (0x15803d, 0xdcfce7),
+        next::Env::Client { .. } => (0x1d4ed8, 0xdbeafe),
+        next::Env::Action => (0xb45309, 0xfef3c7),
+    }
+}
+
+fn env_explainer(e: next::Env) -> &'static str {
+    match e {
+        next::Env::Server => "Server Component: rendered on the server. No hooks, no event handlers; it can be async.",
+        next::Env::Client { implicit: false } => "Client Component: its file starts with \"use client\". It ships to the browser.",
+        next::Env::Client { implicit: true } => "Client Component by import: its file has no directive, but a client component renders or calls it, so it ships to the browser too.",
+        next::Env::Action => "Server Action: runs on the server when called from the client (\"use server\").",
     }
 }
 
@@ -3706,9 +4075,11 @@ impl Render for GraphView {
         let focus = selected
             .filter(|s| trace.is_none() && self.focus_selection && self.view.set.contains(s))
             .map(|s| self.lineage(s));
-        let related = |i: usize| match trace {
-            Some(t) => t.nodes.contains(&i),
-            None => focus.as_ref().is_none_or(|(up, down)| up.contains(&i) || down.contains(&i)),
+        let path = self.path.as_ref().filter(|_| trace.is_none());
+        let related = |i: usize| match (trace, path) {
+            (Some(t), _) => t.nodes.contains(&i),
+            (None, Some(p)) => p.set.contains(&i),
+            (None, None) => focus.as_ref().is_none_or(|(up, down)| up.contains(&i) || down.contains(&i)),
         };
 
         let to_screen = |x: f32, y: f32| (x * z + ox, y * z + oy);
@@ -3741,6 +4112,9 @@ impl Render for GraphView {
                 let k = flow::key(e);
                 let level = match trace {
                     Some(tr) => u8::from(tr.edges.contains(&k)),
+                    None if path.is_some() => {
+                        if path.is_some_and(|p| p.edges.contains(&k)) { 2 } else { 0 }
+                    }
                     None => {
                         let hot = selected == Some(e.from) || selected == Some(e.to);
                         let on_path = focus.as_ref().is_none_or(|(up, down)| {
@@ -4067,6 +4441,57 @@ impl Render for GraphView {
                                 .text_color(rgb(fg))
                                 .child(w.label())
                         }))
+                        .when(s.lazy, |d| {
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(LAZY_BG))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(LAZY_FG))
+                                    .child("lazy"),
+                            )
+                        })
+
+                        .when(!s.data.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(DATA_BG))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(DATA_FG))
+                                    .child("data"),
+                            )
+                        })
+
+                        .when_some(s.env, |d, e| {
+                            let (fg, bg) = env_colors(e);
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(bg))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(fg))
+                                    .child(e.label()),
+                            )
+                        })
+                        .when_some(s.entry.as_ref(), |d, e| {
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(0xf1f5f9))
+                                    .text_size(px(9.0 * z))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(0x475569))
+                                    .child(e.kind.label()),
+                            )
+                        })
                         .when(warns > 0 || dup.is_some(), |d| d.child(div().flex_1()))
                         .when_some(dup, |d, score| {
                             d.child(
@@ -4384,7 +4809,7 @@ impl Render for GraphView {
             side = side.child(tabs);
 
             type Toggle = fn(&mut Filters);
-            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 6] = [
+            let props: [(&'static str, &'static str, &'static str, &'static str, usize, bool, u32, Toggle); 8] = [
                 (
                     "f-dup",
                     "\u{E8C8}",
@@ -4445,8 +4870,29 @@ impl Render for GraphView {
                     0xbe185d,
                     |f| f.cycle = !f.cycle,
                 ),
+                (
+                    "f-untested",
+                    "\u{E783}",
+                    "No tests",
+                    "No test file (*.test.*, *.spec.*, __tests__/) imports it",
+                    count(&|i| g.untested(i)),
+                    f.untested,
+                    0x6d28d9,
+                    |f| f.untested = !f.untested,
+                ),
+
+                (
+                    "f-data",
+                    "\u{E774}",
+                    "Data",
+                    "Calls an API (fetch, axios), a data-fetching hook (useQuery, useSWR) or a store (redux, zustand, jotai) itself",
+                    count(&|i| !g.symbols[i].data.is_empty()),
+                    f.data,
+                    DATA_FG,
+                    |f| f.data = !f.data,
+                ),
             ];
-            let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().items_center().gap(px(2.));
+            let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().flex_wrap().items_center().gap(px(2.));
             for (id, glyph, name, detail, num, on, color, toggle) in props {
                 let none = num == 0 && !on;
                 bar = bar.child(
@@ -5051,6 +5497,7 @@ impl Render for GraphView {
                     this.show_functions = !this.show_functions;
                     // cards a playing trace runs through may disappear
                     this.flow = None;
+                    this.path = None;
                     this.relayout();
                     this.fit_pending = true;
                     cx.notify();
@@ -5059,6 +5506,10 @@ impl Render for GraphView {
             buttons = buttons
                 .child(ghost_button("export-svg", "Export SVG").on_click(cx.listener(|this, _, _, cx| {
                     this.export_svg(cx);
+                    cx.notify();
+                })))
+                .child(ghost_button("export-html", "Export HTML").on_click(cx.listener(|this, _, _, cx| {
+                    this.export_html(cx);
                     cx.notify();
                 })))
                 .child(ghost_button("copy-mermaid", "Copy Mermaid").on_click(cx.listener(|this, _, _, cx| {
@@ -5245,6 +5696,50 @@ impl Render for GraphView {
                     ),
             );
 
+            if s.lazy || !s.cover_hints.is_empty() {
+                p = p.child(section("Boundaries"));
+                if s.lazy {
+                    p = p.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(LAZY_BG))
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(LAZY_FG))
+                                    .child("lazy"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("Loaded on demand with lazy(() => import(...)): its own chunk, and it suspends while loading."),
+                            ),
+                    );
+                }
+                for (n, h) in s.cover_hints.iter().enumerate() {
+                    p = p.child(
+                        div()
+                            .id(("cover-hint", n))
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                            .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
             if !s.wraps.is_empty() {
                 p = p.child(section("Memoization"));
                 for w in &s.wraps {
@@ -5314,6 +5809,44 @@ impl Render for GraphView {
                 }
             }
 
+            if !s.lint_hints.is_empty() {
+                p = p.child(section("Rules of React"));
+                for (n, h) in s.lint_hints.iter().enumerate() {
+                    let line = h.line;
+                    p = p.child(
+                        div()
+                            .id(("lint-hint", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let sym = &this.graph.symbols[sel];
+                                let (file, start) = (sym.file.clone(), sym.line);
+                                this.source_tab = true;
+                                this.ensure_code(&file, start);
+                                this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                                    .child(div().text_sm().font_family(MONO_FONT).child(h.rule))
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!("line {line}"))),
+                            )
+                            .child(div().pl(px(15.)).min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
+
             if !s.prop_hints.is_empty() {
                 p = p.child(section("Props defeating memo"));
                 for (n, h) in s.prop_hints.iter().enumerate() {
@@ -5329,6 +5862,49 @@ impl Render for GraphView {
                             .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                                 if e.modifiers().control || e.modifiers().platform {
                                     this.reveal(child);
+                                } else {
+                                    let sym = &this.graph.symbols[sel];
+                                    let (file, start) = (sym.file.clone(), sym.line);
+                                    this.source_tab = true;
+                                    this.ensure_code(&file, start);
+                                    this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                }
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                                    .child(div().text_sm().font_family(MONO_FONT).child(h.prop.clone()))
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!("line {line}"))),
+                            )
+                            .child(div().pl(px(15.)).min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
+                    );
+                }
+            }
+
+            if !s.drill_hints.is_empty() {
+                p = p.child(section("Prop drilling"));
+                for (n, h) in s.drill_hints.iter().enumerate() {
+                    let (line, end) = (h.line, h.end);
+                    p = p.child(
+                        div()
+                            .id(("drill-hint", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .tooltip(tip("Show the line", Some(if MAC { "⌘-click: jump to where it is used" } else { "Ctrl+click: jump to where it is used" })))
+                            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                                if e.modifiers().control || e.modifiers().platform {
+                                    this.reveal(end);
                                 } else {
                                     let sym = &this.graph.symbols[sel];
                                     let (file, start) = (sym.file.clone(), sym.line);
@@ -5460,6 +6036,13 @@ impl Render for GraphView {
                         .find(|h| h.warn)
                         .map(|h| h.text.clone())
                         .or_else(|| t.prop_hints.first().map(|h| h.text.clone()))
+                        .or_else(|| t.drill_hints.first().map(|h| h.text.clone()))
+
+                        .or_else(|| t.cover_hints.first().map(|h| h.text.clone()))
+
+                        .or_else(|| t.lint_hints.first().map(|h| h.text.clone()))
+
+                        .or_else(|| t.next_hints.first().map(|h| h.text.clone()))
                         .unwrap_or_default();
                     p = p.child(
                         div()
@@ -5527,6 +6110,149 @@ impl Render for GraphView {
                             .gap_2()
                             .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
                             .child(div().text_sm().child(t.name.clone())),
+                    );
+                }
+            }
+
+            // tests: files that import it (or the top-level symbol it lives in)
+            if !self.graph.test_files.is_empty() {
+                let tests = self.graph.tests_of(sel).to_vec();
+                if tests.is_empty() && self.graph.untested(sel) {
+                    p = p.child(section("Tests")).child(
+                        div().px_2().text_xs().text_color(rgb(0x6d28d9)).child("No test file imports this"),
+                    );
+                }
+                if !tests.is_empty() {
+                    p = p.child(section("Tests"));
+                }
+                for (n, t) in tests.into_iter().take(30).enumerate() {
+                    let file = self.graph.test_files[t].clone();
+                    let name = short_file(&file).to_string();
+                    let dir = file[..file.len() - name.len()].trim_end_matches('/').to_string();
+                    p = p.child(
+                        div()
+                            .id(("test", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .tooltip(tip("Open the test in your editor", Some("VS Code, or the system default")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_test(t, cx);
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(rgb(0x6d28d9)).child("\u{2197}"))
+                            .child(div().text_sm().child(name))
+                            .child(div().min_w(px(0.)).overflow_hidden().text_xs().text_color(rgb(MUTED)).child(dir)),
+                    );
+                }
+            }
+
+            // what it reaches out to: its own calls, and those of the hooks and functions it calls
+            let data_uses = self.graph.data_of(sel);
+            if !data_uses.is_empty() {
+                p = p.child(section("Data"));
+                for (n, (u, via)) in data_uses.into_iter().take(30).enumerate() {
+                    let (line, via_name) = (u.line, via.map(|v| self.graph.symbols[v].name.clone()));
+                    let color = data_color(u.kind);
+                    p = p.child(
+                        div()
+                            .id(("data-use", n))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(ACCENT_50)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match via {
+                                    Some(v) => this.reveal(v),
+                                    None => {
+                                        let sym = &this.graph.symbols[sel];
+                                        let (file, start) = (sym.file.clone(), sym.line);
+                                        this.source_tab = true;
+                                        this.ensure_code(&file, start);
+                                        this.code.scroll.scroll_to_item_strict(line.saturating_sub(4), ScrollStrategy::Top);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(tint(color, 0.12))
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(color))
+                                    .child(u.kind.label()),
+                            )
+                            .child(div().min_w(px(0.)).overflow_hidden().text_sm().font_family(MONO_FONT).child(u.label.clone()))
+                            .child(div().flex_shrink_0().text_xs().text_color(rgb(MUTED)).child(match via_name {
+                                Some(v) => format!("via {v}"),
+                                None => format!("line {line}"),
+                            })),
+                    );
+                }
+            }
+
+            if s.entry.is_some() || s.env.is_some() || !s.next_hints.is_empty() {
+                p = p.child(section("Next.js"));
+                if let Some(e) = &s.entry {
+                    p = p.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(0xf1f5f9))
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(0x475569))
+                                    .child(e.kind.label()),
+                            )
+                            .child(div().text_sm().font_family(MONO_FONT).child(e.route.clone()))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("loaded by Next.js")),
+                    );
+                }
+                if let Some(env) = s.env {
+                    let (fg, bg) = env_colors(env);
+                    p = p.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                div().px(px(5.)).rounded(px(4.)).bg(rgb(bg)).text_xs().font_family(MONO_FONT).text_color(rgb(fg)).child(env.label()),
+                            )
+                            .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(MUTED)).child(env_explainer(env))),
+                    );
+                }
+                for h in &s.next_hints {
+                    p = p.child(
+                        div()
+                            .mt_1()
+                            .px_2()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_start()
+                            .child(div().text_xs().text_color(rgb(0xb45309)).child("⚠"))
+                            .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(0x92400e)).child(h.text.clone())),
                     );
                 }
             }
@@ -6160,6 +6886,10 @@ impl Render for GraphView {
                     "escape" => {
                         if this.menu.is_some() {
                             this.menu = None;
+                        } else if (this.path.is_some() || this.path_from.is_some()) && this.query.is_empty() {
+                            this.path = None;
+                            this.path_from = None;
+                            this.status.clear();
                         } else if this.flow.is_some() && this.query.is_empty() {
                             this.flow = None;
                         } else if this.cmp.is_some() {
@@ -6229,6 +6959,9 @@ impl Render for GraphView {
         }
         if !seq_on && !self.root.is_empty() {
             root = root.child(controls);
+        }
+        if let Some(b) = self.path_banner(vw, cx) {
+            root = root.child(b);
         }
         if let Some(m) = self.card_menu(cx) {
             root = root.child(m);
