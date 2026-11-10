@@ -4314,7 +4314,7 @@ dependencies = [
 
 [[package]]
 name = "react-graph"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "embed-resource",
  "gpui",
