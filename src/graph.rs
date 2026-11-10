@@ -2991,7 +2991,7 @@ mod tests {
 
     #[test]
     fn a_project_folder_named_like_a_test_is_still_a_project() {
-        let base = std::env::temp_dir().join(format!("react-graph-odd-root-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("rendermap-odd-root-{}", std::process::id()));
         for dir in ["my.test.app", "__tests__/proj", "a.spec.b"] {
             let root = base.join(dir);
             std::fs::create_dir_all(root.join("src")).unwrap();
@@ -3090,7 +3090,7 @@ test(\"a\", () => { void App; });
     fn tempdir_project(files: &[(&str, &str)]) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!("react-graph-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let root = std::env::temp_dir().join(format!("rendermap-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         for (f, text) in files {
             let p = root.join(f);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -3251,7 +3251,7 @@ export function Oops() { return <i />; }
         assert_eq!(own_data(&g, "lookup"), ["http:GET (dynamic url)"]);
         assert!(own_data(&g, "cached").is_empty(), "Map.get is not a request");
         // `fetch()`, `axios.get()` and `useQuery()` with no arguments are not calls to list
-        let nothing = std::env::temp_dir().join(format!("react-graph-data-{}", std::process::id()));
+        let nothing = std::env::temp_dir().join(format!("rendermap-data-{}", std::process::id()));
         std::fs::create_dir_all(&nothing).unwrap();
         std::fs::write(nothing.join("A.tsx"), "export function A() { fetch(); axios.get(); useQuery(); useSWR(); return <p />; }").unwrap();
         let g2 = build(&nothing);

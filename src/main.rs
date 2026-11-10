@@ -77,10 +77,10 @@ const UI_FONT: &str = if cfg!(windows) { "Segoe UI" } else { ".SystemUIFont" };
 const MONO_FONT: &str = if cfg!(windows) { "Consolas" } else if MAC { "Menlo" } else { "DejaVu Sans Mono" };
 
 /// Segoe Fluent Icons only ships with Windows; elsewhere the same icons come from bundled SVGs.
-/// `REACT_GRAPH_SVG_ICONS=1` uses the SVGs on Windows too (to check them without a Mac).
+/// `RENDERMAP_SVG_ICONS=1` uses the SVGs on Windows too (to check them without a Mac).
 fn svg_icons() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !cfg!(windows) || std::env::var_os("REACT_GRAPH_SVG_ICONS").is_some())
+    *ON.get_or_init(|| !cfg!(windows) || std::env::var_os("RENDERMAP_SVG_ICONS").is_some())
 }
 
 /// Bundled SVG for a Segoe Fluent Icons glyph.
@@ -164,7 +164,7 @@ impl gpui::AssetSource for Assets {
     }
 }
 
-gpui::actions!(react_graph, [Quit]);
+gpui::actions!(rendermap, [Quit]);
 
 static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -871,7 +871,7 @@ impl GraphView {
     /// Save the drawn graph as an SVG picture, where the user chooses.
     fn export_svg(&mut self, cx: &mut Context<Self>) {
         let svg = export::svg(&self.drawn());
-        let rx = cx.prompt_for_new_path(&self.root_path, Some("react-graph.svg"));
+        let rx = cx.prompt_for_new_path(&self.root_path, Some("rendermap.svg"));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 let msg = match std::fs::write(&path, svg) {
@@ -891,7 +891,7 @@ impl GraphView {
     /// Save the drawn graph as one HTML page you can open anywhere and share.
     fn export_html(&mut self, cx: &mut Context<Self>) {
         let page = export::html(&self.drawn(), &folder_name(&self.root_path));
-        let rx = cx.prompt_for_new_path(&self.root_path, Some("react-graph.html"));
+        let rx = cx.prompt_for_new_path(&self.root_path, Some("rendermap.html"));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 let msg = match std::fs::write(&path, page) {
@@ -3890,45 +3890,52 @@ fn short_file(f: &str) -> &str {
     f.rsplit('/').next().unwrap_or(f)
 }
 
-/// The app logo (same drawing as `assets/app.ico`), with its edges in the current accent.
+/// The app logo: the small-size layout of `assets/make_icon.py` (a folded map on the
+/// pink-to-violet tile, with a route joining a component, a hook and a function).
 fn logo(sz: f32) -> impl IntoElement {
-    let a = ACCENT;
     canvas(
         |_, _, _| (),
         move |b, _, window, _| {
             let k = sz / 1024.0;
             let at = |x: f32, y: f32| b.origin + point(px(x * k), px(y * k));
             let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Bounds::new(at(x0, y0), size(px((x1 - x0) * k), px((y1 - y0) * k)));
-            window.paint_quad(fill(rect(0.0, 0.0, 1024.0, 1024.0), gpui::rgb(0x24223a)).corner_radii(px(200.0 * k)));
-            // the small-size layout of the icon: big cards, thick edges, no text lines
-            let (cw, ch, gap) = (330.0, 230.0, 250.0);
-            let root = (70.0, 512.0 - ch / 2.0, 70.0 + cw, 512.0 + ch / 2.0, SymKind::Component);
-            let kids = [
-                (954.0 - cw, 512.0 - gap - ch / 2.0, 954.0, 512.0 - gap + ch / 2.0, SymKind::Hook),
-                (954.0 - cw, 512.0 + gap - ch / 2.0, 954.0, 512.0 + gap + ch / 2.0, SymKind::Function),
+            let tile = gpui::linear_gradient(135.0, gpui::linear_color_stop(gpui::rgb(0xff1f75), 0.0), gpui::linear_color_stop(gpui::rgb(0x7c5cff), 1.0));
+            window.paint_quad(fill(rect(0.0, 0.0, 1024.0, 1024.0), tile).corner_radii(px(180.0 * k)));
+
+            // three map panels whose top and bottom edges zig-zag at the folds
+            let (x0, x3, hgt, zig) = (130.0_f32, 894.0_f32, 600.0_f32, 46.0_f32);
+            let xs: [f32; 4] = std::array::from_fn(|i| x0 + (x3 - x0) * i as f32 / 3.0);
+            let top = 512.0 - hgt / 2.0;
+            let tops = [top + zig, top, top + zig, top];
+            for i in 0..3 {
+                let mut pb = PathBuilder::fill();
+                pb.move_to(at(xs[i], tops[i]));
+                pb.line_to(at(xs[i + 1], tops[i + 1]));
+                pb.line_to(at(xs[i + 1], tops[i + 1] + hgt));
+                pb.line_to(at(xs[i], tops[i] + hgt));
+                pb.close();
+                if let Ok(path) = pb.build() {
+                    window.paint_path(path, gpui::rgb(if i == 1 { 0xe9e5f8 } else { 0xffffff }));
+                }
+            }
+
+            // the route, then its stops
+            let nodes: [(Pt, SymKind); 3] = [
+                ((xs[0] + 105.0, 660.0), SymKind::Component),
+                ((512.0, 370.0), SymKind::Hook),
+                ((xs[3] - 105.0, 620.0), SymKind::Function),
             ];
-            let src = (root.2, 512.0);
-            let mut edges = StrokeBatch::new(b, 0.35);
-            for c in &kids {
-                let dst = (c.0, (c.1 + c.3) / 2.0);
-                let m = (dst.0 - src.0) * 0.6;
-                let s = |p: Pt| (p.0 * k, p.1 * k);
-                edges.curve([s(src), s((src.0 + m, src.1)), s((dst.0 - m, dst.1)), s(dst)], (64.0 * k).max(1.2), None, hsla(a, 1.0));
+            let s = |p: Pt| (p.0 * k, p.1 * k);
+            let mut route = StrokeBatch::new(b, 0.35);
+            for w in nodes.windows(2) {
+                let (a, z) = (w[0].0, w[1].0);
+                let m = (z.0 - a.0) * 0.6;
+                route.curve([s(a), s((a.0 + m, a.1)), s((z.0 - m, z.1)), s(z)], (76.0 * k).max(1.2), None, hsla(0xff1f75, 1.0));
             }
-            edges.paint(window);
-            let r = px(30.0 * k);
-            for (x0, y0, x1, y1, kind) in std::iter::once(root).chain(kids) {
-                window.paint_quad(fill(rect(x0, y0, x1, y1), gpui::rgb(0xffffff)).corner_radii(r));
-                window.paint_quad(fill(rect(x0, y0, x1, y0 + 56.0), gpui::rgb(kind_rgb(kind))).corner_radii(gpui::Corners {
-                    top_left: r,
-                    top_right: r,
-                    bottom_right: px(0.0),
-                    bottom_left: px(0.0),
-                }));
-            }
-            let hr = 40.0 * k;
-            for (x, y) in std::iter::once(src).chain(kids.iter().map(|c| (c.0, (c.1 + c.3) / 2.0))) {
-                window.paint_quad(fill(rect(x - 40.0, y - 40.0, x + 40.0, y + 40.0), hsla(a, 1.0)).corner_radii(px(hr)));
+            route.paint(window);
+            let r = 78.0;
+            for ((x, y), kind) in nodes {
+                window.paint_quad(fill(rect(x - r, y - r, x + r, y + r), gpui::rgb(kind_rgb(kind))).corner_radii(px(r * k)));
             }
         },
     )
@@ -4282,7 +4289,7 @@ impl GraphView {
                 .items_center()
                 .gap_2()
                 .child(logo(64.0))
-                .child(div().mt_2().text_lg().font_weight(gpui::FontWeight::BOLD).child("Welcome to React Graph"))
+                .child(div().mt_2().text_lg().font_weight(gpui::FontWeight::BOLD).child("Welcome to Rendermap"))
                 .child(
                     div()
                         .text_sm()
@@ -4311,7 +4318,7 @@ impl GraphView {
                                 .flex_1()
                                 .flex()
                                 .flex_col()
-                                .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("React Graph"))
+                                .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("Rendermap"))
                                 .child(hint(concat!("Version ", env!("CARGO_PKG_VERSION")))),
                         )
                         .child(open()),
@@ -7486,7 +7493,7 @@ fn main() {
         // macOS: an app menu with Quit (⌘Q), and quit when the window closes
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
-        cx.set_menus(vec![gpui::Menu { name: "React Graph".into(), items: vec![gpui::MenuItem::action("Quit React Graph", Quit)] }]);
+        cx.set_menus(vec![gpui::Menu { name: "Rendermap".into(), items: vec![gpui::MenuItem::action("Quit Rendermap", Quit)] }]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -7502,12 +7509,12 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 // no native caption: the title bar is drawn by the app (logo, project widget, window buttons)
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("React Graph".into()),
+                    title: Some("Rendermap".into()),
                     appears_transparent: true,
                     // centre macOS's traffic lights in the 40px title bar
                     traffic_light_position: Some(point(px(14.), px(14.))),
                 }),
-                app_id: Some("react-graph".into()),
+                app_id: Some("rendermap".into()),
                 ..Default::default()
             },
             move |window, cx| {
@@ -7547,7 +7554,7 @@ mod tests {
 
     #[test]
     fn watcher_reports_source_changes_only() {
-        let dir = std::env::temp_dir().join(format!("react-graph-watch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rendermap-watch-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let (_w, rx) = watch_folder(&dir).expect("watch the folder");
 

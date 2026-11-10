@@ -47,9 +47,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/react-graph.exe dist/react-graph.exe
-          Compress-Archive -Path dist/react-graph.exe -DestinationPath "dist/react-graph-$env:VERSION-windows-x64-portable.zip"
-          & $env:ISCC /Q "/DAppVersion=$env:VERSION" installer/react-graph.iss
+          Copy-Item target/release/rendermap.exe dist/rendermap.exe
+          Compress-Archive -Path dist/rendermap.exe -DestinationPath "dist/rendermap-$env:VERSION-windows-x64-portable.zip"
+          & $env:ISCC /Q "/DAppVersion=$env:VERSION" installer/rendermap.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
           Get-ChildItem dist
 
@@ -94,7 +94,7 @@ jobs:
       - name: Smoke test
         continue-on-error: true
         run: |
-          "dist/React Graph.app/Contents/MacOS/react-graph" "$PWD/tests/fixtures/memo" &
+          "dist/Rendermap.app/Contents/MacOS/rendermap" "$PWD/tests/fixtures/memo" &
           pid=$!
           sleep 15
           screencapture -x dist/macos-smoke.png || true

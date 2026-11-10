@@ -1,20 +1,21 @@
-"""Draws the React Graph app icon: a root card branching into two child cards (the way the
-app lays out a component tree), on a dark tile. Writes icon.png (512px) and app.ico
-(16-256px) next to this script.
+"""Draws the Rendermap app icon: a folded paper map on the pink-to-violet brand tile, with a
+pink route joining a component, a hook and a function across the folds. Writes icon.png
+(512px) and app.ico (16-256px) next to this script.
 
     python assets/make_icon.py
 """
 
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 HERE = Path(__file__).resolve().parent
 S = 1024  # design size; every size is drawn at 4x and scaled down
-PINK = (255, 0, 113)
+PINK = (255, 31, 117)
+VIOLET = (124, 92, 255)
 WHITE = (255, 255, 255)
-LINE = (213, 217, 225)
-KINDS = [(59, 130, 246), (168, 85, 247), (16, 185, 129)]  # component, hook, function
+FOLD = (233, 229, 248)  # the panel that faces away from the light
+KINDS = [(59, 130, 246), (139, 92, 246), (16, 185, 129)]  # component, hook, function
 
 
 def bezier(p0, p1, p2, p3, n=96):
@@ -32,82 +33,76 @@ def bezier(p0, p1, p2, p3, n=96):
 
 
 def draw(px: int) -> Image.Image:
-    """The icon at `px` square. Small sizes drop the text lines and thicken the strokes."""
+    """The icon at `px` square. Small sizes fill the tile, enlarge the map and thicken the route."""
     small = px <= 32
     k = px * 4 / S  # supersampled scale
     w = round(S * k)
-    img = Image.new("RGBA", (w, w), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
     f = lambda v: v * k  # noqa: E731
 
-    # tile: vertical gradient, rounded
+    # tile: diagonal pink -> violet gradient, rounded
     inset = 0 if small else 36
-    radius = 200 if not small else 180
+    radius = 180 if small else 200
     grad = Image.new("RGBA", (w, w))
-    gd = ImageDraw.Draw(grad)
-    top, bot = (44, 41, 70), (21, 20, 33)
+    gp = grad.load()
     for y in range(w):
-        t = y / (w - 1)
-        gd.line([(0, y), (w, y)], fill=tuple(round(a + (b - a) * t) for a, b in zip(top, bot)) + (255,))
+        for x in range(0, w):
+            t = min(1.0, max(0.0, (x + y) / (2 * (w - 1))))
+            gp[x, y] = tuple(round(a + (b - a) * t) for a, b in zip(PINK, VIOLET)) + (255,)
+    img = Image.new("RGBA", (w, w), (0, 0, 0, 0))
     mask = Image.new("L", (w, w), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
         [f(inset), f(inset), f(S - inset) - 1, f(S - inset) - 1], radius=f(radius), fill=255
     )
     img.paste(grad, (0, 0), mask)
 
-    # cards: (x0, y0, x1, y1, kind)
-    cw, ch = (330, 230) if small else (280, 180)
-    root = (120, 512 - ch / 2, 150 + cw, 512 + ch / 2, 0)
-    gap = 250 if small else 205
-    kids = [
-        (904 - cw, 512 - gap - ch / 2, 904, 512 - gap + ch / 2, 1),
-        (904 - cw, 512 + gap - ch / 2, 904, 512 + gap + ch / 2, 2),
-    ]
-    if small:
-        root = (70, 512 - ch / 2, 70 + cw, 512 + ch / 2, 0)
-        kids = [(954 - cw, y0, 954, y1, kk) for _, y0, _, y1, kk in kids]
+    # folded map: three panels whose top and bottom edges zig-zag at the folds
+    x0, x3 = (130, 894) if small else (190, 834)
+    xs = [x0 + (x3 - x0) * i / 3 for i in range(4)]
+    hgt = 600 if small else 500
+    zig = 46 if small else 52
+    top = 512 - hgt / 2
+    tops = [top + zig, top, top + zig, top]
+    panels = [[(xs[i], tops[i]), (xs[i + 1], tops[i + 1]), (xs[i + 1], tops[i + 1] + hgt), (xs[i], tops[i] + hgt)] for i in range(3)]
 
-    # edges first, so the cards sit on top of them
-    stroke = 64 if small else 34
-    a = (root[2], 512)
-    for c in kids:
-        b = (c[0], (c[1] + c[3]) / 2)
-        m = (b[0] - a[0]) / 2
-        # round brush stamped along the curve: smooth at any width (PIL's wide polylines jag)
-        rr = f(stroke) / 2
-        for x, y in bezier(a, (a[0] + m * 1.2, a[1]), (b[0] - m * 1.2, b[1]), b, n=600):
+    # soft shadow under the map
+    sh = Image.new("L", (w, w), 0)
+    sd = ImageDraw.Draw(sh)
+    for p in panels:
+        sd.polygon([(f(x), f(y + 26)) for x, y in p], fill=120)
+    sh = sh.filter(ImageFilter.GaussianBlur(f(28)))
+    img.paste(Image.new("RGBA", (w, w), (40, 10, 70, 255)), (0, 0), ImageChops_mul(sh, mask))
+
+    d = ImageDraw.Draw(img)
+    for i, p in enumerate(panels):
+        d.polygon([(f(x), f(y)) for x, y in p], fill=FOLD if i == 1 else WHITE)
+
+    # route across the folds
+    if small:
+        nodes = [(xs[0] + 105, 660), (512, 370), (xs[3] - 105, 620)]
+    else:
+        nodes = [(xs[0] + 92, 650), (512, 405), (xs[3] - 92, 600)]
+    stroke = 76 if small else 34
+    rr = f(stroke) / 2
+    for a, b in zip(nodes, nodes[1:]):
+        m = (b[0] - a[0]) * 0.6
+        for x, y in bezier(a, (a[0] + m, a[1]), (b[0] - m, b[1]), b, n=500):
             d.ellipse([f(x) - rr, f(y) - rr, f(x) + rr, f(y) + rr], fill=PINK)
 
-    r = 30 if small else 36
-    strip = 56 if small else 40
-    for x0, y0, x1, y1, kind in [root, *kids]:
-        box = [f(x0), f(y0), f(x1), f(y1)]
-        d.rounded_rectangle(box, radius=f(r), fill=WHITE)
-        # coloured strip along the top, clipped to the card's rounded corners
-        sm = Image.new("L", (w, w), 0)
-        ImageDraw.Draw(sm).rounded_rectangle(box, radius=f(r), fill=255)
-        band = Image.new("L", (w, w), 0)
-        ImageDraw.Draw(band).rectangle([f(x0), f(y0), f(x1), f(y0 + strip)], fill=255)
-        img.paste(Image.new("RGBA", (w, w), KINDS[kind] + (255,)), (0, 0), ImageChops.multiply(sm, band))
-        if not small:
-            # two "text" lines
-            lx = x0 + 34
-            for i, frac in enumerate((0.72, 0.46)):
-                ly = y0 + strip + 34 + i * 46
-                d.rounded_rectangle(
-                    [f(lx), f(ly), f(lx + (x1 - x0 - 68) * frac), f(ly + 22)], radius=f(11), fill=LINE
-                )
-
-    # connection handles
-    hr = 40 if small else 30
-    handles = [a] + [(c[0], (c[1] + c[3]) / 2) for c in kids]
-    for x, y in handles:
-        d.ellipse([f(x - hr), f(y - hr), f(x + hr), f(y + hr)], fill=PINK)
-        if not small:
-            ir = hr * 0.42
-            d.ellipse([f(x - ir), f(y - ir), f(x + ir), f(y + ir)], fill=WHITE)
+    # nodes: kind-coloured dots, the middle one (the hook) ringed in white
+    nr = 78 if small else 46
+    for i, ((x, y), kind) in enumerate(zip(nodes, KINDS)):
+        if i == 1 and not small:
+            ring = 14
+            d.ellipse([f(x - nr - ring), f(y - nr - ring), f(x + nr + ring), f(y + nr + ring)], fill=WHITE)
+        d.ellipse([f(x - nr), f(y - nr), f(x + nr), f(y + nr)], fill=kind)
 
     return img.resize((px, px), Image.LANCZOS)
+
+
+def ImageChops_mul(a, b):  # noqa: N802
+    from PIL import ImageChops
+
+    return ImageChops.multiply(a, b)
 
 
 def main():

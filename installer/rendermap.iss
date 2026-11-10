@@ -1,19 +1,20 @@
-; Inno Setup script for the React Graph Windows installer.
+; Inno Setup script for the Rendermap Windows installer.
 ; Built by .github/workflows/release.yml; to build by hand (after `cargo build --release`):
-;   iscc /DAppVersion=0.1.1 installer\react-graph.iss
-; The installer is written to dist\react-graph-<version>-setup.exe.
+;   iscc /DAppVersion=0.1.1 installer\rendermap.iss
+; The installer is written to dist\rendermap-<version>-setup.exe.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
 
-#define AppName "React Graph"
-#define AppExe "react-graph.exe"
+#define AppName "Rendermap"
+#define AppExe "rendermap.exe"
 #define AppPublisher "dalladirosa"
 #define AppURL "https://github.com/dalladirosa/react-graph"
 
 [Setup]
 ; keep this AppId forever: it is how upgrades and the uninstaller find an existing install
+; (it dates from when the app was called React Graph, so those installs upgrade in place)
 AppId={{3C401576-345D-4BF9-8BCB-2353F6E4FE11}
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -34,7 +35,7 @@ SetupIconFile=..\assets\app.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 OutputDir=..\dist
-OutputBaseFilename=react-graph-{#AppVersion}-setup
+OutputBaseFilename=rendermap-{#AppVersion}-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -45,6 +46,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[InstallDelete]
+; left behind by React Graph installs that this one upgrades (same AppId, same folder)
+Type: files; Name: "{app}\react-graph.exe"
+Type: files; Name: "{autoprograms}\React Graph.lnk"
+Type: files; Name: "{autodesktop}\React Graph.lnk"
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
