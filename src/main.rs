@@ -22,7 +22,7 @@ mod source;
 mod views;
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, Hsla, IntoElement, KeyDownEvent,
+    App, Application, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Hsla, IntoElement, KeyDownEvent,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions, Pixels, Point,
     Render, ScrollStrategy, ScrollWheelEvent, Stateful, StyledText, UniformListScrollHandle, Window, WindowBounds,
     WindowOptions, anchored, canvas, deferred, div, fill, point, prelude::*, px, size, uniform_list,
@@ -129,6 +129,16 @@ fn icon(glyph: &'static str, size: f32, color: Option<u32>) -> gpui::AnyElement 
     }
 }
 
+/// A bundled SVG icon on every platform (for icons with no Segoe Fluent glyph worth hard-coding).
+fn svg_icon(path: &'static str, size: f32, color: Option<u32>) -> gpui::AnyElement {
+    gpui::svg()
+        .path(path)
+        .flex_shrink_0()
+        .size(px((size * 1.15).round()))
+        .text_color(rgb(color.unwrap_or(MUTED)))
+        .into_any_element()
+}
+
 macro_rules! bundled {
     ($($name:literal),* $(,)?) => {
         &[$((concat!("icons/", $name), include_bytes!(concat!("../assets/icons/", $name)) as &[u8])),*]
@@ -137,6 +147,8 @@ macro_rules! bundled {
 const ICONS: &[(&str, &[u8])] = bundled!(
     "chevron-down.svg", "chevron-right.svg", "copy.svg", "database.svg", "eye-off.svg", "file.svg", "filter-x.svg",
     "flask-conical-off.svg", "folder.svg", "layers.svg", "minimize-2.svg", "moon.svg", "repeat.svg", "search.svg", "sun.svg", "triangle-alert.svg", "x.svg", "zap.svg",
+    "chevrons-up-down.svg", "chevrons-down-up.svg", "download.svg", "code.svg", "contrast.svg", "braces.svg", "image.svg",
+    "play.svg", "square.svg", "network.svg", "focus.svg", "corner-left-up.svg", "flag.svg",
 );
 
 /// Serves the bundled icons to gpui's `svg()` element.
@@ -352,6 +364,9 @@ struct GraphView {
     cmp: Option<CmpView>,
     /// "Play flow" trace from the selection; selecting anything else closes it
     flow: Option<FlowView>,
+    /// open / closed rows of the detail panel's Flow tree, by (selected symbol, row); rows not
+    /// listed use the default (open near the top)
+    flow_fold: HashMap<(usize, usize), bool>,
     /// player settings, kept for the next trace
     flow_from: Start,
     flow_style: Style,
@@ -395,6 +410,8 @@ struct GraphView {
 enum Popup {
     /// the project widget in the title bar: open a folder, recent projects
     Project,
+    /// the canvas toolbar's Export menu
+    Export,
 }
 
 /// Which symbols the sidebar filters keep. Property filters combine with AND; kind filters
@@ -779,6 +796,7 @@ impl GraphView {
             code: CodeView::default(),
             cmp: None,
             flow: None,
+            flow_fold: HashMap::new(),
             flow_from: Start::Here,
             flow_style: Style::CallReturn,
             flow_speed: 1.0,
@@ -2566,10 +2584,12 @@ impl GraphView {
         // What it uses / defines is left to expand and collapse: forcing those in too would make
         // collapsing the selected card do nothing.
         let sel = self.selected.filter(|s| set.contains(s));
+        let mut users: HashSet<usize> = HashSet::new();
         if let Some(s) = sel {
             for o in self.graph.in_edges(s).map(|e| e.from) {
                 if o != s && set.insert(o) {
                     order.push(o);
+                    users.insert(o);
                 }
             }
         }
@@ -2581,7 +2601,18 @@ impl GraphView {
             .filter(|e| e.from != e.to && set.contains(&e.from) && set.contains(&e.to))
             .copied()
             .collect();
-        let (pos, size) = layout(&order, &edges, &self.graph);
+        // Cards drawn only because they use the selection must not move what's already there:
+        // their links are drawn, but don't count for the columns (or picking a card would shove
+        // it, and whatever else they use, a column to the right). They sit after whatever drawn
+        // card leads to them; one that nothing leads to goes left of the selection.
+        let placed: HashSet<usize> =
+            edges.iter().filter(|e| users.contains(&e.to) && !users.contains(&e.from)).map(|e| e.to).collect();
+        let columns: Vec<Edge> = edges
+            .iter()
+            .filter(|e| !users.contains(&e.from) || (!placed.contains(&e.from) && Some(e.to) == sel))
+            .copied()
+            .collect();
+        let (pos, size) = layout(&order, &columns, &self.graph);
         let has_in = edges.iter().map(|e| e.to).collect();
         let has_out = edges.iter().map(|e| e.from).collect();
         let kids = order.iter().map(|&i| (i, self.children(i).len())).collect();
@@ -3079,46 +3110,116 @@ fn dist(a: Pt, b: Pt) -> f32 {
 /// of a full-window MSAA texture). With hundreds of edges that made pan / zoom crawl.
 /// Here each curve is flattened into a strip of quads and all curves of a colour share
 /// one path, so a frame costs a few passes no matter how many edges are drawn.
-#[derive(Default)]
+///
+/// What a frame costs after that is its triangles (gpui copies every vertex twice on the way
+/// to the GPU), so only the part of a curve that is on screen is turned into triangles: a long
+/// edge crossing the window, dashed or not, costs what its visible stretch costs.
 struct StrokeBatch {
     /// in paint order: the first edge of each colour decides where that colour sits
     paths: Vec<(Hsla, gpui::Path<Pixels>)>,
+    /// window position of (0, 0) in the coordinates the curves are given in
+    origin: Point<Pixels>,
+    /// what can be seen, in those coordinates: (x0, y0, x1, y1)
+    clip: (f32, f32, f32, f32),
+    /// how far a stroke may stray from its true curve (px)
+    tol: f32,
+    // scratch, reused from curve to curve: points along the curve, arc length up to each,
+    // half-width offset at each
+    pts: Vec<Pt>,
+    acc: Vec<f32>,
+    off: Vec<Pt>,
 }
 
 impl StrokeBatch {
-    /// Stroke the cubic Bézier `c` (px, relative to `origin`), solid or dashed (on, off).
-    fn curve(&mut self, origin: Point<Pixels>, c: [Pt; 4], width: f32, dash: Option<(f32, f32)>, color: Hsla) {
+    /// Strokes for a canvas painted at `bounds`; curves are given relative to its origin, and
+    /// whatever falls outside it is skipped.
+    fn new(bounds: Bounds<Pixels>, tol: f32) -> Self {
+        Self {
+            paths: Vec::new(),
+            origin: bounds.origin,
+            clip: (0.0, 0.0, f32::from(bounds.size.width), f32::from(bounds.size.height)),
+            tol,
+            pts: Vec::new(),
+            acc: Vec::new(),
+            off: Vec::new(),
+        }
+    }
+
+    /// Stroke the cubic Bézier `c` (px, relative to the origin), solid or dashed (on, off).
+    fn curve(&mut self, c: [Pt; 4], width: f32, dash: Option<(f32, f32)>, color: Hsla) {
         if dist(c[0], c[1]) + dist(c[1], c[2]) + dist(c[2], c[3]) < 0.5 {
             return;
         }
-        // segments from how much the curve bends (Wang's formula), to within ~0.35px;
-        // the curve is already in screen px, so this holds at any zoom
-        let bend = |a: Pt, b: Pt, c: Pt| dist((0.0, 0.0), (a.0 - 2.0 * b.0 + c.0, a.1 - 2.0 * b.1 + c.1));
-        let dd = bend(c[0], c[1], c[2]).max(bend(c[1], c[2], c[3]));
-        let n = ((0.75 * dd / 0.35).sqrt().ceil() as usize).clamp(2, 64);
-        let pts: Vec<Pt> = (0..=n).map(|i| bezier_at(c, i as f32 / n as f32)).collect();
-        let mut acc = Vec::with_capacity(n + 1);
+        let half = width / 2.0;
+        // room for the width of the stroke and its antialiasing
+        let pad = half + 1.0;
+        let (x0, y0, x1, y1) = (self.clip.0 - pad, self.clip.1 - pad, self.clip.2 + pad, self.clip.3 + pad);
+        let outside = |a: Pt, b: Pt| a.0.max(b.0) < x0 || a.0.min(b.0) > x1 || a.1.max(b.1) < y0 || a.1.min(b.1) > y1;
+        // a Bézier stays inside the hull of its control points
+        let (lo, hi) = c.iter().fold((c[0], c[0]), |(lo, hi), p| ((lo.0.min(p.0), lo.1.min(p.1)), (hi.0.max(p.0), hi.1.max(p.1))));
+        if outside(lo, hi) {
+            return;
+        }
+        // control points on the chord, between its ends: a straight line (an edge between two
+        // cards of the same row), whatever its second differences say
+        let chord = (c[3].0 - c[0].0, c[3].1 - c[0].1);
+        let len2 = (chord.0 * chord.0 + chord.1 * chord.1).max(1e-6);
+        let straight = [c[1], c[2]].iter().all(|p| {
+            let d = (p.0 - c[0].0, p.1 - c[0].1);
+            let along = (d.0 * chord.0 + d.1 * chord.1) / len2;
+            let away = (d.0 * chord.1 - d.1 * chord.0).abs() / len2.sqrt();
+            (0.0..=1.0).contains(&along) && 0.75 * away <= self.tol
+        });
+        // else segments from how much the curve bends (Wang's formula), to within `tol`;
+        // the curve is already in screen px, so this holds at any zoom. Only the part of the
+        // second difference that is across the curve's direction bends it; the part along it
+        // just changes how fast the curve is travelled, and that is most of a wide, shallow edge.
+        let n = if straight {
+            1
+        } else {
+            let len = |v: Pt| (v.0 * v.0 + v.1 * v.1).sqrt();
+            let diff2 = |a: Pt, b: Pt, c: Pt| (a.0 - 2.0 * b.0 + c.0, a.1 - 2.0 * b.1 + c.1);
+            let (d0, d1) = (diff2(c[0], c[1], c[2]), diff2(c[1], c[2], c[3]));
+            let across = (0..=8)
+                .map(|i| {
+                    let t = i as f32 / 8.0;
+                    let (u, d) = (1.0 - t, lerp(d0, d1, t));
+                    let w = (u * u, 2.0 * u * t, t * t);
+                    let tan = (
+                        w.0 * (c[1].0 - c[0].0) + w.1 * (c[2].0 - c[1].0) + w.2 * (c[3].0 - c[2].0),
+                        w.0 * (c[1].1 - c[0].1) + w.1 * (c[2].1 - c[1].1) + w.2 * (c[3].1 - c[2].1),
+                    );
+                    let l = len(tan);
+                    if l < 1e-3 { len(d) } else { (d.0 * tan.1 - d.1 * tan.0).abs() / l }
+                })
+                .fold(0.0f32, f32::max);
+            // sampled, so with some margin; never more than the whole second difference
+            let dd = len(d0).max(len(d1)).min(1.25 * across);
+            ((0.75 * dd / self.tol).sqrt().ceil() as usize).clamp(2, 64)
+        };
+        let (mut pts, mut acc, mut off) = (std::mem::take(&mut self.pts), std::mem::take(&mut self.acc), std::mem::take(&mut self.off));
+        pts.clear();
+        pts.extend((0..=n).map(|i| bezier_at(c, i as f32 / n as f32)));
+        acc.clear();
         acc.push(0.0f32);
         for w in pts.windows(2) {
-            acc.push(acc.last().unwrap() + dist(w[0], w[1]));
+            acc.push(acc[acc.len() - 1] + dist(w[0], w[1]));
         }
-        let total = acc[n];
-        let half = width / 2.0;
-        // half-width offsets, along each point's normal
-        let off: Vec<Pt> = (0..=n)
-            .map(|i| {
-                let (a, b) = (pts[i.saturating_sub(1)], pts[(i + 1).min(n)]);
-                let (tx, ty) = (b.0 - a.0, b.1 - a.1);
-                let l = (tx * tx + ty * ty).sqrt().max(1e-6);
-                (-ty / l * half, tx / l * half)
-            })
-            .collect();
+        // half-width offsets, along the normal at each point
+        off.clear();
+        off.extend((0..=n).map(|i| {
+            let (a, b) = (pts[i.saturating_sub(1)], pts[(i + 1).min(n)]);
+            let (tx, ty) = (b.0 - a.0, b.1 - a.1);
+            let l = (tx * tx + ty * ty).sqrt().max(1e-6);
+            (-ty / l * half, tx / l * half)
+        }));
         // centre + offset at arc length `s`
         let sample = |s: f32| -> (Pt, Pt) {
             let j = acc.partition_point(|&a| a <= s).clamp(1, n) - 1;
             let t = ((s - acc[j]) / (acc[j + 1] - acc[j]).max(1e-6)).clamp(0.0, 1.0);
             (lerp(pts[j], pts[j + 1], t), lerp(off[j], off[j + 1], t))
         };
+        let origin = self.origin;
         let at = |p: Pt| origin + point(px(p.0), px(p.1));
         let i = match self.paths.iter().position(|(k, _)| *k == color) {
             Some(i) => i,
@@ -3130,35 +3231,52 @@ impl StrokeBatch {
         let path = &mut self.paths[i].1;
         // solid (st = (0, 1) everywhere, like lyon's output) triangles for arc length s0..s1
         let st = (point(0.0, 1.0), point(0.0, 1.0), point(0.0, 1.0));
-        let mut strip: Vec<(Pt, Pt)> = Vec::with_capacity(n + 2);
         let mut run = |s0: f32, s1: f32| {
-            strip.clear();
-            strip.push(sample(s0));
-            for j in acc.partition_point(|&a| a <= s0)..n {
-                if acc[j] >= s1 {
-                    break;
-                }
-                strip.push((pts[j], off[j]));
-            }
-            strip.push(sample(s1));
-            for w in strip.windows(2) {
-                let ((p, a), (q, b)) = (w[0], w[1]);
+            let mut prev = sample(s0);
+            let mut quad = |next: (Pt, Pt)| {
+                let ((p, a), (q, b)) = (prev, next);
                 let (l0, r0) = (at((p.0 + a.0, p.1 + a.1)), at((p.0 - a.0, p.1 - a.1)));
                 let (l1, r1) = (at((q.0 + b.0, q.1 + b.1)), at((q.0 - b.0, q.1 - b.1)));
                 path.push_triangle((l0, r0, l1), st);
                 path.push_triangle((r0, r1, l1), st);
+                prev = next;
+            };
+            for j in acc.partition_point(|&a| a <= s0)..n {
+                if acc[j] >= s1 {
+                    break;
+                }
+                quad((pts[j], off[j]));
             }
+            quad(sample(s1));
         };
-        match dash {
-            None => run(0.0, total),
-            Some((on, gap)) => {
-                let mut s = 0.0;
-                while s < total {
-                    run(s, (s + on).min(total));
-                    s += on + gap;
+        // each stretch of segments that is on screen
+        let mut j = 0;
+        while j < n {
+            if outside(pts[j], pts[j + 1]) {
+                j += 1;
+                continue;
+            }
+            let lo = acc[j];
+            while j < n && !outside(pts[j], pts[j + 1]) {
+                j += 1;
+            }
+            let hi = acc[j];
+            match dash {
+                None => run(lo, hi),
+                // dashes are counted from the start of the curve, so they stay put as it scrolls
+                Some((on, gap)) => {
+                    let mut s = (lo / (on + gap)).floor() * (on + gap);
+                    while s < hi {
+                        let (a, b) = (s.max(lo), (s + on).min(hi));
+                        if b > a {
+                            run(a, b);
+                        }
+                        s += on + gap;
+                    }
                 }
             }
         }
+        (self.pts, self.acc, self.off) = (pts, acc, off);
     }
 
     fn paint(self, window: &mut Window) {
@@ -3474,14 +3592,182 @@ fn ghost_button(id: &'static str, label: impl Into<String>) -> Stateful<Div> {
         .child(label.into())
 }
 
+/// Toolbar button above the canvas (JetBrains-style): icon with an optional label; `on` = toggled.
+fn tb_button(id: &'static str, path: &'static str, label: Option<&'static str>, on: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .h(px(26.))
+        .min_w(px(26.))
+        .px(px(if label.is_some() { 8. } else { 5. }))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .rounded(px(6.))
+        .border_1()
+        .text_xs()
+        .whitespace_nowrap()
+        .cursor_pointer()
+        .when(on, |d| d.bg(rgb(ACCENT_50)).border_color(rgb(ACCENT_200)).text_color(rgb(ACCENT)))
+        .when(!on, |d| d.border_color(gpui::transparent_black()).text_color(rgb(INK)).hover(|s| s.bg(rgb(HOVER))))
+        .child(svg_icon(path, 13., Some(if on { ACCENT } else { MUTED })))
+        .when_some(label, |d, l| d.child(l))
+}
+
+/// Thin divider between toolbar groups.
+fn tb_sep() -> Div {
+    div().flex_shrink_0().mx(px(4.)).w(px(1.)).h(px(16.)).bg(rgb(BORDER))
+}
+
 fn section(t: &str) -> Div {
+    section_head(t, None, Vec::new())
+}
+
+/// Detail-panel section header, IDE-style: title, an optional count, a hairline to the right
+/// edge and optional icon tools at the end.
+fn section_head(t: &str, count: Option<usize>, tools: Vec<gpui::AnyElement>) -> Div {
     div()
         .mt_4()
         .mb_1()
+        .h(px(20.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(div().flex_shrink_0().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(INK)).child(t.to_string()))
+        .when_some(count, |d, c| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(5.))
+                    .rounded(px(8.))
+                    .bg(rgb(HOVER))
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(c.to_string()),
+            )
+        })
+        .child(div().flex_1().h(px(1.)).bg(rgb(SOFT_BORDER)))
+        .children(tools)
+}
+
+/// JetBrains-style symbol icon: the kind's letter on a tinted rounded square.
+fn kind_icon(k: SymKind, sz: f32) -> Div {
+    let c = kind_rgb(k);
+    div()
+        .flex_shrink_0()
+        .size(px(sz))
+        .rounded(px((sz * 0.28).round()))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(tint(c, 0.16))
+        .border_1()
+        .border_color(tint(c, 0.42))
+        .font_family(MONO_FONT)
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_size(px((sz * 0.68).round()))
+        .line_height(px(sz - 2.0))
+        .text_color(kind_color(k))
+        .child(match k {
+            SymKind::Component => "C",
+            SymKind::Hook => "H",
+            SymKind::Function => "f",
+        })
+}
+
+/// Small square icon button (section tools, panel close).
+fn mini_icon(id: &'static str, path: &'static str, sz: f32) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .size(px(sz + 8.))
+        .rounded(px(5.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(HOVER)))
+        .child(svg_icon(path, sz, Some(MUTED)))
+}
+
+/// Compact bordered action in the detail panel's toolbar: icon + label; `on` = toggled.
+fn panel_action(id: &'static str, path: &'static str, label: impl Into<gpui::SharedString>, on: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .h(px(26.))
+        .px(px(8.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .rounded(px(6.))
+        .border_1()
         .text_xs()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(rgb(MUTED))
-        .child(t.to_uppercase())
+        .whitespace_nowrap()
+        .cursor_pointer()
+        .when(on, |d| d.bg(rgb(ACCENT_50)).border_color(rgb(ACCENT_200)).text_color(rgb(ACCENT)))
+        .when(!on, |d| d.border_color(rgb(BORDER)).text_color(rgb(INK)).hover(|s| s.bg(rgb(HOVER))))
+        .child(svg_icon(path, 12., Some(if on { ACCENT } else { MUTED })))
+        .child(label.into())
+}
+
+/// indent per tree level in the detail panel (px)
+const TREE_INDENT: f32 = 14.0;
+const TREE_ROW_H: f32 = 22.0;
+
+/// One row of an IDE-style tree in the detail panel: indent guides, a fold slot (filled in by
+/// the caller), the kind icon, the name and a muted relation on the right. `repeat`: the symbol
+/// is already listed above (dimmed, with a "go up" mark, not expanded again).
+fn tree_line(id: (&'static str, usize), depth: usize, fold: gpui::AnyElement, k: SymKind, name: String, repeat: bool, rel: String) -> Stateful<Div> {
+    let mut row = div()
+        .id(id)
+        .relative()
+        .flex_shrink_0()
+        .h(px(TREE_ROW_H))
+        .pl(px(2. + depth as f32 * TREE_INDENT))
+        .pr(px(6.))
+        .rounded(px(5.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(HOVER)));
+    // a vertical guide under each ancestor's chevron
+    for l in 0..depth {
+        row = row.child(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(2. + l as f32 * TREE_INDENT + 6.))
+                .w(px(1.))
+                .h(px(TREE_ROW_H))
+                .bg(rgb(BORDER)),
+        );
+    }
+    row.child(fold)
+        .child(kind_icon(k, 16.))
+        .child(
+            div()
+                .min_w(px(0.))
+                .ml(px(2.))
+                .truncate()
+                .text_sm()
+                .text_color(rgb(if repeat { MUTED } else { INK }))
+                .child(name),
+        )
+        .when(repeat, |d| d.child(svg_icon("icons/corner-left-up.svg", 10., Some(0x9ca3af))))
+        .child(div().flex_1().min_w(px(8.)))
+        .child(div().flex_shrink_0().text_xs().text_color(rgb(0x9ca3af)).child(rel))
+}
+
+/// The empty 12 px fold slot of a tree row without children.
+fn no_fold() -> gpui::AnyElement {
+    div().w(px(12.)).flex_shrink_0().into_any_element()
 }
 
 /// Hover tooltip: a title line and an optional muted detail line.
@@ -3563,40 +3849,41 @@ fn legend_dot(c: Hsla, t: &'static str) -> Div {
 
 /// "Overview | Source" switch in the detail panel.
 fn tab_bar(source: bool, cx: &mut Context<GraphView>) -> Div {
-    let tab = |id: &'static str, label: &'static str, active: bool| {
+    // tool-window tabs: text with an accent underline on the active one, over a hairline
+    let tab = |id: &'static str, path: &'static str, label: &'static str, active: bool| {
         div()
             .id(id)
-            .px_3()
-            .py(px(3.))
-            .rounded(px(6.))
-            .text_xs()
+            .h(px(30.))
+            .px(px(10.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .border_b_2()
+            .text_sm()
             .cursor_pointer()
-            .when(active, |d| d.bg(rgb(0xffffff)).text_color(rgb(ACCENT)).font_weight(gpui::FontWeight::SEMIBOLD).shadow_sm())
-            .when(!active, |d| d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(INK))))
+            .when(active, |d| d.border_color(rgb(ACCENT)).text_color(rgb(INK)).font_weight(gpui::FontWeight::MEDIUM))
+            .when(!active, |d| {
+                d.border_color(gpui::transparent_black()).text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(INK)).bg(rgb(HOVER)))
+            })
+            .child(svg_icon(path, 12., Some(if active { ACCENT } else { MUTED })))
             .child(label)
     };
     div()
         .mt_2()
         .flex()
         .flex_row()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .p(px(2.))
-                .gap(px(2.))
-                .rounded(px(8.))
-                .bg(rgb(0xf1f3f5))
-                .child(tab("tab-overview", "Overview", !source).on_click(cx.listener(|this, _, _, cx| {
-                    this.source_tab = false;
-                    cx.notify();
-                })))
-                .child(tab("tab-source", "</> Source", source).on_click(cx.listener(|this, _, _, cx| {
-                    this.source_tab = true;
-                    this.code.scrolled_for = None;
-                    cx.notify();
-                }))),
-        )
+        .border_b_1()
+        .border_color(rgb(SOFT_BORDER))
+        .child(tab("tab-overview", "icons/layers.svg", "Overview", !source).on_click(cx.listener(|this, _, _, cx| {
+            this.source_tab = false;
+            cx.notify();
+        })))
+        .child(tab("tab-source", "icons/code.svg", "Source", source).on_click(cx.listener(|this, _, _, cx| {
+            this.source_tab = true;
+            this.code.scrolled_for = None;
+            cx.notify();
+        })))
 }
 
 fn short_file(f: &str) -> &str {
@@ -3621,12 +3908,12 @@ fn logo(sz: f32) -> impl IntoElement {
                 (954.0 - cw, 512.0 + gap - ch / 2.0, 954.0, 512.0 + gap + ch / 2.0, SymKind::Function),
             ];
             let src = (root.2, 512.0);
-            let mut edges = StrokeBatch::default();
+            let mut edges = StrokeBatch::new(b, 0.35);
             for c in &kids {
                 let dst = (c.0, (c.1 + c.3) / 2.0);
                 let m = (dst.0 - src.0) * 0.6;
                 let s = |p: Pt| (p.0 * k, p.1 * k);
-                edges.curve(b.origin, [s(src), s((src.0 + m, src.1)), s((dst.0 - m, dst.1)), s(dst)], (64.0 * k).max(1.2), None, hsla(a, 1.0));
+                edges.curve([s(src), s((src.0 + m, src.1)), s((dst.0 - m, dst.1)), s(dst)], (64.0 * k).max(1.2), None, hsla(a, 1.0));
             }
             edges.paint(window);
             let r = px(30.0 * k);
@@ -3757,6 +4044,75 @@ impl GraphView {
             );
         }
         list
+    }
+
+    /// Width of the toolbar above the canvas: what is left between the sidebar and the right panel.
+    fn toolbar_w(&self, vw: f32) -> f32 {
+        (vw - LEFT_W - MARGIN - self.right_gap(vw)).max(220.)
+    }
+
+    /// The toolbar's Export drop-down, hanging off the right edge of the toolbar.
+    fn export_popup(&self, vw: f32, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let which = self.popup.filter(|p| *p == Popup::Export)?;
+        let item = |id: &'static str, icon_path: &'static str, label: &'static str, hint: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .px_2()
+                .py(px(5.))
+                .rounded(px(6.))
+                .text_sm()
+                .text_color(rgb(INK))
+                .cursor_pointer()
+                .hover(|st| st.bg(rgb(HOVER)))
+                .child(svg_icon(icon_path, 13., Some(MUTED)))
+                .child(div().flex_1().child(label))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
+        };
+        let m = card()
+            .id("export-popup")
+            .occlude()
+            .w(px(250.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                this.popup = None;
+                this.popup_closed = Some((which, Instant::now()));
+                cx.notify();
+            }))
+            .child(item("exp-svg", "icons/image.svg", "Save as SVG", ".svg").on_click(cx.listener(|this, _, _, cx| {
+                this.popup = None;
+                this.export_svg(cx);
+                cx.notify();
+            })))
+            .child(item("exp-html", "icons/code.svg", "Save as HTML", ".html").on_click(cx.listener(|this, _, _, cx| {
+                this.popup = None;
+                this.export_html(cx);
+                cx.notify();
+            })))
+            .child(div().my_1().mx_1().h(px(1.)).bg(rgb(SOFT_BORDER)))
+            .child(item("exp-mermaid", "icons/copy.svg", "Copy as Mermaid", "clipboard").on_click(cx.listener(|this, _, _, cx| {
+                this.popup = None;
+                this.copy_mermaid(cx);
+                cx.notify();
+            })));
+        let x = LEFT_W + MARGIN + self.toolbar_w(vw) - 8.0;
+        Some(
+            deferred(
+                anchored()
+                    .position(point(px(x), px(TB + MARGIN + 70.0)))
+                    .anchor(Corner::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(m),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
     }
 
     /// The project widget's drop-down (JetBrains "project widget"): open, then recent projects.
@@ -4182,7 +4538,8 @@ impl Render for GraphView {
                 if !has_graph {
                     return;
                 }
-                let mut strokes = StrokeBatch::default();
+                // zoomed out (painted cards, hairline edges): a looser fit is not seen, and saves triangles
+                let mut strokes = StrokeBatch::new(bounds, if z < TEXT_ZOOM { 0.7 } else { 0.35 });
                 for ((fx, fy), (tx, ty), kind, level) in &edge_list {
                     let hot = *level == 2;
                     let c: Hsla = match level {
@@ -4192,15 +4549,17 @@ impl Render for GraphView {
                     };
                     let c4 = edge_curve((*fx, *fy), (*tx, *ty), z);
                     let w = (if hot { 2.4 } else { 1.8 } * z.sqrt()).clamp(1.0, 3.0);
-                    let dash = (*kind == EdgeKind::Context || (*kind == EdgeKind::Defines && z >= 0.35)).then_some((5.0, 4.0));
-                    strokes.curve(bounds.origin, c4, w, dash, c);
+                    // zoomed out (painted cards) every edge is solid: dashes are most of the triangles
+                    // of a big graph there, and a context link still has its amber
+                    let dash = (matches!(kind, EdgeKind::Context | EdgeKind::Defines) && z >= TEXT_ZOOM).then_some((5.0, 4.0));
+                    strokes.curve(c4, w, dash, c);
                 }
 
                 // ---- "Play flow" ----
                 // lit trails: the part of each edge a pulse has covered (and a return hasn't pulled back)
                 for p in pulses.iter().filter(|p| p.trail > 0.001) {
                     let c4 = bezier_head(edge_curve(p.from, p.to, z), p.trail);
-                    strokes.curve(bounds.origin, c4, (2.8 * z.sqrt()).clamp(1.6, 3.6), None, hsla(ACCENT, 0.9));
+                    strokes.curve(c4, (2.8 * z.sqrt()).clamp(1.6, 3.6), None, hsla(ACCENT, 0.9));
                 }
                 strokes.paint(window);
                 // rings growing out of the cards a pulse just reached (cards are drawn on top)
@@ -4521,7 +4880,10 @@ impl Render for GraphView {
                 .child(
                     div()
                         .flex_1()
-                        .px(px(10.0 * z))
+                        .min_w_0()
+                        .pl(px(10.0 * z))
+                        // keep the text clear of the +N toggle, which sits half over this edge
+                        .pr(px(if self.view.kids.get(&i).is_some_and(|&k| k > 0) { (20.0 * z).clamp(14.0, 22.0) / 2.0 + 6.0 * z } else { 10.0 * z }))
                         .flex()
                         .flex_col()
                         .justify_center()
@@ -4530,14 +4892,14 @@ impl Render for GraphView {
                                 .text_size(px(13.5 * z))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(rgb(INK))
-                                .whitespace_nowrap()
+                                .truncate()
                                 .child(s.name.clone()),
                         )
                         .child(
                             div()
                                 .text_size(px(10.5 * z))
                                 .text_color(rgb(MUTED))
-                                .whitespace_nowrap()
+                                .truncate()
                                 .child(format!("{}:{}", short_file(&s.file), s.line)),
                         ),
                 );
@@ -4892,45 +5254,53 @@ impl Render for GraphView {
                     |f| f.data = !f.data,
                 ),
             ];
-            let mut bar = div().mt(px(6.)).mx(px(9.)).flex().flex_row().flex_wrap().items_center().gap(px(2.));
+            // two even rows of four: every cell is the same size, so nothing wraps onto a line of its own
+            let mut cells: Vec<gpui::AnyElement> = Vec::new();
             for (id, glyph, name, detail, num, on, color, toggle) in props {
                 let none = num == 0 && !on;
-                bar = bar.child(
+                let dim = 0x9ca3af;
+                cells.push(
                     div()
                         .id(id)
-                        .h(px(24.))
-                        .px(px(6.))
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h(px(26.))
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(4.))
-                        .rounded(px(5.))
+                        .justify_center()
+                        .gap(px(5.))
+                        .rounded(px(6.))
                         .border_1()
                         .cursor_pointer()
                         .when(on, |d| d.bg(tint(color, 0.14)).border_color(tint(color, 0.45)))
-                        .when(!on, |d| d.border_color(gpui::transparent_black()).hover(|s| s.bg(rgb(TITLE_HOVER))))
-                        .child(icon(glyph, 12., Some(if none { 0x9ca3af } else { color })))
+                        .when(!on, |d| d.border_color(rgb(SOFT_BORDER)).hover(|s| s.bg(rgb(TITLE_HOVER))))
+                        .child(icon(glyph, 13., Some(if none { dim } else { color })))
                         .child(
                             div()
                                 .text_xs()
+                                .when(on, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
                                 .text_color(rgb(if on {
                                     color
                                 } else if none {
-                                    0x9ca3af
+                                    dim
                                 } else {
                                     INK
                                 }))
                                 .child(num.to_string()),
                         )
-                        .tooltip(tip(format!("{name} · {num}{}", if on { " (on)" } else { "" }), Some(detail)))
+                        .tooltip(tip(format!("{name} \u{b7} {num}{}", if on { " (on)" } else { "" }), Some(detail)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             toggle(&mut this.filters);
                             this.refilter(true);
                             cx.notify();
-                        })),
+                        }))
+                        .into_any_element(),
                 );
             }
-            side = side.child(bar);
+            let second_row = cells.split_off(4);
+            let row = |cells: Vec<gpui::AnyElement>| div().flex().flex_row().gap(px(4.)).children(cells);
+            side = side.child(div().mt(px(8.)).mx(px(9.)).flex().flex_col().gap(px(4.)).child(row(cells)).child(row(second_row)));
 
             // scope: the counts only look at the selection and what's below it
             let scope_label = match (self.filter_scope, &self.focus_file) {
@@ -5010,7 +5380,7 @@ impl Render for GraphView {
         let name_cell = |t: String| div().flex_1().overflow_hidden().whitespace_nowrap().text_sm().child(t);
 
         let mut list: Vec<gpui::AnyElement> = Vec::new();
-        let sel_file = selected.map(|s| self.graph.symbols[s].file.clone());
+        let mut tree_list: Option<gpui::UniformList> = None;
         if !self.query.is_empty() {
             let q = self.query.to_lowercase();
             // files first
@@ -5304,76 +5674,97 @@ impl Render for GraphView {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            list.push(
-                row(("proj", 0), 0, self.focus_file.is_none())
-                    .mt_1()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_file(None);
-                        cx.notify();
-                    }))
-                    .child(chevron(true))
-                    .child(folder_icon())
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(project),
-                    )
-                    .child(div().text_xs().text_color(rgb(MUTED)).whitespace_nowrap().child("whole project"))
-                    .into_any_element(),
-            );
             let mut rows = Vec::new();
             tree_rows(&self.tree, "", 0, Some(&self.open_dirs), &mut rows);
-            for (n, r) in rows.into_iter().enumerate() {
-                let path = r.path.clone();
-                let depth = r.depth + 1;
-                if r.dir {
-                    list.push(
-                        row(("dir", n), depth, false)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.open_dirs.remove(&path) {
-                                    this.open_dirs.insert(path.clone());
-                                }
-                                cx.notify();
-                            }))
-                            .child(chevron(r.open))
-                            .child(folder_icon())
-                            .child(name_cell(r.name))
-                            .into_any_element(),
-                    );
-                } else {
-                    let active = self.focus_file.as_deref() == Some(r.path.as_str());
-                    let count = self.file_syms.get(&r.path).copied().unwrap_or(0);
-                    let holds_sel = !active && sel_file.as_deref() == Some(r.path.as_str());
-                    list.push(
-                        row(("file", n), depth, active)
-                            .when(holds_sel, |d| d.bg(rgb(0xeef0f3)))
-                            .when(count == 0 && !active, |d| d.text_color(rgb(0x9ca3af)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_file(Some(path.clone()));
-                                cx.notify();
-                            }))
-                            .child(div().w(px(12.)).flex_shrink_0())
-                            .child(file_icon(&r.path))
-                            .child(name_cell(r.name))
-                            .when(count > 0, |d| {
-                                d.child(
+            let rows_len = rows.len();
+            let rows = Rc::new(rows);
+            // only the rows in view are built and laid out: a big project with its folders open
+            // is thousands of them, on every frame (the project itself is the first row)
+            let build = cx.processor(move |this: &mut Self, range: std::ops::Range<usize>, _, cx| {
+                let sel_file = this.selected.map(|s| this.graph.symbols[s].file.as_str());
+                // the list has the side padding the other lists get from each row's margin
+                let row = |id: (&'static str, usize), depth: usize, active: bool| row(id, depth, active).mx(px(0.)).w_full();
+                range
+                    .map(|n| {
+                        let Some((k, r)) = n.checked_sub(1).and_then(|k| Some((k, rows.get(k)?))) else {
+                            return row(("proj", 0), 0, this.focus_file.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_file(None);
+                                    cx.notify();
+                                }))
+                                .child(chevron(true))
+                                .child(folder_icon())
+                                .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(rgb(if active { ACCENT } else { 0x9ca3af }))
-                                        .child(count.to_string()),
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(project.clone()),
                                 )
-                            })
-                            .into_any_element(),
-                    );
-                }
-            }
+                                .child(div().text_xs().text_color(rgb(MUTED)).whitespace_nowrap().child("whole project"))
+                                .into_any_element();
+                        };
+                        let path = r.path.clone();
+                        let depth = r.depth + 1;
+                        if r.dir {
+                            row(("dir", k), depth, false)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.open_dirs.remove(&path) {
+                                        this.open_dirs.insert(path.clone());
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(chevron(r.open))
+                                .child(folder_icon())
+                                .child(name_cell(r.name.clone()))
+                                .into_any_element()
+                        } else {
+                            let active = this.focus_file.as_deref() == Some(r.path.as_str());
+                            let count = this.file_syms.get(&r.path).copied().unwrap_or(0);
+                            let holds_sel = !active && sel_file == Some(r.path.as_str());
+                            row(("file", k), depth, active)
+                                .when(holds_sel, |d| d.bg(rgb(0xeef0f3)))
+                                .when(count == 0 && !active, |d| d.text_color(rgb(0x9ca3af)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_file(Some(path.clone()));
+                                    cx.notify();
+                                }))
+                                .child(div().w(px(12.)).flex_shrink_0())
+                                .child(file_icon(&r.path))
+                                .child(name_cell(r.name.clone()))
+                                .when(count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(if active { ACCENT } else { 0x9ca3af }))
+                                            .child(count.to_string()),
+                                    )
+                                })
+                                .into_any_element()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            tree_list = Some(uniform_list("tree-rows", rows_len + 1, build));
         }
-        side = side.child(
-            div()
+        side = side.child(match tree_list {
+            // the gap above the first row is outside the list: gpui 0.2 offsets a uniform
+            // list's rows by its top padding twice
+            Some(tree) => div()
+                .mt_2()
+                .border_t_1()
+                .border_color(rgb(BORDER))
+                .flex_1()
+                .min_h(px(0.))
+                .pt_1()
+                .flex()
+                .flex_col()
+                .child(tree.flex_1().min_h(px(0.)).pb_3().px(px(6.)))
+                .into_any_element(),
+            // search hits and filter matches: short, capped lists
+            None => div()
                 .id("tree")
                 .mt_2()
                 .border_t_1()
@@ -5384,8 +5775,9 @@ impl Render for GraphView {
                 .pb_3()
                 .flex()
                 .flex_col()
-                .children(list),
-        );
+                .children(list)
+                .into_any_element(),
+        });
         // status bar strip at the bottom of the tool window
         if !self.status.is_empty() {
             side = side.child(
@@ -5407,13 +5799,23 @@ impl Render for GraphView {
 
         // ---- toolbar above the canvas: what is shown + view options ----
         let toolbar = (!self.root.is_empty() && !self.loading && !seq_on).then(|| {
-            let right_gap = self.right_gap(vw);
+            let bar_w = self.toolbar_w(vw);
             // trail of what's picked: Whole project › file › symbol; earlier crumbs widen back out
-            let mut crumbs = div().flex().flex_row().flex_wrap().items_center().gap_1().text_sm();
-            let sep = || div().text_color(rgb(0xcbd5e1)).child("›");
+            let mut crumbs = div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .text_sm();
+            let sep = || div().flex_shrink_0().text_color(rgb(0xcbd5e1)).child("›");
             let crumb = |id: &'static str, label: String, current: bool| {
                 div()
                     .id(id)
+                    .flex_shrink_0()
                     .when(current, |d| d.font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(INK)))
                     .when(!current, |d| d.text_color(rgb(ACCENT)).cursor_pointer().hover(|s| s.underline()))
                     .child(label)
@@ -5426,14 +5828,11 @@ impl Render for GraphView {
                     cx.notify();
                 }))
             }));
-            if at_top {
-                crumbs = crumbs.child(div().text_color(rgb(MUTED)).child("· from entry points"));
-            }
             if let Some(f) = &self.focus_file {
                 let (dir, name) = f.rsplit_once('/').unwrap_or(("", f.as_str()));
                 crumbs = crumbs.child(sep());
                 if !dir.is_empty() {
-                    crumbs = crumbs.child(div().text_color(rgb(MUTED)).child(format!("{dir}/")));
+                    crumbs = crumbs.child(div().flex_shrink_0().text_color(rgb(MUTED)).child(format!("{dir}/")));
                 }
                 let current = selected.is_none();
                 crumbs = crumbs.child(crumb("crumb-file", name.to_string(), current).when(!current, |d| {
@@ -5447,75 +5846,80 @@ impl Render for GraphView {
                 let t = &self.graph.symbols[s];
                 crumbs = crumbs
                     .child(sep())
-                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
+                    .child(div().flex_shrink_0().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
                     .child(crumb("crumb-symbol", t.name.clone(), true));
             }
-            let mut buttons = div().flex().flex_row().flex_wrap().gap_1();
+
+            // labels give way to icons when the canvas is narrow
+            let compact = bar_w < 800.0;
+            let label = |l: &'static str| (!compact).then_some(l);
+            let mut buttons = div().flex_shrink_0().flex().flex_row().items_center().gap(px(2.));
             if self.focus_file.is_some() {
                 let on = self.file_panel && selected.is_none();
-                buttons = buttons.child(
-                    ghost_button("view-file-source", if on { "✓ Source" } else { "</> Source" }).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            if on {
-                                this.file_panel = false;
-                            } else {
-                                this.file_panel = true;
-                                this.selected = None;
-                                this.code.scrolled_for = None;
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                );
+                buttons = buttons
+                    .child(
+                        tb_button("view-file-source", "icons/code.svg", label("Source"), on)
+                            .tooltip(tip("View the file's source", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if on {
+                                    this.file_panel = false;
+                                } else {
+                                    this.file_panel = true;
+                                    this.selected = None;
+                                    this.code.scrolled_for = None;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(tb_sep());
             }
             buttons = buttons
-                .child(ghost_button("expand-all", "Expand all").on_click(cx.listener(|this, _, _, cx| {
-                    this.expand_all();
-                    cx.notify();
-                })))
-                .child(ghost_button("collapse-all", "Collapse all").on_click(cx.listener(|this, _, _, cx| {
-                    this.collapse_all();
-                    cx.notify();
-                })))
                 .child(
-                    ghost_button(
-                        "focus-toggle",
-                        if self.focus_selection { "✓ Dim others" } else { "Dim others" },
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.focus_selection = !this.focus_selection;
-                        cx.notify();
-                    })),
-                );
-            // which cards a component opens into (every kind of link is always drawn)
-            buttons = buttons.child(
-                ghost_button(
-                    "fn-toggle",
-                    if self.show_functions { "✓ Hooks & functions" } else { "Hooks & functions" },
+                    tb_button("expand-all", "icons/chevrons-up-down.svg", None, false)
+                        .tooltip(tip("Expand all", Some("Open every card into what it renders or calls")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.expand_all();
+                            cx.notify();
+                        })),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.show_functions = !this.show_functions;
-                    // cards a playing trace runs through may disappear
-                    this.flow = None;
-                    this.path = None;
-                    this.relayout();
-                    this.fit_pending = true;
-                    cx.notify();
-                })),
-            );
-            buttons = buttons
-                .child(ghost_button("export-svg", "Export SVG").on_click(cx.listener(|this, _, _, cx| {
-                    this.export_svg(cx);
-                    cx.notify();
-                })))
-                .child(ghost_button("export-html", "Export HTML").on_click(cx.listener(|this, _, _, cx| {
-                    this.export_html(cx);
-                    cx.notify();
-                })))
-                .child(ghost_button("copy-mermaid", "Copy Mermaid").on_click(cx.listener(|this, _, _, cx| {
-                    this.copy_mermaid(cx);
-                    cx.notify();
-                })));
+                .child(
+                    tb_button("collapse-all", "icons/chevrons-down-up.svg", None, false)
+                        .tooltip(tip("Collapse all", Some("Close every open card")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.collapse_all();
+                            cx.notify();
+                        })),
+                )
+                .child(tb_sep())
+                .child(
+                    tb_button("focus-toggle", "icons/contrast.svg", label("Dim others"), self.focus_selection)
+                        .tooltip(tip("Dim others", Some("Fade the cards unrelated to the selection")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.focus_selection = !this.focus_selection;
+                            cx.notify();
+                        })),
+                )
+                // which cards a component opens into (every kind of link is always drawn)
+                .child(
+                    tb_button("fn-toggle", "icons/braces.svg", label("Hooks & functions"), self.show_functions)
+                        .tooltip(tip("Hooks & functions", Some("Also open components into the hooks and functions they use")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_functions = !this.show_functions;
+                            // cards a playing trace runs through may disappear
+                            this.flow = None;
+                            this.path = None;
+                            this.relayout();
+                            this.fit_pending = true;
+                            cx.notify();
+                        })),
+                )
+                .child(tb_sep())
+                .child(
+                    tb_button("export-menu", "icons/download.svg", label("Export"), self.popup == Some(Popup::Export))
+                        .tooltip(tip("Export", Some("Save the graph as SVG or HTML, or copy it as Mermaid")))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_popup(Popup::Export, cx))),
+                );
+
             let plural = |n: usize| if n == 1 { "" } else { "s" };
             let shown = self.view.nodes.len();
             let stats = match &self.focus_file {
@@ -5528,7 +5932,7 @@ impl Render for GraphView {
                     plural(shown),
                 ),
                 None => format!(
-                    "{} entry point{} · {} node{} shown{}",
+                    "From {} entry point{} · {} node{} shown{}",
                     self.entry_count,
                     plural(self.entry_count),
                     shown,
@@ -5546,34 +5950,33 @@ impl Render for GraphView {
                 .absolute()
                 .top(px(MARGIN))
                 .left(px(LEFT_W + MARGIN))
-                .max_w(px((vw - LEFT_W - MARGIN - right_gap).max(220.)))
-                .px_3()
-                .py_2()
+                .w(px(bar_w))
                 .flex()
                 .flex_col()
-                .gap_1()
+                .child(div().h(px(40.)).px_3().flex().flex_row().items_center().gap_3().child(crumbs).child(buttons))
                 .child(
                     div()
+                        .h(px(26.))
+                        .px_3()
                         .flex()
                         .flex_row()
-                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .child(crumbs)
-                        .child(buttons),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_3()
-                        .child(div().text_xs().text_color(rgb(MUTED)).child(stats))
-                        .child(legend_dot(kind_color(SymKind::Component), "component"))
-                        .child(legend_dot(kind_color(SymKind::Hook), "hook"))
-                        .child(legend_dot(kind_color(SymKind::Function), "function")),
+                        .border_t_1()
+                        .border_color(rgb(SOFT_BORDER))
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_xs().text_color(rgb(MUTED)).child(stats))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .child(legend_dot(kind_color(SymKind::Component), "component"))
+                                .child(legend_dot(kind_color(SymKind::Hook), "hook"))
+                                .child(legend_dot(kind_color(SymKind::Function), "function")),
+                        ),
                 )
         });
 
@@ -5594,84 +5997,101 @@ impl Render for GraphView {
                 .flex()
                 .flex_col()
                 .gap_1()
+                // header: kind icon, name, "kind · file:line" (click: show the source), close
                 .child(
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
-                        .justify_between()
+                        .items_start()
+                        .gap(px(10.))
+                        .child(div().mt(px(3.)).child(kind_icon(s.kind, 24.)))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(kind_color(s.kind)))
+                                .flex_col()
+                                .child(div().truncate().text_lg().font_weight(gpui::FontWeight::BOLD).child(s.name.clone()))
                                 .child(
                                     div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .min_w(px(0.))
                                         .text_xs()
-                                        .font_family(MONO_FONT)
                                         .text_color(rgb(MUTED))
-                                        .child(kind_name(s.kind)),
-                                ),
+                                        .child(div().flex_shrink_0().text_color(kind_color(s.kind)).child(kind_name(s.kind)))
+                                        .child(div().flex_shrink_0().child("·"))
+                                        .child(
+                                            div()
+                                                .id("sel-loc")
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .font_family(MONO_FONT)
+                                                .cursor_pointer()
+                                                .hover(|st| st.text_color(rgb(ACCENT)).underline())
+                                                .tooltip(tip("Show source", None))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.source_tab = true;
+                                                    this.code.scrolled_for = None;
+                                                    cx.notify();
+                                                }))
+                                                .child(if s.end_line > s.line {
+                                                    format!("{}:{}–{}", s.file, s.line, s.end_line)
+                                                } else {
+                                                    format!("{}:{}", s.file, s.line)
+                                                }),
+                                        ),
+                                )
+                                .when_some(s.parent, |d, par| {
+                                    d.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(format!("defined inside {}", self.graph.symbols[par].name)),
+                                    )
+                                }),
                         )
-                        .child(
-                            div()
-                                .id("close")
-                                .px_2()
-                                .rounded(px(6.))
-                                .cursor_pointer()
-                                .text_color(rgb(MUTED))
-                                .hover(|st| st.bg(rgb(0xf3f4f6)))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.selected = None;
-                                    cx.notify();
-                                }))
-                                .child("✕"),
-                        ),
+                        .child(mini_icon("close", "icons/x.svg", 14.).tooltip(tip("Close", Some("Esc"))).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.selected = None;
+                                cx.notify();
+                            },
+                        ))),
                 )
-                .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).child(s.name.clone()))
-                .child(div().text_xs().text_color(rgb(MUTED)).child(if s.end_line > s.line {
-                    format!("{}:{}–{}", s.file, s.line, s.end_line)
-                } else {
-                    format!("{}:{}", s.file, s.line)
-                }))
                 .child(tab_bar(show_code, cx));
             if show_code {
                 return p.child(self.code_block(code_range, cx));
             }
-            if self.focus_file.as_deref() != Some(s.file.as_str()) {
-                let file = s.file.clone();
-                p = p.child(
-                    div().flex().flex_row().child(
-                        ghost_button("open-sel-file", format!("Show only {}", short_file(&s.file)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_file(Some(file.clone()));
-                                // narrow to the file, keep this symbol picked inside it
-                                this.pick_from_list(sel);
-                                cx.notify();
-                            })),
-                    ),
-                );
-            }
-            if let Some(par) = s.parent {
-                p = p.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child(format!("defined inside {}", self.graph.symbols[par].name)),
-                );
-            }
+            // toolbar: canvas expand, play flow, narrow the canvas to this file
             let flowing = self.flow.is_some();
+            let only_file = (self.focus_file.as_deref() != Some(s.file.as_str())).then(|| s.file.clone());
             p = p.child(
                 div()
                     .mt_2()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .flex_wrap()
+                    .gap(px(6.))
                     .when(kids > 0, |d| {
                         d.child(
-                            primary_button("expand-sel", if open { "Collapse".to_string() } else { format!("Expand ({kids})") })
+                            panel_action("expand-sel", "icons/network.svg", if open { "Collapse" } else { "Expand" }, open)
+                                .when(!open, |b| {
+                                    b.child(
+                                        div()
+                                            .px(px(5.))
+                                            .rounded(px(8.))
+                                            .bg(rgb(HOVER))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(MUTED))
+                                            .child(kids.to_string()),
+                                    )
+                                })
+                                .tooltip(tip(
+                                    if open { "Hide its children on the canvas" } else { "Show its children on the canvas" },
+                                    None,
+                                ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_expand(sel);
                                     cx.notify();
@@ -5679,21 +6099,35 @@ impl Render for GraphView {
                         )
                     })
                     .child(
-                        ghost_button("play-flow", if flowing { "■ Stop flow" } else { "▶ Play flow" })
-                            .text_sm()
-                            .py(px(5.))
-                            .px_3()
-                            .text_color(rgb(ACCENT))
-                            .border_color(rgb(ACCENT_300))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.flow.is_some() {
-                                    this.flow = None;
-                                } else {
-                                    this.start_flow();
-                                }
-                                cx.notify();
-                            })),
-                    ),
+                        panel_action(
+                            "play-flow",
+                            if flowing { "icons/square.svg" } else { "icons/play.svg" },
+                            if flowing { "Stop flow" } else { "Play flow" },
+                            flowing,
+                        )
+                        .tooltip(tip("Animate what runs from here", None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.flow.is_some() {
+                                this.flow = None;
+                            } else {
+                                this.start_flow();
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .when_some(only_file, |d, file| {
+                        let label = format!("Only {}", short_file(&file));
+                        d.child(
+                            panel_action("open-sel-file", "icons/focus.svg", label, false)
+                                .tooltip(tip("Show only this file on the canvas", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_file(Some(file.clone()));
+                                    // narrow to the file, keep this symbol picked inside it
+                                    this.pick_from_list(sel);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             );
 
             if s.lazy || !s.cover_hints.is_empty() {
@@ -6257,34 +6691,37 @@ impl Render for GraphView {
                 }
             }
 
-            p = p.child(section("Used by"));
+            let by_total = self.graph.in_edges(sel).count();
+            p = p.child(section_head("Used by", (by_total > 0).then_some(by_total), Vec::new()));
             let used_by: Vec<_> = self.graph.in_edges(sel).take(30).copied().collect();
             if used_by.is_empty() {
-                p = p.child(div().text_xs().text_color(rgb(MUTED)).child("Nothing — this is an entry point"));
+                p = p.child(
+                    div()
+                        .h(px(TREE_ROW_H))
+                        .pl(px(4.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(svg_icon("icons/flag.svg", 12., Some(TEAL)))
+                        .child(div().text_sm().child("Entry point"))
+                        .child(div().text_xs().text_color(rgb(MUTED)).child("nothing renders or calls it")),
+                );
             }
             for (n, e) in used_by.into_iter().enumerate() {
                 let from = e.from;
                 let t = &self.graph.symbols[from];
                 p = p.child(
-                    div()
-                        .id(("by", n))
-                        .px_2()
-                        .py_1()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|st| st.bg(rgb(ACCENT_50)))
+                    tree_line(("by", n), 0, no_fold(), t.kind, t.name.clone(), false, self.graph.edge_label(&e))
+                        .tooltip(tip(format!("{}:{}", self.graph.symbols[e.site].file, e.line), Some("Click to select it on the canvas")))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.reveal(from);
                             cx.notify();
-                        }))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(kind_color(t.kind)))
-                        .child(div().text_sm().child(t.name.clone()))
-                        .child(div().text_xs().text_color(rgb(MUTED)).child(self.graph.edge_label(&e))),
+                        })),
                 );
+            }
+            if by_total > 30 {
+                p = p.child(div().pl(px(22.)).text_xs().text_color(rgb(MUTED)).child(format!("…and {} more", by_total - 30)));
             }
 
             // while a flow plays: its steps, the current one highlighted; click one to jump there
@@ -6346,38 +6783,92 @@ impl Render for GraphView {
                 }
                 return p;
             }
-            p = p.child(section("Flow"));
-            for (n, (depth, idx, via, again)) in self.flow_list(sel).into_iter().enumerate().skip(1) {
+            // Flow: what this renders / calls, as a foldable tree (JetBrains call hierarchy)
+            let rows = self.flow_list(sel);
+            let has_kids = |n: usize| rows.get(n + 1).is_some_and(|r| r.0 > rows[n].0);
+            // rows near the top start open, deeper ones closed
+            let is_open = |n: usize| self.flow_fold.get(&(sel, n)).copied().unwrap_or(rows[n].0 < 3);
+            let parents: Vec<usize> = (1..rows.len()).filter(|&n| has_kids(n)).collect();
+            let fold_all = |id: &'static str, path: &'static str, to: bool, hint: &'static str| {
+                let parents = parents.clone();
+                mini_icon(id, path, 12.)
+                    .tooltip(tip(hint, None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        for &n in &parents {
+                            this.flow_fold.insert((sel, n), to);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
+            let tools = if parents.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    fold_all("flow-open-all", "icons/chevrons-up-down.svg", true, "Expand all"),
+                    fold_all("flow-close-all", "icons/chevrons-down-up.svg", false, "Collapse all"),
+                ]
+            };
+            let flow_total = rows.len().saturating_sub(1);
+            p = p.child(section_head("Flow", (flow_total > 0).then_some(flow_total), tools));
+            if flow_total == 0 {
+                p = p.child(div().pl(px(4.)).text_xs().text_color(rgb(MUTED)).child("Doesn't render or call anything"));
+            }
+            // depth of a closed row: everything deeper below it is hidden
+            let mut hide_below: Option<usize> = None;
+            for (n, &(depth, idx, via, again)) in rows.iter().enumerate().skip(1) {
+                if let Some(h) = hide_below {
+                    if depth > h {
+                        continue;
+                    }
+                    hide_below = None;
+                }
                 let t = &self.graph.symbols[idx];
-                p = p.child(
+                let kids = has_kids(n);
+                let open = kids && is_open(n);
+                if kids && !open {
+                    hide_below = Some(depth);
+                }
+                let fold = if kids {
                     div()
-                        .id(("flow", n))
-                        .pl(px((depth as f32 - 1.0) * 14. + 8.))
-                        .pr_2()
-                        .py(px(3.))
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|st| st.bg(rgb(ACCENT_50)))
+                        .id(("flow-fold", n))
+                        .w(px(12.))
+                        .h(px(TREE_ROW_H))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.))
+                        .hover(|st| st.bg(rgb(BORDER)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let cur = this.flow_fold.get(&(sel, n)).copied().unwrap_or(depth < 3);
+                            this.flow_fold.insert((sel, n), !cur);
+                            cx.notify();
+                        }))
+                        .child(svg_icon(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, 9., Some(MUTED)))
+                        .into_any_element()
+                } else {
+                    no_fold()
+                };
+                let rel = match via {
+                    Some(EdgeKind::Renders) => "rendered",
+                    Some(EdgeKind::Calls) => "called",
+                    Some(EdgeKind::Defines) => "defined",
+                    Some(EdgeKind::Handler) => "handler",
+                    Some(EdgeKind::Context) => "context",
+                    None => "",
+                };
+                p = p.child(
+                    tree_line(("flow", n), depth - 1, fold, t.kind, t.name.clone(), again, rel.to_string())
+                        .tooltip(tip(
+                            format!("{}:{}", t.file, t.line),
+                            Some(if again { "Already listed above · click to select it" } else { "Click to select it on the canvas" }),
+                        ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.reveal(idx);
                             cx.notify();
-                        }))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x9ca3af))
-                                .child(via.map(|v| v.label()).unwrap_or("")),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(kind_color(t.kind))
-                                .child(if again { format!("{} ↑", t.name) } else { t.name.clone() }),
-                        ),
+                        })),
                 );
             }
             p
@@ -6818,15 +7309,19 @@ impl Render for GraphView {
                         let map = |x: f32, y: f32| {
                             bounds.origin + point(px(mpx + (x - mx0) * ms), px(mpy + (y - my0) * ms))
                         };
-                        // dim everything, then punch out the viewport
-                        window.paint_quad(fill(bounds, hsla(0xf0f0f0, 0.6)));
                         let (vx, vy, vw_, vh_) = vrect;
                         let vb = Bounds::new(map(vx, vy), size(px(vw_ * ms), px(vh_ * ms)));
-                        window.paint_quad(fill(vb, hsla(0xffffff, 1.0)));
-                        for (x, y, c) in &mm_nodes {
-                            let b = Bounds::new(map(*x, *y), size(px((NODE_W * ms).max(2.0)), px((NODE_H * ms).max(1.5))));
-                            window.paint_quad(fill(b, *c).corner_radii(px(2.0)));
-                        }
+                        // one layer: a big graph is thousands of overlapping cards here, and the
+                        // scene would sort each into its bounds tree (they keep their paint order)
+                        window.paint_layer(bounds, |window| {
+                            // dim everything, then punch out the viewport
+                            window.paint_quad(fill(bounds, hsla(0xf0f0f0, 0.6)));
+                            window.paint_quad(fill(vb, hsla(0xffffff, 1.0)));
+                            for (x, y, c) in &mm_nodes {
+                                let b = Bounds::new(map(*x, *y), size(px((NODE_W * ms).max(2.0)), px((NODE_H * ms).max(1.5))));
+                                window.paint_quad(fill(b, *c).corner_radii(px(2.0)));
+                            }
+                        });
                         let mut pb = PathBuilder::stroke(px(1.0));
                         let (a, b) = (vb.origin, vb.origin + point(vb.size.width, vb.size.height));
                         pb.move_to(a);
@@ -6967,6 +7462,9 @@ impl Render for GraphView {
             root = root.child(m);
         }
         if let Some(m) = self.project_popup(cx) {
+            root = root.child(m);
+        }
+        if let Some(m) = self.export_popup(vw, cx) {
             root = root.child(m);
         }
         div()
