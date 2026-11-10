@@ -3466,17 +3466,4 @@ export default function Old() { const [a] = useState(0); return <b onClick={() =
         assert!(sym(&g2, "Old").next_hints.is_empty());
         let _ = std::fs::remove_dir_all(&torture);
     }
-
-    /// A throwaway project folder with the given files.
-    fn tempdir_project(files: &[(&str, &str)]) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!("react-graph-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
-        for (f, text) in files {
-            let p = root.join(f);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, text).unwrap();
-        }
-        root
-    }
 }

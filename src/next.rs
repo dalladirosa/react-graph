@@ -324,7 +324,18 @@ pub fn annotate(root: &Path, symbols: &mut [Symbol], edges: &mut Vec<Edge>, file
         let have: HashSet<(usize, usize)> = edges.iter().filter(|e| e.kind == EdgeKind::Renders).map(|e| (e.from, e.to)).collect();
         for (p, c) in add {
             if !have.contains(&(p, c)) {
-                edges.push(Edge { from: p, to: c, kind: EdgeKind::Renders, line: symbols[p].line, site: p, ctx: None });
+                // not a route edge for boundary coverage: Next.js wraps pages in error.tsx / loading.tsx itself
+                edges.push(Edge {
+                    from: p,
+                    to: c,
+                    kind: EdgeKind::Renders,
+                    line: symbols[p].line,
+                    site: p,
+                    ctx: None,
+                    suspended: false,
+                    caught: false,
+                    route: false,
+                });
             }
         }
     }
