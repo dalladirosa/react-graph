@@ -4,11 +4,11 @@ A fast desktop app that maps a React codebase as an interactive graph of **compo
 
 Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it with tree-sitter (it never runs your code). It shows what renders, calls and passes what, starting from your entry points.
 
-![React Graph showing a sample project](docs/screenshot.png)
+![React Graph in dark mode, with the App component expanded and the toolbar showing Dim others, Hooks & functions and Export](docs/screenshot.png)
 
 ## Features
 
-- **Graph view.** Components, hooks and functions are shown as cards, with edges for render, call and prop relations. Expand or collapse nodes, use **Dim others** to focus on one, zoom, and pan with the minimap.
+- **Graph view.** Components, hooks and functions are shown as cards, with edges for render, call and prop relations. Expand or collapse nodes (one by one, or all at once with the two arrow buttons at the left of the toolbar), use **Dim others** to focus on one, zoom, and pan with the minimap.
 - **Context links.** A component that provides a context (`<ThemeContext.Provider>`) is linked, with a dashed amber edge (solid when zoomed far out), to everything that reads it: `useContext(ThemeContext)`, and the components and hooks that call a custom hook doing so.
 - **Next.js.** App Router (`app/`) and Pages Router (`pages/`) projects are recognised. `page`, `layout`, `loading`, `error`, `not-found`, `route` and `_app` files are marked as entry points with their URL (`/blog/[slug]`; route groups and slots don't count), are never reported as unused, and each page and layout hangs off the nearest layout above it. Components get a `server` / `client` badge: Server Components by default, client with `"use client"` or when a client component renders them, and Server Actions with `"use server"`. A Server Component that calls `useState`, `useEffect` and the like, or puts `onClick` on an element, gets a warning.
 - **Path aliases.** `paths` and `baseUrl` from `tsconfig.json` / `jsconfig.json` (including `extends`) are followed, so `import { Button } from "@/ui/Button"` resolves like a relative import. Without a config, `@/` and `~/` are assumed to mean `src/`.
