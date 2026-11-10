@@ -2012,6 +2012,7 @@ impl GraphView {
             (f.memo, "memo"),
             (f.cycle, "cycle"),
             (f.untested, "untested"),
+            (f.data, "data"),
         ];
         let kinds = ["component", "hook", "function"];
         let keys = |set: &mut dyn Iterator<Item = usize>| {
@@ -2048,6 +2049,7 @@ impl GraphView {
                     "memo" => f.memo = true,
                     "cycle" => f.cycle = true,
                     "untested" => f.untested = true,
+                    "data" => f.data = true,
                     _ => {}
                 }
             }
