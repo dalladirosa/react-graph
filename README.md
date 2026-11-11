@@ -86,9 +86,9 @@ To build the packages locally:
 ```bash
 cargo build --release
 # Windows, with Inno Setup 6 (https://jrsoftware.org/isinfo.php) installed:
-iscc /DAppVersion=0.5.0 installer/rendermap.iss   # writes dist/rendermap-0.5.0-setup.exe
+iscc /DAppVersion=0.6.0 installer/rendermap.iss   # writes dist/rendermap-0.6.0-setup.exe
 # macOS (needs `pip install dmgbuild`):
-installer/macos/bundle.sh 0.5.0                     # writes dist/Rendermap.app and dist/rendermap-0.5.0-macos-arm64.dmg
+installer/macos/bundle.sh 0.6.0                     # writes dist/Rendermap.app and dist/rendermap-0.6.0-macos-arm64.dmg
 ```
 
 ## Releasing
