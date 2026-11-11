@@ -369,6 +369,24 @@ impl Graph {
     pub fn untested(&self, i: usize) -> bool {
         !self.test_files.is_empty() && self.symbols[i].parent.is_none() && self.symbols[i].tests.is_empty()
     }
+    /// Nothing references `i` except the symbol that defines it. Pages, layouts and route
+    /// handlers are loaded by Next.js itself.
+    pub fn is_unused(&self, i: usize) -> bool {
+        !self.symbols[i].is_entry()
+            && !self.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
+    }
+    /// `i` is `anc` or defined (at any depth) inside it.
+    pub fn is_inside(&self, mut i: usize, anc: usize) -> bool {
+        loop {
+            if i == anc {
+                return true;
+            }
+            match self.symbols[i].parent {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
+    }
 
     /// What `i` reaches out to: its own data uses first, then those of the hooks and functions it
     /// calls (up to `DATA_DEPTH` calls away), each with the first callee that leads to it.

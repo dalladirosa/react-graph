@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod alias;
+mod changes;
 mod compare;
 mod drill;
 
@@ -304,6 +305,19 @@ struct ViewData {
     has_in: HashSet<usize>,
     has_out: HashSet<usize>,
     kids: HashMap<usize, usize>,
+    /// removed since HEAD: faded cards where they used to be, after the drawn card that used them
+    ghosts: Vec<Ghost>,
+    /// links that are gone since HEAD, from / to graph points (card edges)
+    ghost_links: Vec<((f32, f32), (f32, f32))>,
+}
+
+/// A symbol the last commit has and the working tree doesn't, drawn as a faded card.
+struct Ghost {
+    name: String,
+    kind: SymKind,
+    file: String,
+    line: usize,
+    pos: (f32, f32),
 }
 
 struct GraphView {
@@ -404,6 +418,17 @@ struct GraphView {
     refreshing: bool,
     /// files changed again while loading / rebuilding: rebuild once more when done
     reload_pending: bool,
+    /// the project as committed in git's HEAD (kept until HEAD moves)
+    head: Option<std::sync::Arc<changes::Head>>,
+    /// uncommitted changes: this graph against HEAD's. None outside a git repository
+    changes: Option<changes::Changes>,
+    /// why there are no changes to show ("Not a git repository", an error), when there aren't
+    changes_note: Option<String>,
+    /// a comparison with HEAD is running / was asked for again meanwhile
+    changes_busy: bool,
+    changes_pending: bool,
+    /// watches the repository's git folder for commits and checkouts
+    git_watcher: Option<notify::RecommendedWatcher>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -435,13 +460,40 @@ struct Filters {
 
     /// calls out to an API, a data-fetching hook or a store itself
     data: bool,
+    /// new or edited since git's HEAD commit
+    changed: bool,
     /// Component, Hook, Function
     kinds: [bool; 3],
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.untested || self.data || self.kinds.iter().any(|&k| k)
+        self.dup
+            || self.exact
+            || self.warn
+            || self.unused
+            || self.memo
+            || self.cycle
+            || self.untested
+            || self.data
+            || self.changed
+            || self.kinds.iter().any(|&k| k)
+    }
+}
+
+const ADD_FG: u32 = 0x15803d;
+const ADD_BG: u32 = 0xdcfce7;
+const EDIT_FG: u32 = 0x1d4ed8;
+const EDIT_BG: u32 = 0xdbeafe;
+const GONE_FG: u32 = 0xb91c1c;
+/// border of an unchanged card that uses changed code (dashed, 1px)
+const AFFECT_BORDER: u32 = 0x3b82f6;
+
+/// (text, background) of a change badge
+fn change_colors(s: changes::Status) -> (u32, u32) {
+    match s {
+        changes::Status::Added => (ADD_FG, ADD_BG),
+        changes::Status::Edited => (EDIT_FG, EDIT_BG),
     }
 }
 
@@ -816,6 +868,12 @@ impl GraphView {
             watcher: None,
             refreshing: false,
             reload_pending: false,
+            head: None,
+            changes: None,
+            changes_note: None,
+            changes_busy: false,
+            changes_pending: false,
+            git_watcher: None,
         }
     }
 
@@ -1916,6 +1974,11 @@ impl GraphView {
         self.view = ViewData::default();
         self.status = "Loading…".into();
         self.reload_pending = false;
+        self.head = None;
+        self.changes = None;
+        self.changes_note = None;
+        self.changes_pending = false;
+        self.git_watcher = None;
         self.start_watching(cx);
         cx.notify();
         let task = cx.background_spawn(async move {
@@ -1954,6 +2017,7 @@ impl GraphView {
                 this.relayout();
                 this.fit_pending = true;
                 this.start_view_saver(cx);
+                this.refresh_changes(cx);
                 // files changed while this was loading
                 if std::mem::take(&mut this.reload_pending) {
                     this.reload_graph(cx);
@@ -2030,6 +2094,7 @@ impl GraphView {
                 this.refreshing = false;
                 if this.graph_root_is(&root) && !this.loading {
                     this.apply_reload(g, took);
+                    this.refresh_changes(cx);
                 }
                 if std::mem::take(&mut this.reload_pending) {
                     this.reload_graph(cx);
@@ -2053,6 +2118,7 @@ impl GraphView {
             (f.cycle, "cycle"),
             (f.untested, "untested"),
             (f.data, "data"),
+            (f.changed, "changed"),
         ];
         let kinds = ["component", "hook", "function"];
         let keys = |set: &mut dyn Iterator<Item = usize>| {
@@ -2090,6 +2156,7 @@ impl GraphView {
                     "cycle" => f.cycle = true,
                     "untested" => f.untested = true,
                     "data" => f.data = true,
+                    "changed" => f.changed = true,
                     _ => {}
                 }
             }
@@ -2172,6 +2239,19 @@ impl GraphView {
         self.filter_scope = self.filter_scope.and_then(carry);
         self.expanded = self.expanded.iter().filter_map(|&i| carry(i)).collect();
         self.pinned = self.pinned.iter().filter_map(|&i| carry(i)).collect();
+        // the last comparison with HEAD stays up (moved to the new indexes) until the next one is done
+        if let Some(c) = self.changes.as_mut() {
+            c.status = c.status.iter().filter_map(|(&i, &s)| Some((carry(i)?, s))).collect();
+            c.issues.retain_mut(|x| match x.sym {
+                Some(i) => carry(i).map(|n| x.sym = Some(n)).is_some(),
+                None => true,
+            });
+            for l in &mut c.links {
+                l.from_idx = l.from_idx.and_then(carry);
+                l.to_idx = l.to_idx.and_then(carry);
+            }
+            c.affected = c.affected.iter().filter_map(|&i| carry(i)).collect();
+        }
         // anything holding indexes into the old graph
         self.cmp = None;
         self.flow = None;
@@ -2291,9 +2371,7 @@ impl GraphView {
 
     /// Nothing references `i` except the symbol that defines it.
     fn is_unused(&self, i: usize) -> bool {
-        // pages, layouts and route handlers are loaded by Next.js itself
-        !self.graph.symbols[i].is_entry()
-            && !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
+        self.graph.is_unused(i)
     }
 
     /// Follow selection changes. The selection's own links are drawn (see `relayout`), so the
@@ -2386,6 +2464,112 @@ impl GraphView {
             && (!f.untested || self.graph.untested(i))
 
             && (!f.data || !s.data.is_empty())
+            && (!f.changed || self.change_of(i).is_some())
+    }
+
+    /// New or edited since HEAD (nothing outside a git repository).
+    fn change_of(&self, i: usize) -> Option<changes::Status> {
+        self.changes.as_ref().and_then(|c| c.status.get(&i).copied())
+    }
+
+    /// Compare the graph with git's HEAD commit, in the background. HEAD's graph is built once
+    /// per commit; after that only the files on disk are read again.
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        if self.root.is_empty() || self.loading {
+            return;
+        }
+        if self.changes_busy {
+            self.changes_pending = true;
+            return;
+        }
+        self.changes_busy = true;
+        let root = self.root_path.clone();
+        let files = self.graph.file_list.clone();
+        let cached = self.head.clone();
+        let want_dir = self.git_watcher.is_none();
+        let task = cx.background_spawn(async move {
+            let Some(sha) = changes::head_sha(&root) else {
+                return Err("Not a git repository (or no commits yet)".to_string());
+            };
+            let head = match cached.filter(|h| h.sha == sha) {
+                Some(h) => h,
+                None => std::sync::Arc::new(changes::load_head(&root, &sha)?),
+            };
+            let edited = changes::edited_files(&root, &files, &head);
+            let dir = if want_dir { changes::git_dir(&root) } else { None };
+            Ok((head, edited, dir))
+        });
+        let root_done = self.root_path.clone();
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                this.changes_busy = false;
+                if this.graph_root_is(&root_done) && !this.loading {
+                    match res {
+                        Ok((head, edited, dir)) => {
+                            this.changes = Some(changes::diff(&head, &this.graph, &edited));
+                            this.changes_note = None;
+                            this.head = Some(head);
+                            if let Some(d) = dir {
+                                this.watch_git(&d, cx);
+                            }
+                        }
+                        Err(e) => {
+                            this.changes = None;
+                            this.head = None;
+                            this.changes_note = Some(e);
+                        }
+                    }
+                    // the "Changes" filter, and the removed cards, follow the new comparison
+                    this.relayout_keep(this.selected);
+                }
+                if std::mem::take(&mut this.changes_pending) {
+                    this.refresh_changes(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Compare again after a commit, checkout or reset (they move HEAD without touching the
+    /// source files the folder watcher looks at).
+    fn watch_git(&mut self, dir: &std::path::Path, cx: &mut Context<Self>) {
+        use notify::Watcher;
+        use std::sync::mpsc::TryRecvError;
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let Ok(mut w) = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                if !ev.kind.is_access() && ev.paths.iter().any(|p| changes::moves_head(p)) {
+                    tx.send(()).ok();
+                }
+            }
+        }) else {
+            return;
+        };
+        if w.watch(dir, notify::RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        self.git_watcher = Some(w);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let mut dirty = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(()) => dirty = true,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+                if dirty && this.update(cx, |this, cx| this.refresh_changes(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// What the canvas starts from while filtering: every match, and every card on a path to one
@@ -2616,7 +2800,61 @@ impl GraphView {
         let has_in = edges.iter().map(|e| e.to).collect();
         let has_out = edges.iter().map(|e| e.from).collect();
         let kids = order.iter().map(|&i| (i, self.children(i).len())).collect();
-        self.view = ViewData { nodes: order, set, edges, pos, size, has_in, has_out, kids };
+        self.view = ViewData { nodes: order, set, edges, pos, size, has_in, has_out, kids, ..ViewData::default() };
+        self.place_ghosts();
+    }
+
+    /// What the uncommitted changes took away, on the canvas: a dashed red link for every link
+    /// gone between two drawn cards, and a faded card for every removed symbol an open card used
+    /// (in the column after it, under what is already there).
+    fn place_ghosts(&mut self) {
+        let Some(c) = self.changes.as_ref() else { return };
+        let v = &mut self.view;
+        let right = |p: (f32, f32)| (p.0 + NODE_W, p.1 + NODE_H / 2.0);
+        let left = |p: (f32, f32)| (p.0, p.1 + NODE_H / 2.0);
+        // lowest card bottom per column (x rounded), to stack ghosts under it
+        let mut bottom: HashMap<i32, f32> = HashMap::new();
+        for &(x, y) in v.pos.values() {
+            let b = bottom.entry(x.round() as i32).or_insert(f32::MIN);
+            *b = b.max(y + NODE_H);
+        }
+        let mut at: HashMap<(String, String), (f32, f32)> = HashMap::new();
+        for l in c.links.iter().filter(|l| !l.added && l.kind != EdgeKind::Defines) {
+            let Some(&fp) = l.from_idx.and_then(|f| v.pos.get(&f)) else { continue };
+            match l.to_idx {
+                Some(t) => {
+                    if let Some(&tp) = v.pos.get(&t) {
+                        v.ghost_links.push((right(fp), left(tp)));
+                    }
+                }
+                // a removed symbol: only under a card that is open (its children are showing)
+                None if l.from_idx.is_some_and(|f| self.expanded.contains(&f)) => {
+                    let key = (l.to_file.clone(), l.to.clone());
+                    let gp = match at.get(&key) {
+                        Some(&p) => p,
+                        None => {
+                            let Some(r) = c.removed_named(&l.to_file, &l.to) else { continue };
+                            let x = fp.0 + NODE_W + COL_GAP;
+                            let col = bottom.entry(x.round() as i32).or_insert(f32::MIN);
+                            let y = if *col == f32::MIN { fp.1 } else { *col + ROW_GAP };
+                            *col = y + NODE_H;
+                            v.ghosts.push(Ghost { name: r.name.clone(), kind: r.kind, file: r.file.clone(), line: r.line, pos: (x, y) });
+                            v.size = (v.size.0.max(x + NODE_W), v.size.1.max(y + NODE_H));
+                            at.insert(key, (x, y));
+                            (x, y)
+                        }
+                    };
+                    v.ghost_links.push((right(fp), left(gp)));
+                }
+                None => {}
+            }
+        }
+        // what a removed symbol used, when that is drawn
+        for l in c.links.iter().filter(|l| !l.added && l.from_idx.is_none() && l.kind != EdgeKind::Defines) {
+            if let (Some(&gp), Some(&tp)) = (at.get(&(l.from_file.clone(), l.from.clone())), l.to_idx.and_then(|t| v.pos.get(&t))) {
+                v.ghost_links.push((right(gp), left(tp)));
+            }
+        }
     }
 
     fn screen_of(&self, i: usize) -> Option<(f32, f32)> {
@@ -3773,7 +4011,7 @@ fn no_fold() -> gpui::AnyElement {
 /// Hover tooltip: a title line and an optional muted detail line.
 struct Tip {
     title: gpui::SharedString,
-    detail: Option<&'static str>,
+    detail: Option<gpui::SharedString>,
 }
 
 impl Render for Tip {
@@ -3790,13 +4028,18 @@ impl Render for Tip {
             .text_xs()
             .text_color(rgb(INK))
             .child(self.title.clone())
-            .when_some(self.detail, |d, t| d.child(div().mt(px(2.)).text_color(rgb(MUTED)).child(t)))
+            .when_some(self.detail.clone(), |d, t| d.child(div().mt(px(2.)).text_color(rgb(MUTED)).child(t)))
     }
 }
 
 fn tip(title: impl Into<gpui::SharedString>, detail: Option<&'static str>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    tip_with(title, detail.map(gpui::SharedString::new_static))
+}
+
+/// `tip` with a detail line made at run time.
+fn tip_with(title: impl Into<gpui::SharedString>, detail: Option<gpui::SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
     let title = title.into();
-    move |_, cx| cx.new(|_| Tip { title: title.clone(), detail }).into()
+    move |_, cx| cx.new(|_| Tip { title: title.clone(), detail: detail.clone() }).into()
 }
 
 /// Square icon-only action button (tool window header, search field).
@@ -4514,6 +4757,8 @@ impl Render for GraphView {
             .unwrap_or_default();
         // draw highlighted edges last so they sit on top
         edge_list.sort_by_key(|e| e.3);
+        // links gone since the last commit: dashed red
+        let ghost_lines: Vec<(Pt, Pt)> = self.view.ghost_links.iter().map(|&(a, b)| (to_screen(a.0, a.1), to_screen(b.0, b.1))).collect();
         let has_graph = !self.view.nodes.is_empty();
         let bg_canvas = canvas(
             |_, _, _| (),
@@ -4560,6 +4805,10 @@ impl Render for GraphView {
                     // of a big graph there, and a context link still has its amber
                     let dash = (matches!(kind, EdgeKind::Context | EdgeKind::Defines) && z >= TEXT_ZOOM).then_some((5.0, 4.0));
                     strokes.curve(c4, w, dash, c);
+                }
+                for &(f, t) in &ghost_lines {
+                    let w = (1.8 * z.sqrt()).clamp(1.0, 3.0);
+                    strokes.curve(edge_curve(f, t, z), w, Some((5.0, 4.0)), hsla(GONE_FG, 0.7));
                 }
 
                 // ---- "Play flow" ----
@@ -4693,6 +4942,11 @@ impl Render for GraphView {
             }
             let s = &self.graph.symbols[i];
             let is_sel = selected == Some(i);
+            // new / edited since HEAD: a coloured border and a badge
+            let chg = self.change_of(i);
+            // unchanged, but uses changed code: a dashed blue border (where the change may show)
+            let affected = chg.is_none() && self.changes.as_ref().is_some_and(|c| c.affected.contains(&i));
+            let chg_border = chg.map(|c| change_colors(c).0).or(affected.then_some(AFFECT_BORDER));
             // flow: reached cards get a pink border; the one running now (top of the stack,
             // or just reached in waves) is tinted too
             let (reached, active) = match (frame.as_ref(), trace) {
@@ -4730,13 +4984,15 @@ impl Render for GraphView {
                     bg: bg.into(),
                     border: rgb(if is_sel || reached {
                         ACCENT
+                    } else if let Some(c) = chg_border {
+                        c
                     } else if hover {
                         0xcbd5e1
                     } else {
                         SOFT_BORDER
                     })
                     .into(),
-                    border_w: if active { 2.0 } else { 1.0 },
+                    border_w: if active || (chg.is_some() && !is_sel && !reached) { 2.0 } else { 1.0 },
                     strip: color,
                     opacity: opacity.unwrap_or(1.0),
                 });
@@ -4758,8 +5014,9 @@ impl Render for GraphView {
                 .rounded(px(12.0 * z))
                 .bg(bg)
                 .border_1()
-                .when(active, |d| d.border_2())
-                .border_color(if is_sel || reached { rgb(ACCENT) } else { rgb(SOFT_BORDER) })
+                .when(active || (chg.is_some() && !is_sel && !reached), |d| d.border_2())
+                .when(affected && !is_sel && !reached, |d| d.border_dashed())
+                .border_color(if is_sel || reached { rgb(ACCENT) } else { rgb(chg_border.unwrap_or(SOFT_BORDER)) })
                 .when(fancy, |d| d.shadow_sm())
                 .cursor_pointer()
                 .hover(|st| st.border_color(rgb(if is_sel || reached { ACCENT } else { 0xcbd5e1 })))
@@ -4796,6 +5053,20 @@ impl Render for GraphView {
                                 .text_color(rgb(MUTED))
                                 .child(kind_name(s.kind)),
                         )
+                        .when_some(chg, |d, c| {
+                            let (fg, bg) = change_colors(c);
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(bg))
+                                    .text_size(px(9.0 * z))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(fg))
+                                    .child(c.label()),
+                            )
+                        })
                         .children(s.wraps.iter().map(|w| {
                             let (fg, bg) = wrap_colors(*w);
                             div()
@@ -4983,6 +5254,95 @@ impl Render for GraphView {
                         .border_color(rgb(0xffffff)),
                 );
             }
+        }
+        // removed since the last commit: faded, dashed, struck-through cards
+        for (gi, gh) in self.view.ghosts.iter().enumerate() {
+            let (sx, sy) = to_screen(gh.pos.0, gh.pos.1);
+            let (nw, nh) = (NODE_W * z, NODE_H * z);
+            if !on_screen(sx, sy, nw + 40.0, nh) {
+                continue;
+            }
+            if !show_text {
+                flat_cards.push(FlatCard {
+                    bounds: (sx, sy, nw, nh),
+                    bg: rgb(CANVAS).into(),
+                    border: rgb(GONE_FG).into(),
+                    border_w: 1.0,
+                    strip: kind_color(gh.kind),
+                    opacity: 0.5,
+                });
+                continue;
+            }
+            area = area.child(
+                div()
+                    .id(("ghost", gi))
+                    .absolute()
+                    .left(px(sx))
+                    .top(px(sy))
+                    .w(px(nw))
+                    .h(px(nh))
+                    .opacity(0.7)
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(px(12.0 * z))
+                    .bg(rgb(CANVAS))
+                    .border_2()
+                    .border_dashed()
+                    .border_color(rgb(GONE_FG))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .tooltip(tip_with(
+                        format!("{} was removed", gh.name),
+                        Some(format!("It was in {}:{} in the last commit", gh.file, gh.line).into()),
+                    ))
+                    .child(
+                        div()
+                            .h(px(22.0 * z))
+                            .px(px(10.0 * z))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0 * z))
+                            .child(div().flex_shrink_0().w(px(7.0 * z)).h(px(7.0 * z)).rounded_full().border_1().border_color(kind_color(gh.kind)))
+                            .child(div().text_size(px(10.0 * z)).font_family(MONO_FONT).text_color(rgb(MUTED)).child(kind_name(gh.kind)))
+                            .child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(tint(GONE_FG, 0.12))
+                                    .text_size(px(9.0 * z))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(GONE_FG))
+                                    .child("removed"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(10.0 * z))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(13.5 * z))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(MUTED))
+                                    .line_through()
+                                    .truncate()
+                                    .child(gh.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5 * z))
+                                    .text_color(rgb(MUTED))
+                                    .truncate()
+                                    .child(format!("{}:{}", short_file(&gh.file), gh.line)),
+                            ),
+                    ),
+            );
         }
         if !flat_cards.is_empty() {
             area = area.child(
@@ -5309,6 +5669,91 @@ impl Render for GraphView {
             let row = |cells: Vec<gpui::AnyElement>| div().flex().flex_row().gap(px(4.)).children(cells);
             side = side.child(div().mt(px(8.)).mx(px(9.)).flex().flex_col().gap(px(4.)).child(row(cells)).child(row(second_row)));
 
+            // uncommitted changes against git's HEAD: what moved, and what got worse or better
+            let num = |n: usize, prefix: &str, color: u32| {
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(if n == 0 { 0x9ca3af } else { color }))
+                    .child(format!("{prefix}{n}"))
+            };
+            let strip = div()
+                .id("f-changed")
+                .mt(px(4.))
+                .mx(px(9.))
+                .h(px(26.))
+                .px(px(8.))
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(6.))
+                .border_1();
+            match (&self.changes, &self.changes_note) {
+                (Some(c), _) => {
+                    let on = f.changed;
+                    let (added, edited) = (c.count(changes::Status::Added), c.count(changes::Status::Edited));
+                    let (worse, better) = (c.worse(), c.better());
+                    let detail = if c.is_empty() {
+                        "Nothing differs from the last commit".to_string()
+                    } else {
+                        format!(
+                            "{} changed since {}: {added} new, {edited} edited, {} removed symbols. {worse} problems added, {better} fixed. Click to show only what changed.",
+                            if c.files == 1 { "1 file".to_string() } else { format!("{} files", c.files) },
+                            c.head,
+                            c.removed.len()
+                        )
+                    };
+                    let tip_title = if on { "Changes since HEAD (on)" } else { "Changes since HEAD" };
+                    side = side.child(
+                        strip
+                            .cursor_pointer()
+                            .when(on, |d| d.bg(tint(EDIT_FG, 0.12)).border_color(tint(EDIT_FG, 0.45)))
+                            .when(!on, |d| d.border_color(rgb(SOFT_BORDER)).hover(|s| s.bg(rgb(TITLE_HOVER))))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .when(on, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                                    .text_color(rgb(if on { EDIT_FG } else { INK }))
+                                    .child("Changes"),
+                            )
+                            .child(div().text_xs().font_family(MONO_FONT).text_color(rgb(MUTED)).child(c.head.clone()))
+                            .child(div().flex_1())
+                            .when(c.is_empty(), |d| d.child(div().text_xs().text_color(rgb(MUTED)).child("none")))
+                            .when(!c.is_empty(), |d| {
+                                d.child(num(added, "+", ADD_FG))
+                                    .child(num(edited, "~", EDIT_FG))
+                                    .child(num(c.removed.len(), "\u{2212}", GONE_FG))
+                                    .child(div().w(px(1.)).h(px(12.)).bg(rgb(BORDER)))
+                                    .child(num(worse, "\u{26a0} ", 0xb45309))
+                                    .child(num(better, "\u{2713} ", ADD_FG))
+                            })
+                            .tooltip(tip_with(tip_title, Some(detail.into())))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.filters.changed = !this.filters.changed;
+                                this.refilter(true);
+                                cx.notify();
+                            })),
+                    );
+                }
+                (None, note) => {
+                    let text = match note {
+                        Some(n) => n.clone(),
+                        None if self.changes_busy => "Comparing with the last commit\u{2026}".into(),
+                        None => String::new(),
+                    };
+                    if !text.is_empty() {
+                        side = side.child(
+                            strip
+                                .border_color(rgb(SOFT_BORDER))
+                                .child(div().text_xs().text_color(rgb(INK)).child("Changes"))
+                                .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_xs().text_color(rgb(0x9ca3af)).child(text)),
+                        );
+                    }
+                }
+            }
+
             // scope: the counts only look at the selection and what's below it
             let scope_label = match (self.filter_scope, &self.focus_file) {
                 (Some(sc), _) => Some((Some(g.symbols[sc].kind), g.symbols[sc].name.clone(), self.scope_set.len())),
@@ -5510,6 +5955,68 @@ impl Render for GraphView {
                         })),
                 );
             }
+            // changes: what the edit made worse or better, and what it removed, before the symbols
+            if let Some(c) = self.changes.as_ref().filter(|_| self.filters.changed) {
+                let issues: Vec<&changes::Issue> = c.issues.iter().filter(|x| x.sym.is_none_or(|i| self.in_scope(i))).collect();
+                if !issues.is_empty() {
+                    list.push(section("Since the last commit").px_3().into_any_element());
+                }
+                for (n, x) in issues.into_iter().take(100).enumerate() {
+                    let (mark, color) = if x.worse { ("\u{26a0}", 0xb45309) } else { ("\u{2713}", ADD_FG) };
+                    let sym = x.sym;
+                    let name = sym.map(|i| g.symbols[i].name.clone());
+                    list.push(
+                        row(("chg-issue", n), 0, sym.is_some() && selected == sym)
+                            .when_some(sym, |d, i| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_from_list(i);
+                                    cx.notify();
+                                }))
+                            })
+                            .when(sym.is_none(), |d| d.cursor_default())
+                            .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(rgb(color)).child(mark))
+                            .when_some(name, |d, nm| d.child(div().flex_shrink_0().text_sm().child(nm)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(rgb(if x.worse { 0x92400e } else { MUTED }))
+                                    .child(x.text.clone()),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                let removed: Vec<&changes::Removed> = c
+                    .removed
+                    .iter()
+                    .filter(|r| self.focus_file.as_ref().is_none_or(|f| &r.file == f) && self.filter_scope.is_none())
+                    .collect();
+                if !removed.is_empty() {
+                    list.push(section(&format!("Removed \u{b7} {}", removed.len())).px_3().into_any_element());
+                }
+                for (n, r) in removed.into_iter().take(100).enumerate() {
+                    list.push(
+                        row(("chg-gone", n), 0, false)
+                            .cursor_default()
+                            .child(div().w(px(7.)).h(px(7.)).flex_shrink_0().rounded_full().border_1().border_color(kind_color(r.kind)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_sm()
+                                    .text_color(rgb(GONE_FG))
+                                    .line_through()
+                                    .child(r.name.clone()),
+                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).whitespace_nowrap().child(format!("{}:{}", short_file(&r.file), r.line)))
+                            .into_any_element(),
+                    );
+                }
+            }
             list.push(head.into_any_element());
             // (header label, best pair to compare, members)
             let groups: Vec<(String, Option<(usize, usize)>, Vec<usize>)> = if clustered {
@@ -5607,6 +6114,7 @@ impl Render for GraphView {
                     let t = &g.symbols[i];
                     let warns = t.warnings();
                     let dup = t.similar.first().map(|m| m.score);
+                    let chg = self.change_of(i).filter(|_| self.filters.changed);
                     list.push(
                         row(("fhit", shown), 1, selected == Some(i))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -5624,6 +6132,10 @@ impl Render for GraphView {
                             .when(!self.in_scope(i), |d| {
                                 d.text_color(rgb(MUTED))
                                     .child(div().text_xs().text_color(rgb(0x9ca3af)).whitespace_nowrap().child("outside"))
+                            })
+                            .when_some(chg, |d, c| {
+                                let (fg, bg) = change_colors(c);
+                                d.child(div().px(px(4.)).rounded(px(4.)).bg(rgb(bg)).text_xs().text_color(rgb(fg)).whitespace_nowrap().child(c.label()))
                             })
                             .when_some(dup.filter(|_| dup_mode && !clustered), |d, score| {
                                 d.child(div().text_xs().text_color(rgb(DUP_FG)).whitespace_nowrap().child(pct(score)))
@@ -6591,6 +7103,121 @@ impl Render for GraphView {
                             .child(div().text_sm().child(name))
                             .child(div().min_w(px(0.)).overflow_hidden().text_xs().text_color(rgb(MUTED)).child(dir)),
                     );
+                }
+            }
+
+            // what this change did to it, against git's HEAD
+            if let Some(c) = self.changes.as_ref() {
+                let st = c.status.get(&sel).copied();
+                let issues: Vec<&changes::Issue> = c.issues_of(sel).collect();
+                let links: Vec<&changes::LinkChange> = c.links_of(sel).collect();
+                // unchanged itself: the changed code it uses directly
+                let mut uses: Vec<usize> = if st.is_none() {
+                    self.graph
+                        .out_edges(sel)
+                        .filter(|e| e.kind != EdgeKind::Defines && c.status.contains_key(&e.to))
+                        .map(|e| e.to)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                uses.sort_unstable();
+                uses.dedup();
+                if st.is_some() || !issues.is_empty() || !links.is_empty() || !uses.is_empty() {
+                    p = p.child(section("Since the last commit"));
+                    let what = match st {
+                        Some(changes::Status::Added) => format!("New since {}", c.head),
+                        Some(changes::Status::Edited) => format!("Code edited since {}", c.head),
+                        None if !uses.is_empty() => "Unchanged, but uses code that changed:".to_string(),
+                        None => format!("Code unchanged since {}; what it links to changed", c.head),
+                    };
+                    let (fg, bg) = st.map(change_colors).unwrap_or((MUTED, 0xf1f5f9));
+                    p = p.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .when_some(st, |d, s| {
+                                d.child(div().px(px(5.)).rounded(px(4.)).bg(rgb(bg)).text_xs().font_family(MONO_FONT).text_color(rgb(fg)).child(s.label()))
+                            })
+                            .child(div().flex_1().min_w(px(0.)).text_sm().text_color(rgb(MUTED)).child(what)),
+                    );
+                    for (n, u) in uses.into_iter().take(20).enumerate() {
+                        let (name, s) = (self.graph.symbols[u].name.clone(), c.status[&u]);
+                        let (fg, bg) = change_colors(s);
+                        p = p.child(
+                            div()
+                                .id(("chg-uses", n))
+                                .px_2()
+                                .py(px(3.))
+                                .rounded(px(6.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .hover(|st| st.bg(rgb(ACCENT_50)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reveal(u);
+                                    cx.notify();
+                                }))
+                                .child(div().px(px(5.)).rounded(px(4.)).bg(rgb(bg)).text_xs().font_family(MONO_FONT).text_color(rgb(fg)).child(s.label()))
+                                .child(div().min_w(px(0.)).text_sm().child(name)),
+                        );
+                    }
+                    for x in issues {
+                        let (mark, color) = if x.worse { ("\u{26a0}", 0xb45309) } else { ("\u{2713}", ADD_FG) };
+                        p = p.child(
+                            div()
+                                .px_2()
+                                .py(px(3.))
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(div().w(px(12.)).flex_shrink_0().text_sm().text_color(rgb(color)).child(mark))
+                                .child(div().min_w(px(0.)).text_sm().text_color(rgb(if x.worse { 0x92400e } else { INK })).child(x.text.clone())),
+                        );
+                    }
+                    for (n, l) in links.into_iter().take(40).enumerate() {
+                        let outgoing = l.from_idx == Some(sel);
+                        let (other, other_idx) = if outgoing { (l.to.clone(), l.to_idx) } else { (l.from.clone(), l.from_idx) };
+                        let verb = match l.kind {
+                            EdgeKind::Renders => "renders",
+                            EdgeKind::Calls => "calls",
+                            EdgeKind::Handler => "passes",
+                            EdgeKind::Context => "provides context to",
+                            EdgeKind::Defines => "defines",
+                        };
+                        let text = match (outgoing, l.added) {
+                            (true, true) => format!("now {verb} {other}"),
+                            (true, false) => format!("no longer {verb} {other}"),
+                            (false, true) => format!("{other} now {verb} it"),
+                            (false, false) => format!("{other} no longer {verb} it"),
+                        };
+                        let (mark, color) = if l.added { ("+", ADD_FG) } else { ("\u{2212}", GONE_FG) };
+                        p = p.child(
+                            div()
+                                .id(("chg-link", n))
+                                .px_2()
+                                .py(px(3.))
+                                .rounded(px(6.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .when_some(other_idx, |d, o| {
+                                    d.cursor_pointer().hover(|st| st.bg(rgb(ACCENT_50))).on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reveal(o);
+                                        cx.notify();
+                                    }))
+                                })
+                                .child(div().w(px(12.)).flex_shrink_0().text_sm().font_weight(gpui::FontWeight::BOLD).text_color(rgb(color)).child(mark))
+                                .child(div().min_w(px(0.)).text_sm().child(text)),
+                        );
+                    }
                 }
             }
 
