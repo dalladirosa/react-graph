@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod alias;
+mod changes;
 mod compare;
 mod drill;
 
@@ -9,6 +10,7 @@ mod cover;
 
 mod data;
 mod export;
+mod files;
 mod flow;
 mod graph;
 mod path;
@@ -304,6 +306,19 @@ struct ViewData {
     has_in: HashSet<usize>,
     has_out: HashSet<usize>,
     kids: HashMap<usize, usize>,
+    /// removed since HEAD: faded cards where they used to be, after the drawn card that used them
+    ghosts: Vec<Ghost>,
+    /// links that are gone since HEAD, from / to graph points (card edges)
+    ghost_links: Vec<((f32, f32), (f32, f32))>,
+}
+
+/// A symbol the last commit has and the working tree doesn't, drawn as a faded card.
+struct Ghost {
+    name: String,
+    kind: SymKind,
+    file: String,
+    line: usize,
+    pos: (f32, f32),
 }
 
 struct GraphView {
@@ -404,6 +419,26 @@ struct GraphView {
     refreshing: bool,
     /// files changed again while loading / rebuilding: rebuild once more when done
     reload_pending: bool,
+    /// the project as committed in git's HEAD (kept until HEAD moves)
+    head: Option<std::sync::Arc<changes::Head>>,
+    /// uncommitted changes: this graph against HEAD's. None outside a git repository
+    changes: Option<changes::Changes>,
+    /// why there are no changes to show ("Not a git repository", an error), when there aren't
+    changes_note: Option<String>,
+    /// a comparison with HEAD is running / was asked for again meanwhile
+    changes_busy: bool,
+    changes_pending: bool,
+    /// watches the repository's git folder for commits and checkouts
+    git_watcher: Option<notify::RecommendedWatcher>,
+
+    /// "Group by: Files": the canvas shows one card per file (`fg`) instead of one per symbol.
+    /// Node ids on the canvas (`view`, `menu`, `hover_card`) are then file cards of `fg.graph`.
+    by_file: bool,
+    fg: files::FileGraph,
+    /// file cards whose children are revealed / shown at top level / picked (by file card id)
+    f_expanded: HashSet<usize>,
+    f_pinned: Vec<usize>,
+    f_sel: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -435,13 +470,40 @@ struct Filters {
 
     /// calls out to an API, a data-fetching hook or a store itself
     data: bool,
+    /// new or edited since git's HEAD commit
+    changed: bool,
     /// Component, Hook, Function
     kinds: [bool; 3],
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.dup || self.exact || self.warn || self.unused || self.memo || self.cycle || self.untested || self.data || self.kinds.iter().any(|&k| k)
+        self.dup
+            || self.exact
+            || self.warn
+            || self.unused
+            || self.memo
+            || self.cycle
+            || self.untested
+            || self.data
+            || self.changed
+            || self.kinds.iter().any(|&k| k)
+    }
+}
+
+const ADD_FG: u32 = 0x15803d;
+const ADD_BG: u32 = 0xdcfce7;
+const EDIT_FG: u32 = 0x1d4ed8;
+const EDIT_BG: u32 = 0xdbeafe;
+const GONE_FG: u32 = 0xb91c1c;
+/// border of an unchanged card that uses changed code (dashed, 1px)
+const AFFECT_BORDER: u32 = 0x3b82f6;
+
+/// (text, background) of a change badge
+fn change_colors(s: changes::Status) -> (u32, u32) {
+    match s {
+        changes::Status::Added => (ADD_FG, ADD_BG),
+        changes::Status::Edited => (EDIT_FG, EDIT_BG),
     }
 }
 
@@ -816,6 +878,17 @@ impl GraphView {
             watcher: None,
             refreshing: false,
             reload_pending: false,
+            head: None,
+            changes: None,
+            changes_note: None,
+            changes_busy: false,
+            changes_pending: false,
+            git_watcher: None,
+            by_file: false,
+            fg: files::FileGraph::default(),
+            f_expanded: HashSet::new(),
+            f_pinned: Vec::new(),
+            f_sel: None,
         }
     }
 
@@ -860,11 +933,12 @@ impl GraphView {
     /// The drawn cards and links, for export.
     fn drawn(&self) -> export::Drawn<'_> {
         export::Drawn {
-            graph: &self.graph,
+            graph: self.canvas_graph(),
             nodes: &self.view.nodes,
             edges: &self.view.edges,
             pos: &self.view.pos,
             card: (NODE_W, NODE_H),
+            files: self.by_file,
         }
     }
 
@@ -1858,7 +1932,7 @@ impl GraphView {
             self.cmp_w(vw) + 2.0 * MARGIN
         } else if self.showing_code() {
             self.code_w(vw) + 2.0 * MARGIN
-        } else if self.selected.is_some() {
+        } else if self.selected.is_some() || (self.by_file && self.f_sel.is_some()) {
             DETAIL_W + 2.0 * MARGIN
         } else {
             MARGIN
@@ -1888,6 +1962,12 @@ impl GraphView {
             let (_, roots, _) = self.roots();
             self.expanded.extend(roots);
         }
+        // file cards: the same, the picked file (or the entry files) open
+        self.f_expanded.clear();
+        self.f_pinned.clear();
+        self.f_sel = None;
+        let (_, roots, _) = self.file_roots();
+        self.f_expanded.extend(roots);
         self.relayout();
         self.fit_pending = true;
     }
@@ -1911,11 +1991,20 @@ impl GraphView {
         self.set_scope(None);
         self.expanded.clear();
         self.pinned.clear();
+        self.f_expanded.clear();
+        self.f_pinned.clear();
+        self.f_sel = None;
+        self.fg = files::FileGraph::default();
         self.focus_file = None;
         self.tree = DirNode::default();
         self.view = ViewData::default();
         self.status = "Loading…".into();
         self.reload_pending = false;
+        self.head = None;
+        self.changes = None;
+        self.changes_note = None;
+        self.changes_pending = false;
+        self.git_watcher = None;
         self.start_watching(cx);
         cx.notify();
         let task = cx.background_spawn(async move {
@@ -1948,12 +2037,14 @@ impl GraphView {
                     this.prefs.push_recent(root_done.clone());
                     this.prefs.save();
                 }
+                this.fg = files::build(&g);
                 this.graph = g;
                 this.loading = false;
                 this.restore_view();
                 this.relayout();
                 this.fit_pending = true;
                 this.start_view_saver(cx);
+                this.refresh_changes(cx);
                 // files changed while this was loading
                 if std::mem::take(&mut this.reload_pending) {
                     this.reload_graph(cx);
@@ -2030,6 +2121,7 @@ impl GraphView {
                 this.refreshing = false;
                 if this.graph_root_is(&root) && !this.loading {
                     this.apply_reload(g, took);
+                    this.refresh_changes(cx);
                 }
                 if std::mem::take(&mut this.reload_pending) {
                     this.reload_graph(cx);
@@ -2053,6 +2145,7 @@ impl GraphView {
             (f.cycle, "cycle"),
             (f.untested, "untested"),
             (f.data, "data"),
+            (f.changed, "changed"),
         ];
         let kinds = ["component", "hook", "function"];
         let keys = |set: &mut dyn Iterator<Item = usize>| {
@@ -2069,6 +2162,14 @@ impl GraphView {
             selected: self.selected.and_then(|i| self.sym_keys.get(i).cloned()),
             expanded: keys(&mut self.expanded.iter().copied()),
             pinned: keys(&mut self.pinned.iter().copied()),
+            by_file: self.by_file,
+            open_files: {
+                let mut v: Vec<String> =
+                    self.f_expanded.iter().filter_map(|&f| self.fg.graph.file_list.get(f).cloned()).collect();
+                v.sort();
+                v
+            },
+            picked_file: self.f_sel.and_then(|f| self.fg.graph.file_list.get(f).cloned()),
         }
     }
 
@@ -2090,6 +2191,7 @@ impl GraphView {
                     "cycle" => f.cycle = true,
                     "untested" => f.untested = true,
                     "data" => f.data = true,
+                    "changed" => f.changed = true,
                     _ => {}
                 }
             }
@@ -2108,6 +2210,13 @@ impl GraphView {
             self.expanded = v.expanded.iter().filter_map(pick).collect();
             self.pinned = v.pinned.iter().filter_map(pick).collect();
             self.selected = v.selected.as_ref().and_then(pick);
+            self.by_file = v.by_file;
+            self.f_expanded = v.open_files.iter().filter_map(|p| self.fg.by_path.get(p).copied()).collect();
+            self.f_sel = v.picked_file.as_ref().and_then(|p| self.fg.by_path.get(p).copied());
+            if self.by_file && self.f_expanded.is_empty() {
+                let (_, roots, _) = self.file_roots();
+                self.f_expanded.extend(roots);
+            }
             // the picked file open in the explorer
             if let Some(f) = self.focus_file.clone() {
                 let mut acc = String::new();
@@ -2172,6 +2281,19 @@ impl GraphView {
         self.filter_scope = self.filter_scope.and_then(carry);
         self.expanded = self.expanded.iter().filter_map(|&i| carry(i)).collect();
         self.pinned = self.pinned.iter().filter_map(|&i| carry(i)).collect();
+        // the last comparison with HEAD stays up (moved to the new indexes) until the next one is done
+        if let Some(c) = self.changes.as_mut() {
+            c.status = c.status.iter().filter_map(|(&i, &s)| Some((carry(i)?, s))).collect();
+            c.issues.retain_mut(|x| match x.sym {
+                Some(i) => carry(i).map(|n| x.sym = Some(n)).is_some(),
+                None => true,
+            });
+            for l in &mut c.links {
+                l.from_idx = l.from_idx.and_then(carry);
+                l.to_idx = l.to_idx.and_then(carry);
+            }
+            c.affected = c.affected.iter().filter_map(|&i| carry(i)).collect();
+        }
         // anything holding indexes into the old graph
         self.cmp = None;
         self.flow = None;
@@ -2195,6 +2317,14 @@ impl GraphView {
         for s in g.symbols.iter().filter(|s| s.parent.is_none()) {
             *self.file_syms.entry(s.file.clone()).or_default() += 1;
         }
+        // file cards: carried over by path
+        let fg = files::build(&g);
+        let old_paths = std::mem::take(&mut self.fg.graph.file_list);
+        let fcarry = |f: usize| old_paths.get(f).and_then(|p| fg.by_path.get(p)).copied();
+        self.f_expanded = self.f_expanded.iter().filter_map(|&f| fcarry(f)).collect();
+        self.f_pinned = self.f_pinned.iter().filter_map(|&f| fcarry(f)).collect();
+        self.f_sel = self.f_sel.and_then(fcarry);
+        self.fg = fg;
         self.graph = g;
         self.sym_keys = views::keys(&self.graph);
         self.set_scope(self.filter_scope);
@@ -2291,9 +2421,7 @@ impl GraphView {
 
     /// Nothing references `i` except the symbol that defines it.
     fn is_unused(&self, i: usize) -> bool {
-        // pages, layouts and route handlers are loaded by Next.js itself
-        !self.graph.symbols[i].is_entry()
-            && !self.graph.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
+        self.graph.is_unused(i)
     }
 
     /// Follow selection changes. The selection's own links are drawn (see `relayout`), so the
@@ -2306,6 +2434,16 @@ impl GraphView {
         }
         let prev = self.scope_seen;
         self.scope_seen = self.selected;
+        // grouping by file: the selected symbol's file is the picked card
+        if self.by_file
+            && let Some(s) = self.selected
+        {
+            let f = self.card_of(s);
+            if self.f_sel != Some(f) {
+                self.f_sel = Some(f);
+                self.ensure_file_visible(f);
+            }
+        }
         let hold = std::mem::take(&mut self.scope_hold);
         if !hold {
             self.set_scope(self.selected);
@@ -2386,6 +2524,112 @@ impl GraphView {
             && (!f.untested || self.graph.untested(i))
 
             && (!f.data || !s.data.is_empty())
+            && (!f.changed || self.change_of(i).is_some())
+    }
+
+    /// New or edited since HEAD (nothing outside a git repository).
+    fn change_of(&self, i: usize) -> Option<changes::Status> {
+        self.changes.as_ref().and_then(|c| c.status.get(&i).copied())
+    }
+
+    /// Compare the graph with git's HEAD commit, in the background. HEAD's graph is built once
+    /// per commit; after that only the files on disk are read again.
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        if self.root.is_empty() || self.loading {
+            return;
+        }
+        if self.changes_busy {
+            self.changes_pending = true;
+            return;
+        }
+        self.changes_busy = true;
+        let root = self.root_path.clone();
+        let files = self.graph.file_list.clone();
+        let cached = self.head.clone();
+        let want_dir = self.git_watcher.is_none();
+        let task = cx.background_spawn(async move {
+            let Some(sha) = changes::head_sha(&root) else {
+                return Err("Not a git repository (or no commits yet)".to_string());
+            };
+            let head = match cached.filter(|h| h.sha == sha) {
+                Some(h) => h,
+                None => std::sync::Arc::new(changes::load_head(&root, &sha)?),
+            };
+            let edited = changes::edited_files(&root, &files, &head);
+            let dir = if want_dir { changes::git_dir(&root) } else { None };
+            Ok((head, edited, dir))
+        });
+        let root_done = self.root_path.clone();
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                this.changes_busy = false;
+                if this.graph_root_is(&root_done) && !this.loading {
+                    match res {
+                        Ok((head, edited, dir)) => {
+                            this.changes = Some(changes::diff(&head, &this.graph, &edited));
+                            this.changes_note = None;
+                            this.head = Some(head);
+                            if let Some(d) = dir {
+                                this.watch_git(&d, cx);
+                            }
+                        }
+                        Err(e) => {
+                            this.changes = None;
+                            this.head = None;
+                            this.changes_note = Some(e);
+                        }
+                    }
+                    // the "Changes" filter, and the removed cards, follow the new comparison
+                    this.relayout_keep(this.selected);
+                }
+                if std::mem::take(&mut this.changes_pending) {
+                    this.refresh_changes(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Compare again after a commit, checkout or reset (they move HEAD without touching the
+    /// source files the folder watcher looks at).
+    fn watch_git(&mut self, dir: &std::path::Path, cx: &mut Context<Self>) {
+        use notify::Watcher;
+        use std::sync::mpsc::TryRecvError;
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let Ok(mut w) = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                if !ev.kind.is_access() && ev.paths.iter().any(|p| changes::moves_head(p)) {
+                    tx.send(()).ok();
+                }
+            }
+        }) else {
+            return;
+        };
+        if w.watch(dir, notify::RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        self.git_watcher = Some(w);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let mut dirty = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(()) => dirty = true,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+                if dirty && this.update(cx, |this, cx| this.refresh_changes(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// What the canvas starts from while filtering: every match, and every card on a path to one
@@ -2560,6 +2804,9 @@ impl GraphView {
 
     /// Recompute which nodes are shown (entry points + children of expanded nodes) and where.
     fn relayout(&mut self) {
+        if self.by_file {
+            return self.relayout_files();
+        }
         let (ctx, roots, isolated) = self.roots();
         self.entry_count = roots.len();
         self.isolated = isolated;
@@ -2616,7 +2863,61 @@ impl GraphView {
         let has_in = edges.iter().map(|e| e.to).collect();
         let has_out = edges.iter().map(|e| e.from).collect();
         let kids = order.iter().map(|&i| (i, self.children(i).len())).collect();
-        self.view = ViewData { nodes: order, set, edges, pos, size, has_in, has_out, kids };
+        self.view = ViewData { nodes: order, set, edges, pos, size, has_in, has_out, kids, ..ViewData::default() };
+        self.place_ghosts();
+    }
+
+    /// What the uncommitted changes took away, on the canvas: a dashed red link for every link
+    /// gone between two drawn cards, and a faded card for every removed symbol an open card used
+    /// (in the column after it, under what is already there).
+    fn place_ghosts(&mut self) {
+        let Some(c) = self.changes.as_ref() else { return };
+        let v = &mut self.view;
+        let right = |p: (f32, f32)| (p.0 + NODE_W, p.1 + NODE_H / 2.0);
+        let left = |p: (f32, f32)| (p.0, p.1 + NODE_H / 2.0);
+        // lowest card bottom per column (x rounded), to stack ghosts under it
+        let mut bottom: HashMap<i32, f32> = HashMap::new();
+        for &(x, y) in v.pos.values() {
+            let b = bottom.entry(x.round() as i32).or_insert(f32::MIN);
+            *b = b.max(y + NODE_H);
+        }
+        let mut at: HashMap<(String, String), (f32, f32)> = HashMap::new();
+        for l in c.links.iter().filter(|l| !l.added && l.kind != EdgeKind::Defines) {
+            let Some(&fp) = l.from_idx.and_then(|f| v.pos.get(&f)) else { continue };
+            match l.to_idx {
+                Some(t) => {
+                    if let Some(&tp) = v.pos.get(&t) {
+                        v.ghost_links.push((right(fp), left(tp)));
+                    }
+                }
+                // a removed symbol: only under a card that is open (its children are showing)
+                None if l.from_idx.is_some_and(|f| self.expanded.contains(&f)) => {
+                    let key = (l.to_file.clone(), l.to.clone());
+                    let gp = match at.get(&key) {
+                        Some(&p) => p,
+                        None => {
+                            let Some(r) = c.removed_named(&l.to_file, &l.to) else { continue };
+                            let x = fp.0 + NODE_W + COL_GAP;
+                            let col = bottom.entry(x.round() as i32).or_insert(f32::MIN);
+                            let y = if *col == f32::MIN { fp.1 } else { *col + ROW_GAP };
+                            *col = y + NODE_H;
+                            v.ghosts.push(Ghost { name: r.name.clone(), kind: r.kind, file: r.file.clone(), line: r.line, pos: (x, y) });
+                            v.size = (v.size.0.max(x + NODE_W), v.size.1.max(y + NODE_H));
+                            at.insert(key, (x, y));
+                            (x, y)
+                        }
+                    };
+                    v.ghost_links.push((right(fp), left(gp)));
+                }
+                None => {}
+            }
+        }
+        // what a removed symbol used, when that is drawn
+        for l in c.links.iter().filter(|l| !l.added && l.from_idx.is_none() && l.kind != EdgeKind::Defines) {
+            if let (Some(&gp), Some(&tp)) = (at.get(&(l.from_file.clone(), l.from.clone())), l.to_idx.and_then(|t| v.pos.get(&t))) {
+                v.ghost_links.push((right(gp), left(tp)));
+            }
+        }
     }
 
     fn screen_of(&self, i: usize) -> Option<(f32, f32)> {
@@ -2639,6 +2940,9 @@ impl GraphView {
 
     /// A click on a card: select it (again: deselect); a double click also opens / closes it.
     fn click_card(&mut self, i: usize, clicks: usize) {
+        if self.by_file {
+            return self.click_file(i, clicks);
+        }
         if clicks >= 2 {
             self.toggle_expand(i);
             self.selected = Some(i);
@@ -2708,6 +3012,9 @@ impl GraphView {
 
     /// The right-click menu on a card: the detail panel's actions, without selecting first.
     fn card_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.by_file {
+            return self.file_menu(cx);
+        }
         let (i, (x, y)) = self.menu?;
         let s = self.graph.symbols.get(i)?;
         let kids = self.children(i).len();
@@ -2843,17 +3150,17 @@ impl GraphView {
     }
 
     /// Relayout while keeping `anchor` at the same spot on screen (no jumping around).
+    /// `anchor` is a symbol; grouping by file, its file card stays put (else the picked one).
     fn relayout_keep(&mut self, anchor: Option<usize>) {
-        let before = anchor.and_then(|a| self.screen_of(a));
-        self.relayout();
-        if let (Some(a), Some((sx, sy))) = (anchor, before) {
-            if let Some(&(x, y)) = self.view.pos.get(&a) {
-                self.off = (sx - x * self.zoom, sy - y * self.zoom);
-            }
-        }
+        let anchor = if self.by_file { anchor.map(|s| self.card_of(s)).or(self.f_sel) } else { anchor };
+        self.relayout_keep_card(anchor);
     }
 
+    /// Open / close symbol `i` (grouping by file: its file card).
     fn toggle_expand(&mut self, i: usize) {
+        if self.by_file {
+            return self.toggle_file(self.card_of(i));
+        }
         if !self.expanded.remove(&i) {
             self.expanded.insert(i);
         }
@@ -2861,6 +3168,9 @@ impl GraphView {
     }
 
     fn expand_all(&mut self) {
+        if self.by_file {
+            return self.expand_all_files();
+        }
         let (_, roots, _) = self.roots();
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack: Vec<usize> = roots.into_iter().chain(self.pinned.iter().copied()).collect();
@@ -2875,6 +3185,9 @@ impl GraphView {
     }
 
     fn collapse_all(&mut self) {
+        if self.by_file {
+            return self.collapse_all_files();
+        }
         self.flow = None;
         self.path = None;
         self.expanded.clear();
@@ -2885,6 +3198,15 @@ impl GraphView {
 
     /// Expand the shortest path from something already visible down to `t`, select and center it.
     fn reveal(&mut self, t: usize) {
+        if self.by_file {
+            // its file card, picked and centered; the panel shows the symbol
+            let f = self.card_of(t);
+            self.f_sel = Some(f);
+            self.ensure_file_visible(f);
+            self.selected = Some(t);
+            self.center_on(f);
+            return;
+        }
         self.ensure_visible(t);
         self.selected = Some(t);
         self.center_on(t);
@@ -3059,6 +3381,695 @@ impl GraphView {
         let wy = y0 + (sy - my - py_) / s;
         self.off = (vw / 2.0 - wx * self.zoom, vh / 2.0 - wy * self.zoom);
     }
+}
+
+// ---------------------------------------------------------------- group by file
+
+impl GraphView {
+    /// The graph the canvas draws: one card per file when grouping by file, else per symbol.
+    fn canvas_graph(&self) -> &Graph {
+        if self.by_file { &self.fg.graph } else { &self.graph }
+    }
+
+    /// The canvas card symbol `s` is drawn on.
+    fn card_of(&self, s: usize) -> usize {
+        if self.by_file { self.fg.of_sym.get(s).copied().unwrap_or(s) } else { s }
+    }
+
+    /// The card lit as picked on the canvas.
+    fn picked_card(&self) -> Option<usize> {
+        if self.by_file { self.f_sel } else { self.selected }
+    }
+
+    /// Switch between one card per symbol and one card per file, keeping what is picked in view.
+    fn set_by_file(&mut self, on: bool) {
+        if self.by_file == on || self.loading {
+            return;
+        }
+        // these hold symbol cards
+        self.flow = None;
+        self.path = None;
+        self.path_from = None;
+        self.menu = None;
+        self.hover_card = None;
+        self.by_file = on;
+        if on {
+            if let Some(s) = self.selected {
+                self.f_sel = self.fg.of_sym.get(s).copied();
+            }
+            if self.f_expanded.is_empty() && self.f_pinned.is_empty() {
+                // first look: the entry files open one level, so there is a map to read right away
+                let (_, roots, _) = self.file_roots();
+                self.f_expanded.extend(roots);
+            }
+        }
+        self.relayout();
+        let target = if on { self.f_sel } else { self.selected };
+        match target {
+            Some(t) => {
+                if on {
+                    self.ensure_file_visible(t);
+                } else {
+                    self.ensure_visible(t);
+                }
+                self.fit_pending = false;
+                if self.view.pos.contains_key(&t) {
+                    self.center_on(t);
+                } else {
+                    self.fit_pending = true;
+                }
+            }
+            None => self.fit_pending = true,
+        }
+    }
+
+    /// Opening file card `e.from` through `e` brings in its target. Like symbol cards: unless
+    /// "Hooks & functions" is on, a file only opens into files whose components it uses.
+    fn file_follows(&self, e: &Edge) -> bool {
+        e.kind != EdgeKind::Context && (self.show_functions || self.fg.comp_links.contains(&(e.from, e.to)))
+    }
+
+    fn file_children(&self, f: usize) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        self.fg.graph.out_edges(f).filter(|e| self.file_follows(e) && seen.insert(e.to)).map(|e| e.to).collect()
+    }
+
+    /// (files that use the picked file, roots, component files nothing links to or from)
+    fn file_roots(&self) -> (Vec<usize>, Vec<usize>, usize) {
+        let fg = &self.fg;
+        if let Some(f) = &self.focus_file {
+            let Some(&r) = fg.by_path.get(f) else { return (Vec::new(), Vec::new(), 0) };
+            let mut ctx = Vec::new();
+            for e in fg.graph.in_edges(r) {
+                if !ctx.contains(&e.from) {
+                    ctx.push(e.from);
+                }
+            }
+            return (ctx, vec![r], 0);
+        }
+        let (entries, _) = self.entry_points();
+        let mut roots = Vec::new();
+        for s in entries {
+            let f = fg.of_sym[s];
+            if !roots.contains(&f) {
+                roots.push(f);
+            }
+        }
+        let n = fg.graph.symbols.len();
+        let mut linked = vec![false; n];
+        for e in fg.graph.edges.iter().filter(|e| self.file_follows(e)) {
+            linked[e.from] = true;
+            linked[e.to] = true;
+        }
+        let isolated = (0..n).filter(|&f| !linked[f] && fg.graph.symbols[f].kind == SymKind::Component).count();
+        (Vec::new(), roots, isolated)
+    }
+
+    /// Symbols of file card `f` that pass the sidebar filters.
+    fn file_hits(&self, f: usize) -> usize {
+        self.fg.all.get(f).map_or(0, |all| all.iter().filter(|&&i| self.filter_match(i)).count())
+    }
+
+    /// With filters on: the files holding a match, and the files on the way to them from the roots.
+    fn filtered_files(&self, ctx: Vec<usize>, roots: Vec<usize>) -> Vec<usize> {
+        let g = &self.fg.graph;
+        let n = g.symbols.len();
+        let matches: Vec<usize> = (0..n).filter(|&f| self.file_hits(f) > 0).collect();
+        let mut starts: Vec<usize> = ctx.into_iter().chain(roots).collect();
+        let mut reach = vec![false; n];
+        let walk = |stack: &mut Vec<usize>, reach: &mut Vec<bool>| {
+            while let Some(i) = stack.pop() {
+                if !std::mem::replace(&mut reach[i], true) {
+                    stack.extend(g.out_edges(i).map(|e| e.to));
+                }
+            }
+        };
+        let mut stack = starts.clone();
+        walk(&mut stack, &mut reach);
+        for &m in &matches {
+            if !reach[m] {
+                starts.push(m);
+                stack.push(m);
+                walk(&mut stack, &mut reach);
+            }
+        }
+        let mut keep = vec![false; n];
+        let mut stack = matches;
+        while let Some(i) = stack.pop() {
+            if reach[i] && !std::mem::replace(&mut keep[i], true) {
+                stack.extend(g.in_edges(i).map(|e| e.from));
+            }
+        }
+        for &p in &self.f_pinned {
+            keep[p] = true;
+        }
+        let mut out = Vec::new();
+        let mut seen = vec![false; n];
+        let mut queue: VecDeque<usize> = starts.into_iter().chain(self.f_pinned.iter().copied()).collect();
+        while let Some(i) = queue.pop_front() {
+            if !keep[i] || std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            out.push(i);
+            queue.extend(g.out_edges(i).map(|e| e.to));
+        }
+        out
+    }
+
+    /// `relayout` for file cards: the root files, the children of open ones, and the files using the picked one.
+    fn relayout_files(&mut self) {
+        let (ctx, roots, isolated) = self.file_roots();
+        self.entry_count = roots.len();
+        self.isolated = isolated;
+        let n = self.fg.graph.symbols.len();
+        let mut queue: VecDeque<usize> = if self.filters.active() {
+            self.filtered_files(ctx, roots).into()
+        } else {
+            ctx.into_iter().chain(roots).chain(self.f_pinned.iter().copied()).collect()
+        };
+        let mut set: HashSet<usize> = HashSet::new();
+        let mut order: Vec<usize> = Vec::new();
+        while let Some(f) = queue.pop_front() {
+            if f >= n || !set.insert(f) {
+                continue;
+            }
+            order.push(f);
+            if self.f_expanded.contains(&f) {
+                queue.extend(self.file_children(f));
+            }
+        }
+        let g = &self.fg.graph;
+        let sel = self.f_sel.filter(|s| set.contains(s));
+        let mut users: HashSet<usize> = HashSet::new();
+        if let Some(s) = sel {
+            for o in g.in_edges(s).map(|e| e.from) {
+                if o != s && set.insert(o) {
+                    order.push(o);
+                    users.insert(o);
+                }
+            }
+        }
+        let edges: Vec<Edge> =
+            g.edges.iter().filter(|e| e.from != e.to && set.contains(&e.from) && set.contains(&e.to)).copied().collect();
+        // as in `relayout`: cards drawn only because they use the pick don't push columns around
+        let placed: HashSet<usize> =
+            edges.iter().filter(|e| users.contains(&e.to) && !users.contains(&e.from)).map(|e| e.to).collect();
+        let columns: Vec<Edge> = edges
+            .iter()
+            .filter(|e| !users.contains(&e.from) || (!placed.contains(&e.from) && Some(e.to) == sel))
+            .copied()
+            .collect();
+        let (pos, size) = layout(&order, &columns, g);
+        let has_in = edges.iter().map(|e| e.to).collect();
+        let has_out = edges.iter().map(|e| e.from).collect();
+        let kids = order.iter().map(|&f| (f, self.file_children(f).len())).collect();
+        self.view = ViewData { nodes: order, set, edges, pos, size, has_in, has_out, kids, ..ViewData::default() };
+    }
+
+    /// Relayout while keeping canvas card `anchor` at the same spot on screen.
+    fn relayout_keep_card(&mut self, anchor: Option<usize>) {
+        let before = anchor.and_then(|a| self.screen_of(a));
+        self.relayout();
+        if let (Some(a), Some((sx, sy))) = (anchor, before)
+            && let Some(&(x, y)) = self.view.pos.get(&a)
+        {
+            self.off = (sx - x * self.zoom, sy - y * self.zoom);
+        }
+    }
+
+    fn toggle_file(&mut self, f: usize) {
+        if !self.f_expanded.remove(&f) {
+            self.f_expanded.insert(f);
+        }
+        self.relayout_keep_card(Some(f));
+    }
+
+    /// Pick file card `f` (again: unpick it); a double click also opens / closes it.
+    fn click_file(&mut self, f: usize, clicks: usize) {
+        if clicks >= 2 {
+            self.f_sel = Some(f);
+            if !self.f_expanded.remove(&f) {
+                self.f_expanded.insert(f);
+            }
+        } else {
+            self.f_sel = if self.f_sel == Some(f) && self.selected.is_none() { None } else { Some(f) };
+        }
+        self.drop_selection();
+        self.relayout_keep_card(Some(f));
+    }
+
+    /// Clear the selected symbol for a picked file card: the file panel replaces the symbol's, and
+    /// the filter scope widens back out, without the refit `sync_scope` would do.
+    fn drop_selection(&mut self) {
+        if self.selected.take().is_some() {
+            self.set_scope(None);
+            self.scope_seen = None;
+        }
+    }
+
+    /// Unpick the picked file card.
+    fn unpick_file(&mut self) {
+        let prev = self.f_sel.take();
+        self.relayout_keep_card(prev);
+    }
+
+    /// Select file card `f` from a list: draw it, pick it and center it.
+    fn reveal_file(&mut self, f: usize) {
+        self.drop_selection();
+        self.f_sel = Some(f);
+        self.ensure_file_visible(f);
+        self.relayout();
+        self.center_on(f);
+    }
+
+    fn expand_all_files(&mut self) {
+        let (_, roots, _) = self.file_roots();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut stack: Vec<usize> = roots.into_iter().chain(self.f_pinned.iter().copied()).collect();
+        while let Some(f) = stack.pop() {
+            if seen.insert(f) {
+                self.f_expanded.insert(f);
+                stack.extend(self.file_children(f));
+            }
+        }
+        self.relayout();
+        self.fit_pending = true;
+    }
+
+    fn collapse_all_files(&mut self) {
+        self.f_expanded.clear();
+        self.f_pinned.clear();
+        self.relayout();
+        self.fit_pending = true;
+    }
+
+    /// Draw file card `t`: open the files that lead to it, or pin it when no drawn card does.
+    fn ensure_file_visible(&mut self, t: usize) {
+        if self.view.set.contains(&t) {
+            return;
+        }
+        let mut next: HashMap<usize, usize> = HashMap::new();
+        let mut queue = VecDeque::from([t]);
+        let mut found = None;
+        'bfs: while let Some(n) = queue.pop_front() {
+            for e in self.fg.graph.in_edges(n) {
+                if !self.file_follows(e) || e.from == t || next.contains_key(&e.from) {
+                    continue;
+                }
+                next.insert(e.from, n);
+                if self.view.set.contains(&e.from) {
+                    found = Some(e.from);
+                    break 'bfs;
+                }
+                queue.push_back(e.from);
+            }
+        }
+        match found {
+            Some(mut n) => {
+                while n != t {
+                    self.f_expanded.insert(n);
+                    n = next[&n];
+                }
+            }
+            None if !self.f_pinned.contains(&t) => self.f_pinned.push(t),
+            None => {}
+        }
+        self.relayout();
+        if !self.view.set.contains(&t) && !self.f_pinned.contains(&t) {
+            self.f_pinned.push(t);
+            self.relayout();
+        }
+    }
+
+    /// Change badge of a file card: new when every symbol in it is new, edited when any changed.
+    fn file_change(&self, f: usize) -> Option<changes::Status> {
+        let all = self.fg.all.get(f)?;
+        let st: Vec<changes::Status> = all.iter().filter_map(|&i| self.change_of(i)).collect();
+        if st.is_empty() {
+            None
+        } else if st.len() == all.len() && st.iter().all(|s| *s == changes::Status::Added) {
+            Some(changes::Status::Added)
+        } else {
+            Some(changes::Status::Edited)
+        }
+    }
+
+    /// Warnings on every symbol of file card `f`.
+    fn file_warnings(&self, f: usize) -> usize {
+        self.fg.all.get(f).map_or(0, |all| all.iter().map(|&i| self.graph.symbols[i].warnings()).sum())
+    }
+
+    /// Show file `path` grouped by component: its own symbols, opened, on the canvas.
+    fn show_components_of(&mut self, path: String) {
+        self.set_by_file(false);
+        self.open_file(Some(path));
+    }
+
+    /// The right-click menu on a file card.
+    fn file_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (f, (x, y)) = self.menu?;
+        let fs = self.fg.graph.symbols.get(f)?;
+        let path = fs.file.clone();
+        let kids = self.file_children(f).len();
+        let open = self.f_expanded.contains(&f);
+        let item = |id: &'static str, label: String| {
+            div()
+                .id(id)
+                .px_3()
+                .py(px(5.))
+                .rounded(px(6.))
+                .text_sm()
+                .cursor_pointer()
+                .hover(|st| st.bg(rgb(ACCENT_50)).text_color(rgb(ACCENT)))
+                .child(label)
+        };
+        let sep = || div().my_1().h(px(1.)).bg(rgb(SOFT_BORDER));
+        let mut m = card()
+            .id("card-menu")
+            .occlude()
+            .w(px(220.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .pb(px(2.))
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(MUTED))
+                    .truncate()
+                    .child(path.clone()),
+            )
+            .child({
+                let path = path.clone();
+                item("menu-components", "Show its components".into()).text_color(rgb(ACCENT)).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.menu = None;
+                        this.show_components_of(path.clone());
+                        cx.notify();
+                    },
+                ))
+            });
+        if kids > 0 {
+            let label = if open { "Collapse".to_string() } else { format!("Expand ({kids} file{})", if kids == 1 { "" } else { "s" }) };
+            m = m.child(item("menu-expand", label).on_click(cx.listener(move |this, _, _, cx| {
+                this.menu = None;
+                this.toggle_file(f);
+                cx.notify();
+            })));
+        }
+        if self.focus_file.as_deref() != Some(path.as_str()) {
+            let path = path.clone();
+            m = m.child(item("menu-file", format!("Show only {}", short_file(&path))).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.menu = None;
+                    this.open_file(Some(path.clone()));
+                    this.f_sel = this.fg.by_path.get(&path).copied();
+                    this.relayout();
+                    cx.notify();
+                },
+            )));
+        }
+        m = m.child(sep()).child(item("menu-editor", "\u{2197} Open in editor".into()).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.menu = None;
+                let p = this.root_path.join(&path);
+                this.open_file_at(p, 1, cx);
+                cx.notify();
+            },
+        )));
+        Some(
+            deferred(anchored().position(point(px(x), px(y))).snap_to_window_with_margin(px(8.)).child(m))
+                .with_priority(1)
+                .into_any_element(),
+        )
+    }
+
+    /// The detail panel for a picked file card: what it defines, the files it uses and that use it.
+    fn file_detail(&self, vh: f32, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if !self.by_file || self.selected.is_some() {
+            return None;
+        }
+        let f = self.f_sel?;
+        let fs = self.fg.graph.symbols.get(f)?;
+        let path = fs.file.clone();
+        let g = &self.graph;
+        let fg = &self.fg;
+        let (badge, bcolor) = file_badge(&path);
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+        let kids = self.file_children(f).len();
+        let open = self.f_expanded.contains(&f);
+        let warns = self.file_warnings(f);
+
+        let mut p = card()
+            .id("detail")
+            .occlude()
+            .absolute()
+            .top(px(MARGIN))
+            .right(px(MARGIN))
+            .w(px(DETAIL_W))
+            .max_h(px(vh - 3.0 * MARGIN - MM_H))
+            .overflow_y_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            // header: file type, name, folder, close
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .mt(px(3.))
+                            .flex_shrink_0()
+                            .size(px(24.))
+                            .rounded(px(7.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(tint(bcolor, 0.14))
+                            .text_size(px(9.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_family(MONO_FONT)
+                            .text_color(rgb(bcolor))
+                            .child(badge),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().text_lg().font_weight(gpui::FontWeight::BOLD).child(fs.name.clone()))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(MUTED))
+                                    .child(if dir.is_empty() { "file in the project folder".to_string() } else { format!("{dir}/") }),
+                            ),
+                    )
+                    .child(mini_icon("close", "icons/x.svg", 14.).tooltip(tip("Close", Some("Esc"))).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.unpick_file();
+                            cx.notify();
+                        },
+                    ))),
+            );
+
+        // actions: drill into the file's components, open its links, focus it, open it in the editor
+        let comp_path = path.clone();
+        let focus_path = path.clone();
+        let edit_path = path.clone();
+        let focused = self.focus_file.as_deref() == Some(path.as_str());
+        p = p.child(
+            div()
+                .mt_3()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    panel_action("file-components", "icons/layers.svg", "Show components", false)
+                        .tooltip(tip("Group by component", Some("Switch to component cards, showing this file's symbols")))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.show_components_of(comp_path.clone());
+                            cx.notify();
+                        })),
+                )
+                .when(kids > 0, |d| {
+                    d.child(
+                        panel_action("file-expand", "icons/network.svg", if open { "Collapse" } else { "Expand" }, open)
+                            .tooltip(tip_with(
+                                if open { "Collapse" } else { "Expand" },
+                                Some(gpui::SharedString::from(if open {
+                                    "Hide the files it uses".to_string()
+                                } else {
+                                    format!("Show the {kids} file{} it uses", if kids == 1 { "" } else { "s" })
+                                })),
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_file(f);
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(!focused, |d| {
+                    d.child(
+                        panel_action("file-focus", "icons/focus.svg", "Only this file", false)
+                            .tooltip(tip_with("Focus this file", Some(format!("Show only {} and its links", short_file(&focus_path)).into())))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_file(Some(focus_path.clone()));
+                                this.f_sel = this.fg.by_path.get(&focus_path).copied();
+                                this.relayout();
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(
+                    panel_action("file-editor", "icons/code.svg", "Editor", false)
+                        .tooltip(tip("Open in editor", None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let p = this.root_path.join(&edit_path);
+                            this.open_file_at(p, 1, cx);
+                            cx.notify();
+                        })),
+                ),
+        );
+        if warns > 0 {
+            p = p.child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(rgb(0xb45309))
+                    .child(format!("\u{26a0} {warns} warning{} in this file: select a symbol below to see them", if warns == 1 { "" } else { "s" })),
+            );
+        }
+
+        // what it defines, nested symbols indented under their parent
+        let all = &fg.all[f];
+        p = p.child(section_head("Defines", Some(all.len()), Vec::new()));
+        let depth = |mut i: usize| {
+            let mut d = 0;
+            while let Some(par) = g.symbols[i].parent {
+                d += 1;
+                i = par;
+            }
+            d
+        };
+        let mut rows: Vec<usize> = Vec::new();
+        fn walk(g: &Graph, all: &[usize], i: usize, out: &mut Vec<usize>) {
+            out.push(i);
+            for &c in all.iter().filter(|&&c| g.symbols[c].parent == Some(i)) {
+                walk(g, all, c, out);
+            }
+        }
+        for &m in &fg.members[f] {
+            walk(g, all, m, &mut rows);
+        }
+        for (n, &i) in rows.iter().take(60).enumerate() {
+            let s = &g.symbols[i];
+            let w = s.warnings();
+            let rel = if w > 0 { format!("\u{26a0} {w} \u{b7} :{}", s.line) } else { format!(":{}", s.line) };
+            p = p.child(
+                tree_line(("fdef", n), depth(i).min(4), no_fold(), s.kind, s.name.clone(), false, rel)
+                    .tooltip(tip("Select it", Some("Shows its details; the file card stays picked")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(i);
+                        this.scope_hold = true;
+                        cx.notify();
+                    })),
+            );
+        }
+        if rows.len() > 60 {
+            p = p.child(div().pl(px(22.)).text_xs().text_color(rgb(MUTED)).child(format!("\u{2026}and {} more", rows.len() - 60)));
+        }
+
+        // the files it uses / that use it, with what links them
+        let list = |out: bool| {
+            let mut v: Vec<usize> = Vec::new();
+            let edges: Vec<&Edge> = if out { fg.graph.out_edges(f).collect() } else { fg.graph.in_edges(f).collect() };
+            for e in edges {
+                let o = if out { e.to } else { e.from };
+                if !v.contains(&o) {
+                    v.push(o);
+                }
+            }
+            v.sort_by(|&a, &b| fg.graph.symbols[a].file.cmp(&fg.graph.symbols[b].file));
+            v
+        };
+        for (out, title, id, empty) in [
+            (true, "Uses", "fuse", "Uses nothing from other files"),
+            (false, "Used by", "fby", "Nothing in other files uses it"),
+        ] {
+            let others = list(out);
+            p = p.child(section_head(title, (!others.is_empty()).then_some(others.len()), Vec::new()));
+            if others.is_empty() {
+                p = p.child(div().pl(px(4.)).text_xs().text_color(rgb(MUTED)).child(empty));
+            }
+            for (n, &o) in others.iter().take(40).enumerate() {
+                let other = &fg.graph.symbols[o].file;
+                let rel = if out { fg.summary(f, o) } else { fg.summary(o, f) };
+                p = p.child(
+                    file_line((id, n), other, rel)
+                        .tooltip(tip("Pick this file", Some("Select its card on the canvas")))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reveal_file(o);
+                            cx.notify();
+                        })),
+                );
+            }
+            if others.len() > 40 {
+                p = p.child(div().pl(px(22.)).text_xs().text_color(rgb(MUTED)).child(format!("\u{2026}and {} more", others.len() - 40)));
+            }
+        }
+        Some(p)
+    }
+}
+
+/// One file row in the detail panel: type badge, file name, folder, and what links to it on the right.
+fn file_line(id: (&'static str, usize), path: &str, rel: String) -> Stateful<Div> {
+    let (badge, color) = file_badge(path);
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .h(px(TREE_ROW_H))
+        .pl(px(2.))
+        .pr(px(6.))
+        .rounded(px(5.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(HOVER)))
+        .child(
+            div()
+                .w(px(26.))
+                .flex_shrink_0()
+                .text_size(px(9.))
+                .font_weight(gpui::FontWeight::BOLD)
+                .font_family(MONO_FONT)
+                .text_color(rgb(color))
+                .child(badge),
+        )
+        .child(div().flex_shrink_0().text_sm().text_color(rgb(INK)).child(name.to_string()))
+        .child(div().flex_1().min_w(px(0.)).truncate().text_xs().text_color(rgb(0x9ca3af)).child(dir.to_string()))
+        .child(div().flex_shrink_0().text_xs().text_color(rgb(0x9ca3af)).child(rel))
 }
 
 // ---------------------------------------------------------------- ui bits
@@ -3773,7 +4784,7 @@ fn no_fold() -> gpui::AnyElement {
 /// Hover tooltip: a title line and an optional muted detail line.
 struct Tip {
     title: gpui::SharedString,
-    detail: Option<&'static str>,
+    detail: Option<gpui::SharedString>,
 }
 
 impl Render for Tip {
@@ -3790,13 +4801,18 @@ impl Render for Tip {
             .text_xs()
             .text_color(rgb(INK))
             .child(self.title.clone())
-            .when_some(self.detail, |d, t| d.child(div().mt(px(2.)).text_color(rgb(MUTED)).child(t)))
+            .when_some(self.detail.clone(), |d, t| d.child(div().mt(px(2.)).text_color(rgb(MUTED)).child(t)))
     }
 }
 
 fn tip(title: impl Into<gpui::SharedString>, detail: Option<&'static str>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    tip_with(title, detail.map(gpui::SharedString::new_static))
+}
+
+/// `tip` with a detail line made at run time.
+fn tip_with(title: impl Into<gpui::SharedString>, detail: Option<gpui::SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
     let title = title.into();
-    move |_, cx| cx.new(|_| Tip { title: title.clone(), detail }).into()
+    move |_, cx| cx.new(|_| Tip { title: title.clone(), detail: detail.clone() }).into()
 }
 
 /// Square icon-only action button (tool window header, search field).
@@ -4432,10 +5448,12 @@ impl Render for GraphView {
         let z = self.zoom;
         let (ox, oy) = self.off;
         let selected = self.selected;
+        // the card lit as picked on the canvas (grouping by file: the picked file)
+        let picked = self.picked_card();
         // a playing flow lights its own cards and edges; everything else fades
-        let trace = self.flow.as_ref().map(|f| &f.trace);
+        let trace = self.flow.as_ref().filter(|_| !self.by_file).map(|f| &f.trace);
         // focus mode: cards on the selected card's lineage stay lit, the rest fade
-        let focus = selected
+        let focus = picked
             .filter(|s| trace.is_none() && self.focus_selection && self.view.set.contains(s))
             .map(|s| self.lineage(s));
         let path = self.path.as_ref().filter(|_| trace.is_none());
@@ -4479,7 +5497,7 @@ impl Render for GraphView {
                         if path.is_some_and(|p| p.edges.contains(&k)) { 2 } else { 0 }
                     }
                     None => {
-                        let hot = selected == Some(e.from) || selected == Some(e.to);
+                        let hot = picked == Some(e.from) || picked == Some(e.to);
                         let on_path = focus.as_ref().is_none_or(|(up, down)| {
                             (up.contains(&e.from) && up.contains(&e.to))
                                 || (down.contains(&e.from) && down.contains(&e.to))
@@ -4514,6 +5532,8 @@ impl Render for GraphView {
             .unwrap_or_default();
         // draw highlighted edges last so they sit on top
         edge_list.sort_by_key(|e| e.3);
+        // links gone since the last commit: dashed red
+        let ghost_lines: Vec<(Pt, Pt)> = self.view.ghost_links.iter().map(|&(a, b)| (to_screen(a.0, a.1), to_screen(b.0, b.1))).collect();
         let has_graph = !self.view.nodes.is_empty();
         let bg_canvas = canvas(
             |_, _, _| (),
@@ -4560,6 +5580,10 @@ impl Render for GraphView {
                     // of a big graph there, and a context link still has its amber
                     let dash = (matches!(kind, EdgeKind::Context | EdgeKind::Defines) && z >= TEXT_ZOOM).then_some((5.0, 4.0));
                     strokes.curve(c4, w, dash, c);
+                }
+                for &(f, t) in &ghost_lines {
+                    let w = (1.8 * z.sqrt()).clamp(1.0, 3.0);
+                    strokes.curve(edge_curve(f, t, z), w, Some((5.0, 4.0)), hsla(GONE_FG, 0.7));
                 }
 
                 // ---- "Play flow" ----
@@ -4684,7 +5708,7 @@ impl Render for GraphView {
         let fancy = z >= 0.6;
         let mut flat_cards: Vec<FlatCard> = Vec::new();
         let filtering = self.filters.active();
-        for &i in &self.view.nodes {
+        for &i in self.view.nodes.iter().filter(|_| !self.by_file) {
             let Some(&(gx, gy)) = self.view.pos.get(&i) else { continue };
             let (sx, sy) = to_screen(gx, gy);
             let (nw, nh) = (NODE_W * z, NODE_H * z);
@@ -4693,6 +5717,11 @@ impl Render for GraphView {
             }
             let s = &self.graph.symbols[i];
             let is_sel = selected == Some(i);
+            // new / edited since HEAD: a coloured border and a badge
+            let chg = self.change_of(i);
+            // unchanged, but uses changed code: a dashed blue border (where the change may show)
+            let affected = chg.is_none() && self.changes.as_ref().is_some_and(|c| c.affected.contains(&i));
+            let chg_border = chg.map(|c| change_colors(c).0).or(affected.then_some(AFFECT_BORDER));
             // flow: reached cards get a pink border; the one running now (top of the stack,
             // or just reached in waves) is tinted too
             let (reached, active) = match (frame.as_ref(), trace) {
@@ -4730,13 +5759,15 @@ impl Render for GraphView {
                     bg: bg.into(),
                     border: rgb(if is_sel || reached {
                         ACCENT
+                    } else if let Some(c) = chg_border {
+                        c
                     } else if hover {
                         0xcbd5e1
                     } else {
                         SOFT_BORDER
                     })
                     .into(),
-                    border_w: if active { 2.0 } else { 1.0 },
+                    border_w: if active || (chg.is_some() && !is_sel && !reached) { 2.0 } else { 1.0 },
                     strip: color,
                     opacity: opacity.unwrap_or(1.0),
                 });
@@ -4758,8 +5789,9 @@ impl Render for GraphView {
                 .rounded(px(12.0 * z))
                 .bg(bg)
                 .border_1()
-                .when(active, |d| d.border_2())
-                .border_color(if is_sel || reached { rgb(ACCENT) } else { rgb(SOFT_BORDER) })
+                .when(active || (chg.is_some() && !is_sel && !reached), |d| d.border_2())
+                .when(affected && !is_sel && !reached, |d| d.border_dashed())
+                .border_color(if is_sel || reached { rgb(ACCENT) } else { rgb(chg_border.unwrap_or(SOFT_BORDER)) })
                 .when(fancy, |d| d.shadow_sm())
                 .cursor_pointer()
                 .hover(|st| st.border_color(rgb(if is_sel || reached { ACCENT } else { 0xcbd5e1 })))
@@ -4796,6 +5828,20 @@ impl Render for GraphView {
                                 .text_color(rgb(MUTED))
                                 .child(kind_name(s.kind)),
                         )
+                        .when_some(chg, |d, c| {
+                            let (fg, bg) = change_colors(c);
+                            d.child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(rgb(bg))
+                                    .text_size(px(9.0 * z))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(fg))
+                                    .child(c.label()),
+                            )
+                        })
                         .children(s.wraps.iter().map(|w| {
                             let (fg, bg) = wrap_colors(*w);
                             div()
@@ -4983,6 +6029,341 @@ impl Render for GraphView {
                         .border_color(rgb(0xffffff)),
                 );
             }
+        }
+        // grouping by file: one card per file, listing what it defines
+        for &f in self.view.nodes.iter().filter(|_| self.by_file) {
+            let Some(&(gx, gy)) = self.view.pos.get(&f) else { continue };
+            let (sx, sy) = to_screen(gx, gy);
+            let (nw, nh) = (NODE_W * z, NODE_H * z);
+            if !on_screen(sx, sy, nw + 40.0, nh) {
+                continue;
+            }
+            let fs = &self.fg.graph.symbols[f];
+            let is_sel = picked == Some(f);
+            let chg = self.file_change(f);
+            let color = kind_color(fs.kind);
+            // with a file picked in the explorer, the files that use it are context: faded
+            let dim = !is_sel && self.focus_file.as_ref().is_some_and(|p| &fs.file != p);
+            let faded = !related(f);
+            let hits = if filtering { self.file_hits(f) } else { 0 };
+            let filter_dim = filtering && !is_sel && hits == 0;
+            let opacity = if faded {
+                Some(0.2)
+            } else if dim || filter_dim {
+                Some(0.45)
+            } else {
+                None
+            };
+            let bg = if is_sel { rgb(ACCENT_50) } else { rgb(0xffffff) };
+            let border = if is_sel { ACCENT } else { chg.map_or(SOFT_BORDER, |c| change_colors(c).0) };
+            if !show_text {
+                flat_cards.push(FlatCard {
+                    bounds: (sx, sy, nw, nh),
+                    bg: bg.into(),
+                    border: rgb(if !is_sel && chg.is_none() && self.hover_card == Some(f) { 0xcbd5e1 } else { border }).into(),
+                    border_w: if chg.is_some() && !is_sel { 2.0 } else { 1.0 },
+                    strip: color,
+                    opacity: opacity.unwrap_or(1.0),
+                });
+                continue;
+            }
+            let warns = self.file_warnings(f);
+            let (badge_txt, badge_color) = file_badge(&fs.file);
+            let dir = fs.file.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+            let kids = self.view.kids.get(&f).copied().unwrap_or(0);
+            let members = &self.fg.members[f];
+            const SHOWN: usize = 3;
+            let pill = |fg: u32, bg: u32, t: String| {
+                div()
+                    .flex_shrink_0()
+                    .px(px(4.0 * z))
+                    .rounded(px(4.0 * z))
+                    .bg(rgb(bg))
+                    .text_size(px(9.5 * z))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(fg))
+                    .child(t)
+            };
+            let node = div()
+                .when_some(opacity, |d, o| d.opacity(o))
+                .id(("fnode", f))
+                .absolute()
+                .left(px(sx))
+                .top(px(sy))
+                .w(px(nw))
+                .h(px(nh))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded(px(12.0 * z))
+                .bg(bg)
+                .border_1()
+                .when(chg.is_some() && !is_sel, |d| d.border_2())
+                .border_color(rgb(border))
+                .when(fancy, |d| d.shadow_sm())
+                .cursor_pointer()
+                .hover(|st| st.border_color(rgb(if is_sel { ACCENT } else { 0xcbd5e1 })))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.menu = Some((f, (f32::from(ev.position.x), f32::from(ev.position.y))));
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    this.click_card(f, ev.click_count());
+                    cx.notify();
+                }))
+                // header: file type, folder, then change / filter / warning badges
+                .child(
+                    div()
+                        .h(px(22.0 * z))
+                        .px(px(10.0 * z))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0 * z))
+                        .border_b_1()
+                        .border_color(rgb(SOFT_BORDER))
+                        .child(div().flex_shrink_0().w(px(7.0 * z)).h(px(7.0 * z)).rounded_full().bg(color))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(9.5 * z))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .font_family(MONO_FONT)
+                                .text_color(rgb(badge_color))
+                                .child(badge_txt),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(10.0 * z))
+                                .font_family(MONO_FONT)
+                                .text_color(rgb(MUTED))
+                                .child(if dir.is_empty() { "./".to_string() } else { format!("{dir}/") }),
+                        )
+                        .when_some(chg, |d, c| {
+                            let (fg, bg) = change_colors(c);
+                            d.child(pill(fg, bg, c.label().to_string()).font_family(MONO_FONT))
+                        })
+                        .when(hits > 0, |d| d.child(pill(ACCENT, ACCENT_100, format!("{hits} match"))))
+                        .when(warns > 0, |d| d.child(pill(0xb45309, 0xfef3c7, format!("\u{26a0} {warns}")))),
+                )
+                // file name, then what it defines: a dot per symbol in its kind colour
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(px(10.0 * z))
+                        .pr(px(if kids > 0 { (20.0 * z).clamp(14.0, 22.0) / 2.0 + 6.0 * z } else { 10.0 * z }))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_size(px(13.5 * z))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(INK))
+                                .truncate()
+                                .child(fs.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0 * z))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_size(px(10.5 * z))
+                                .text_color(rgb(MUTED))
+                                .children(members.iter().take(SHOWN).map(|&m| {
+                                    let s = &self.graph.symbols[m];
+                                    div()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(3.0 * z))
+                                        .child(div().w(px(5.0 * z)).h(px(5.0 * z)).rounded_full().bg(kind_color(s.kind)))
+                                        .child(s.name.clone())
+                                }))
+                                .when(members.len() > SHOWN, |d| {
+                                    d.child(div().flex_shrink_0().child(format!("+{}", members.len() - SHOWN)))
+                                }),
+                        ),
+                );
+            area = area.child(node);
+
+            // target handle (left)
+            if self.view.has_in.contains(&f) {
+                let hs = (10.0 * z).clamp(5.0, 10.0);
+                area = area.child(
+                    div()
+                        .when(faded, |d| d.opacity(0.2))
+                        .absolute()
+                        .left(px(sx - hs / 2.0))
+                        .top(px(sy + nh / 2.0 - hs / 2.0))
+                        .w(px(hs))
+                        .h(px(hs))
+                        .rounded_full()
+                        .bg(rgb(HANDLE))
+                        .border_1()
+                        .border_color(rgb(0xffffff)),
+                );
+            }
+            // source handle (right) = open / close toggle: the files this one uses
+            if kids > 0 {
+                let open = self.f_expanded.contains(&f);
+                let bh = (20.0 * z).clamp(14.0, 22.0);
+                let label = if open { "\u{2212}".to_string() } else { format!("+{kids}") };
+                let bw = if open { bh } else { bh + 8.0 * (label.len() as f32 - 1.0).max(0.0) * (bh / 20.0) };
+                let hint = if open {
+                    "Hide the files it uses".to_string()
+                } else {
+                    format!("Show the {kids} file{} it uses", if kids == 1 { "" } else { "s" })
+                };
+                area = area.child(
+                    div()
+                        .when(faded, |d| d.opacity(0.35))
+                        .id(("fexp", f))
+                        .absolute()
+                        .left(px(sx + nw - bh / 2.0))
+                        .top(px(sy + nh / 2.0 - bh / 2.0))
+                        .h(px(bh))
+                        .min_w(px(bw))
+                        .px(px(if open { 0.0 } else { 4.0 }))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(if open { rgb(0xffffff) } else { rgb(ACCENT) })
+                        .border_1()
+                        .border_color(if open { rgb(0xcbd5e1) } else { rgb(ACCENT) })
+                        .text_color(if open { rgb(INK) } else { rgb(ON_ACCENT) })
+                        .text_size(px((11.0 * z).clamp(9.0, 12.0)))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .shadow_sm()
+                        .cursor_pointer()
+                        .hover(|st| st.border_color(rgb(ACCENT)))
+                        .tooltip(tip_with(hint, None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_file(f);
+                            cx.notify();
+                        }))
+                        .child(label),
+                );
+            } else if self.view.has_out.contains(&f) {
+                let hs = (10.0 * z).clamp(5.0, 10.0);
+                area = area.child(
+                    div()
+                        .when(faded, |d| d.opacity(0.2))
+                        .absolute()
+                        .left(px(sx + nw - hs / 2.0))
+                        .top(px(sy + nh / 2.0 - hs / 2.0))
+                        .w(px(hs))
+                        .h(px(hs))
+                        .rounded_full()
+                        .bg(rgb(HANDLE))
+                        .border_1()
+                        .border_color(rgb(0xffffff)),
+                );
+            }
+        }
+        // removed since the last commit: faded, dashed, struck-through cards
+        for (gi, gh) in self.view.ghosts.iter().enumerate() {
+            let (sx, sy) = to_screen(gh.pos.0, gh.pos.1);
+            let (nw, nh) = (NODE_W * z, NODE_H * z);
+            if !on_screen(sx, sy, nw + 40.0, nh) {
+                continue;
+            }
+            if !show_text {
+                flat_cards.push(FlatCard {
+                    bounds: (sx, sy, nw, nh),
+                    bg: rgb(CANVAS).into(),
+                    border: rgb(GONE_FG).into(),
+                    border_w: 1.0,
+                    strip: kind_color(gh.kind),
+                    opacity: 0.5,
+                });
+                continue;
+            }
+            area = area.child(
+                div()
+                    .id(("ghost", gi))
+                    .absolute()
+                    .left(px(sx))
+                    .top(px(sy))
+                    .w(px(nw))
+                    .h(px(nh))
+                    .opacity(0.7)
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(px(12.0 * z))
+                    .bg(rgb(CANVAS))
+                    .border_2()
+                    .border_dashed()
+                    .border_color(rgb(GONE_FG))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .tooltip(tip_with(
+                        format!("{} was removed", gh.name),
+                        Some(format!("It was in {}:{} in the last commit", gh.file, gh.line).into()),
+                    ))
+                    .child(
+                        div()
+                            .h(px(22.0 * z))
+                            .px(px(10.0 * z))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0 * z))
+                            .child(div().flex_shrink_0().w(px(7.0 * z)).h(px(7.0 * z)).rounded_full().border_1().border_color(kind_color(gh.kind)))
+                            .child(div().text_size(px(10.0 * z)).font_family(MONO_FONT).text_color(rgb(MUTED)).child(kind_name(gh.kind)))
+                            .child(
+                                div()
+                                    .px(px(4.0 * z))
+                                    .rounded(px(4.0 * z))
+                                    .bg(tint(GONE_FG, 0.12))
+                                    .text_size(px(9.0 * z))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(GONE_FG))
+                                    .child("removed"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(10.0 * z))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(13.5 * z))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(MUTED))
+                                    .line_through()
+                                    .truncate()
+                                    .child(gh.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5 * z))
+                                    .text_color(rgb(MUTED))
+                                    .truncate()
+                                    .child(format!("{}:{}", short_file(&gh.file), gh.line)),
+                            ),
+                    ),
+            );
         }
         if !flat_cards.is_empty() {
             area = area.child(
@@ -5309,6 +6690,91 @@ impl Render for GraphView {
             let row = |cells: Vec<gpui::AnyElement>| div().flex().flex_row().gap(px(4.)).children(cells);
             side = side.child(div().mt(px(8.)).mx(px(9.)).flex().flex_col().gap(px(4.)).child(row(cells)).child(row(second_row)));
 
+            // uncommitted changes against git's HEAD: what moved, and what got worse or better
+            let num = |n: usize, prefix: &str, color: u32| {
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(if n == 0 { 0x9ca3af } else { color }))
+                    .child(format!("{prefix}{n}"))
+            };
+            let strip = div()
+                .id("f-changed")
+                .mt(px(4.))
+                .mx(px(9.))
+                .h(px(26.))
+                .px(px(8.))
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(6.))
+                .border_1();
+            match (&self.changes, &self.changes_note) {
+                (Some(c), _) => {
+                    let on = f.changed;
+                    let (added, edited) = (c.count(changes::Status::Added), c.count(changes::Status::Edited));
+                    let (worse, better) = (c.worse(), c.better());
+                    let detail = if c.is_empty() {
+                        "Nothing differs from the last commit".to_string()
+                    } else {
+                        format!(
+                            "{} changed since {}: {added} new, {edited} edited, {} removed symbols. {worse} problems added, {better} fixed. Click to show only what changed.",
+                            if c.files == 1 { "1 file".to_string() } else { format!("{} files", c.files) },
+                            c.head,
+                            c.removed.len()
+                        )
+                    };
+                    let tip_title = if on { "Changes since HEAD (on)" } else { "Changes since HEAD" };
+                    side = side.child(
+                        strip
+                            .cursor_pointer()
+                            .when(on, |d| d.bg(tint(EDIT_FG, 0.12)).border_color(tint(EDIT_FG, 0.45)))
+                            .when(!on, |d| d.border_color(rgb(SOFT_BORDER)).hover(|s| s.bg(rgb(TITLE_HOVER))))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .when(on, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                                    .text_color(rgb(if on { EDIT_FG } else { INK }))
+                                    .child("Changes"),
+                            )
+                            .child(div().text_xs().font_family(MONO_FONT).text_color(rgb(MUTED)).child(c.head.clone()))
+                            .child(div().flex_1())
+                            .when(c.is_empty(), |d| d.child(div().text_xs().text_color(rgb(MUTED)).child("none")))
+                            .when(!c.is_empty(), |d| {
+                                d.child(num(added, "+", ADD_FG))
+                                    .child(num(edited, "~", EDIT_FG))
+                                    .child(num(c.removed.len(), "\u{2212}", GONE_FG))
+                                    .child(div().w(px(1.)).h(px(12.)).bg(rgb(BORDER)))
+                                    .child(num(worse, "\u{26a0} ", 0xb45309))
+                                    .child(num(better, "\u{2713} ", ADD_FG))
+                            })
+                            .tooltip(tip_with(tip_title, Some(detail.into())))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.filters.changed = !this.filters.changed;
+                                this.refilter(true);
+                                cx.notify();
+                            })),
+                    );
+                }
+                (None, note) => {
+                    let text = match note {
+                        Some(n) => n.clone(),
+                        None if self.changes_busy => "Comparing with the last commit\u{2026}".into(),
+                        None => String::new(),
+                    };
+                    if !text.is_empty() {
+                        side = side.child(
+                            strip
+                                .border_color(rgb(SOFT_BORDER))
+                                .child(div().text_xs().text_color(rgb(INK)).child("Changes"))
+                                .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_xs().text_color(rgb(0x9ca3af)).child(text)),
+                        );
+                    }
+                }
+            }
+
             // scope: the counts only look at the selection and what's below it
             let scope_label = match (self.filter_scope, &self.focus_file) {
                 (Some(sc), _) => Some((Some(g.symbols[sc].kind), g.symbols[sc].name.clone(), self.scope_set.len())),
@@ -5510,6 +6976,68 @@ impl Render for GraphView {
                         })),
                 );
             }
+            // changes: what the edit made worse or better, and what it removed, before the symbols
+            if let Some(c) = self.changes.as_ref().filter(|_| self.filters.changed) {
+                let issues: Vec<&changes::Issue> = c.issues.iter().filter(|x| x.sym.is_none_or(|i| self.in_scope(i))).collect();
+                if !issues.is_empty() {
+                    list.push(section("Since the last commit").px_3().into_any_element());
+                }
+                for (n, x) in issues.into_iter().take(100).enumerate() {
+                    let (mark, color) = if x.worse { ("\u{26a0}", 0xb45309) } else { ("\u{2713}", ADD_FG) };
+                    let sym = x.sym;
+                    let name = sym.map(|i| g.symbols[i].name.clone());
+                    list.push(
+                        row(("chg-issue", n), 0, sym.is_some() && selected == sym)
+                            .when_some(sym, |d, i| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_from_list(i);
+                                    cx.notify();
+                                }))
+                            })
+                            .when(sym.is_none(), |d| d.cursor_default())
+                            .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(rgb(color)).child(mark))
+                            .when_some(name, |d, nm| d.child(div().flex_shrink_0().text_sm().child(nm)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(rgb(if x.worse { 0x92400e } else { MUTED }))
+                                    .child(x.text.clone()),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                let removed: Vec<&changes::Removed> = c
+                    .removed
+                    .iter()
+                    .filter(|r| self.focus_file.as_ref().is_none_or(|f| &r.file == f) && self.filter_scope.is_none())
+                    .collect();
+                if !removed.is_empty() {
+                    list.push(section(&format!("Removed \u{b7} {}", removed.len())).px_3().into_any_element());
+                }
+                for (n, r) in removed.into_iter().take(100).enumerate() {
+                    list.push(
+                        row(("chg-gone", n), 0, false)
+                            .cursor_default()
+                            .child(div().w(px(7.)).h(px(7.)).flex_shrink_0().rounded_full().border_1().border_color(kind_color(r.kind)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_sm()
+                                    .text_color(rgb(GONE_FG))
+                                    .line_through()
+                                    .child(r.name.clone()),
+                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).whitespace_nowrap().child(format!("{}:{}", short_file(&r.file), r.line)))
+                            .into_any_element(),
+                    );
+                }
+            }
             list.push(head.into_any_element());
             // (header label, best pair to compare, members)
             let groups: Vec<(String, Option<(usize, usize)>, Vec<usize>)> = if clustered {
@@ -5607,6 +7135,7 @@ impl Render for GraphView {
                     let t = &g.symbols[i];
                     let warns = t.warnings();
                     let dup = t.similar.first().map(|m| m.score);
+                    let chg = self.change_of(i).filter(|_| self.filters.changed);
                     list.push(
                         row(("fhit", shown), 1, selected == Some(i))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -5624,6 +7153,10 @@ impl Render for GraphView {
                             .when(!self.in_scope(i), |d| {
                                 d.text_color(rgb(MUTED))
                                     .child(div().text_xs().text_color(rgb(0x9ca3af)).whitespace_nowrap().child("outside"))
+                            })
+                            .when_some(chg, |d, c| {
+                                let (fg, bg) = change_colors(c);
+                                d.child(div().px(px(4.)).rounded(px(4.)).bg(rgb(bg)).text_xs().text_color(rgb(fg)).whitespace_nowrap().child(c.label()))
                             })
                             .when_some(dup.filter(|_| dup_mode && !clustered), |d, score| {
                                 d.child(div().text_xs().text_color(rgb(DUP_FG)).whitespace_nowrap().child(pct(score)))
@@ -5827,10 +7360,18 @@ impl Render for GraphView {
                     .when(!current, |d| d.text_color(rgb(ACCENT)).cursor_pointer().hover(|s| s.underline()))
                     .child(label)
             };
-            let at_top = self.focus_file.is_none() && selected.is_none();
+            // grouping by file: the picked file card, when it isn't the file already in the trail
+            let picked_file = self
+                .f_sel
+                .filter(|_| self.by_file && selected.is_none())
+                .and_then(|f| self.fg.graph.symbols.get(f))
+                .map(|s| s.file.clone())
+                .filter(|p| self.focus_file.as_ref() != Some(p));
+            let at_top = self.focus_file.is_none() && selected.is_none() && picked_file.is_none();
             crumbs = crumbs.child(crumb("crumb-project", "Whole project".into(), at_top).when(!at_top, |d| {
                 d.on_click(cx.listener(|this, _, _, cx| {
                     this.selected = None;
+                    this.f_sel = None;
                     this.widen_to_project();
                     cx.notify();
                 }))
@@ -5841,13 +7382,21 @@ impl Render for GraphView {
                 if !dir.is_empty() {
                     crumbs = crumbs.child(div().flex_shrink_0().text_color(rgb(MUTED)).child(format!("{dir}/")));
                 }
-                let current = selected.is_none();
+                let current = selected.is_none() && picked_file.is_none();
                 crumbs = crumbs.child(crumb("crumb-file", name.to_string(), current).when(!current, |d| {
                     d.on_click(cx.listener(|this, _, _, cx| {
+                        this.f_sel = None;
                         this.widen_to_file();
                         cx.notify();
                     }))
                 }));
+            }
+            if let Some(p) = &picked_file {
+                let (badge, color) = file_badge(p);
+                crumbs = crumbs
+                    .child(sep())
+                    .child(div().flex_shrink_0().text_xs().font_weight(gpui::FontWeight::BOLD).text_color(rgb(color)).child(badge))
+                    .child(crumb("crumb-picked-file", short_file(p).to_string(), true));
             }
             if let Some(s) = selected {
                 let t = &self.graph.symbols[s];
@@ -5861,6 +7410,63 @@ impl Render for GraphView {
             let compact = bar_w < 800.0;
             let label = |l: &'static str| (!compact).then_some(l);
             let mut buttons = div().flex_shrink_0().flex().flex_row().items_center().gap(px(2.));
+            // what a card stands for: a component (hook, function) or a whole file. Sits on the
+            // stats row, which says what is shown.
+            let by_file = self.by_file;
+            let segment = |id: &'static str, path: &'static str, text: &'static str, on: bool| {
+                div()
+                    .id(id)
+                    .h(px(20.))
+                    .px(px(7.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .rounded(px(5.))
+                    .text_xs()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(0xffffff)).shadow_sm().text_color(rgb(ACCENT)).font_weight(gpui::FontWeight::SEMIBOLD))
+                    .when(!on, |d| d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(INK))))
+                    .child(svg_icon(path, 12., Some(if on { ACCENT } else { MUTED })))
+                    .child(text)
+            };
+            let group_switch = div()
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .child(div().text_xs().text_color(rgb(MUTED)).child("Cards"))
+                .child(
+                    div()
+                        .p(px(2.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.))
+                        .rounded(px(7.))
+                        .bg(rgb(HOVER))
+                        .child(
+                            segment("group-symbols", "icons/layers.svg", "Components", !by_file)
+                                .tooltip(tip("One card per component", Some("Components, hooks and functions, linked by what renders and calls what")))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_by_file(false);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            segment("group-files", "icons/file.svg", "Files", by_file)
+                                .tooltip(tip(
+                                    "One card per file",
+                                    Some("Each card lists what the file defines; a link means one file uses another"),
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_by_file(true);
+                                    cx.notify();
+                                })),
+                        ),
+                );
             if self.focus_file.is_some() {
                 let on = self.file_panel && selected.is_none();
                 buttons = buttons
@@ -5909,7 +7515,14 @@ impl Render for GraphView {
                 // which cards a component opens into (every kind of link is always drawn)
                 .child(
                     tb_button("fn-toggle", "icons/braces.svg", label("Hooks & functions"), self.show_functions)
-                        .tooltip(tip("Hooks & functions", Some("Also open components into the hooks and functions they use")))
+                        .tooltip(tip(
+                            "Hooks & functions",
+                            Some(if by_file {
+                                "Also open files into the files of the hooks and functions they use"
+                            } else {
+                                "Also open components into the hooks and functions they use"
+                            }),
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_functions = !this.show_functions;
                             // cards a playing trace runs through may disappear
@@ -5930,6 +7543,24 @@ impl Render for GraphView {
             let plural = |n: usize| if n == 1 { "" } else { "s" };
             let shown = self.view.nodes.len();
             let stats = match &self.focus_file {
+                Some(_) if by_file && self.entry_count == 0 => "No components, hooks or functions in this file".to_string(),
+                Some(_) if by_file => format!(
+                    "This file and the files it uses · {} file{} shown · faded = files that use it",
+                    shown,
+                    plural(shown),
+                ),
+                None if by_file => format!(
+                    "From {} entry file{} · {} file{} shown{}",
+                    self.entry_count,
+                    plural(self.entry_count),
+                    shown,
+                    plural(shown),
+                    if self.isolated > 0 {
+                        format!(" · {} unlinked component file{} hidden", self.isolated, plural(self.isolated))
+                    } else {
+                        String::new()
+                    }
+                ),
                 Some(_) if self.entry_count == 0 => "No components, hooks or functions in this file".to_string(),
                 Some(_) => format!(
                     "{} symbol{} in this file · {} node{} shown · faded = other files",
@@ -5963,7 +7594,7 @@ impl Render for GraphView {
                 .child(div().h(px(40.)).px_3().flex().flex_row().items_center().gap_3().child(crumbs).child(buttons))
                 .child(
                     div()
-                        .h(px(26.))
+                        .h(px(30.))
                         .px_3()
                         .flex()
                         .flex_row()
@@ -5972,6 +7603,8 @@ impl Render for GraphView {
                         .gap_3()
                         .border_t_1()
                         .border_color(rgb(SOFT_BORDER))
+                        .child(group_switch)
+                        .child(div().flex_shrink_0().w(px(1.)).h(px(14.)).bg(rgb(BORDER)))
                         .child(div().flex_1().min_w(px(0.)).truncate().text_xs().text_color(rgb(MUTED)).child(stats))
                         .child(
                             div()
@@ -6117,6 +7750,8 @@ impl Render for GraphView {
                             if this.flow.is_some() {
                                 this.flow = None;
                             } else {
+                                // a flow runs between symbol cards
+                                this.set_by_file(false);
                                 this.start_flow();
                             }
                             cx.notify();
@@ -6594,6 +8229,121 @@ impl Render for GraphView {
                 }
             }
 
+            // what this change did to it, against git's HEAD
+            if let Some(c) = self.changes.as_ref() {
+                let st = c.status.get(&sel).copied();
+                let issues: Vec<&changes::Issue> = c.issues_of(sel).collect();
+                let links: Vec<&changes::LinkChange> = c.links_of(sel).collect();
+                // unchanged itself: the changed code it uses directly
+                let mut uses: Vec<usize> = if st.is_none() {
+                    self.graph
+                        .out_edges(sel)
+                        .filter(|e| e.kind != EdgeKind::Defines && c.status.contains_key(&e.to))
+                        .map(|e| e.to)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                uses.sort_unstable();
+                uses.dedup();
+                if st.is_some() || !issues.is_empty() || !links.is_empty() || !uses.is_empty() {
+                    p = p.child(section("Since the last commit"));
+                    let what = match st {
+                        Some(changes::Status::Added) => format!("New since {}", c.head),
+                        Some(changes::Status::Edited) => format!("Code edited since {}", c.head),
+                        None if !uses.is_empty() => "Unchanged, but uses code that changed:".to_string(),
+                        None => format!("Code unchanged since {}; what it links to changed", c.head),
+                    };
+                    let (fg, bg) = st.map(change_colors).unwrap_or((MUTED, 0xf1f5f9));
+                    p = p.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .when_some(st, |d, s| {
+                                d.child(div().px(px(5.)).rounded(px(4.)).bg(rgb(bg)).text_xs().font_family(MONO_FONT).text_color(rgb(fg)).child(s.label()))
+                            })
+                            .child(div().flex_1().min_w(px(0.)).text_sm().text_color(rgb(MUTED)).child(what)),
+                    );
+                    for (n, u) in uses.into_iter().take(20).enumerate() {
+                        let (name, s) = (self.graph.symbols[u].name.clone(), c.status[&u]);
+                        let (fg, bg) = change_colors(s);
+                        p = p.child(
+                            div()
+                                .id(("chg-uses", n))
+                                .px_2()
+                                .py(px(3.))
+                                .rounded(px(6.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .hover(|st| st.bg(rgb(ACCENT_50)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reveal(u);
+                                    cx.notify();
+                                }))
+                                .child(div().px(px(5.)).rounded(px(4.)).bg(rgb(bg)).text_xs().font_family(MONO_FONT).text_color(rgb(fg)).child(s.label()))
+                                .child(div().min_w(px(0.)).text_sm().child(name)),
+                        );
+                    }
+                    for x in issues {
+                        let (mark, color) = if x.worse { ("\u{26a0}", 0xb45309) } else { ("\u{2713}", ADD_FG) };
+                        p = p.child(
+                            div()
+                                .px_2()
+                                .py(px(3.))
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(div().w(px(12.)).flex_shrink_0().text_sm().text_color(rgb(color)).child(mark))
+                                .child(div().min_w(px(0.)).text_sm().text_color(rgb(if x.worse { 0x92400e } else { INK })).child(x.text.clone())),
+                        );
+                    }
+                    for (n, l) in links.into_iter().take(40).enumerate() {
+                        let outgoing = l.from_idx == Some(sel);
+                        let (other, other_idx) = if outgoing { (l.to.clone(), l.to_idx) } else { (l.from.clone(), l.from_idx) };
+                        let verb = match l.kind {
+                            EdgeKind::Renders => "renders",
+                            EdgeKind::Calls => "calls",
+                            EdgeKind::Handler => "passes",
+                            EdgeKind::Context => "provides context to",
+                            EdgeKind::Defines => "defines",
+                        };
+                        let text = match (outgoing, l.added) {
+                            (true, true) => format!("now {verb} {other}"),
+                            (true, false) => format!("no longer {verb} {other}"),
+                            (false, true) => format!("{other} now {verb} it"),
+                            (false, false) => format!("{other} no longer {verb} it"),
+                        };
+                        let (mark, color) = if l.added { ("+", ADD_FG) } else { ("\u{2212}", GONE_FG) };
+                        p = p.child(
+                            div()
+                                .id(("chg-link", n))
+                                .px_2()
+                                .py(px(3.))
+                                .rounded(px(6.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .when_some(other_idx, |d, o| {
+                                    d.cursor_pointer().hover(|st| st.bg(rgb(ACCENT_50))).on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reveal(o);
+                                        cx.notify();
+                                    }))
+                                })
+                                .child(div().w(px(12.)).flex_shrink_0().text_sm().font_weight(gpui::FontWeight::BOLD).text_color(rgb(color)).child(mark))
+                                .child(div().min_w(px(0.)).text_sm().child(text)),
+                        );
+                    }
+                }
+            }
+
             // what it reaches out to: its own calls, and those of the hooks and functions it calls
             let data_uses = self.graph.data_of(sel);
             if !data_uses.is_empty() {
@@ -6880,6 +8630,8 @@ impl Render for GraphView {
             }
             p
         });
+        // grouping by file, a file card picked: what it defines, the files it uses and that use it
+        let detail = detail.or_else(|| self.file_detail(vh, cx));
         // whole-file source (toolbar "Source" button, nothing selected)
         let detail = detail.or_else(|| {
             let f = self.focus_file.clone().filter(|_| show_code)?;
@@ -7253,7 +9005,7 @@ impl Render for GraphView {
             .iter()
             .filter_map(|i| {
                 self.view.pos.get(i).map(|&(x, y)| {
-                    let c: Hsla = if selected == Some(*i) {
+                    let c: Hsla = if picked == Some(*i) {
                         rgb(ACCENT).into()
                     } else if focus.is_some() && related(*i) {
                         rgb(ACCENT_300).into()
@@ -7399,6 +9151,8 @@ impl Render for GraphView {
                         } else if this.query.is_empty() {
                             if this.selected.is_some() {
                                 this.selected = None;
+                            } else if this.by_file && this.f_sel.is_some() && !this.showing_code() {
+                                this.unpick_file();
                             } else {
                                 this.file_panel = false;
                             }
@@ -7409,6 +9163,8 @@ impl Render for GraphView {
                     "enter" => {
                         if let Some(s) = this.selected {
                             this.toggle_expand(s);
+                        } else if let Some(f) = this.f_sel.filter(|_| this.by_file) {
+                            this.toggle_file(f);
                         }
                     }
                     _ => match &k.key_char {

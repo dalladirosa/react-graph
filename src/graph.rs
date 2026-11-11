@@ -351,6 +351,16 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// A graph made from given symbols and links (a derived view, such as one card per file).
+    pub fn from_parts(symbols: Vec<Symbol>, edges: Vec<Edge>, file_list: Vec<String>) -> Graph {
+        let n = symbols.len();
+        let (mut out, mut inc) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+        for (ei, e) in edges.iter().enumerate() {
+            out[e.from].push(ei);
+            inc[e.to].push(ei);
+        }
+        Graph { files: file_list.len(), symbols, edges, file_list, out, inc, ..Graph::default() }
+    }
     pub fn out_edges(&self, i: usize) -> impl Iterator<Item = &Edge> {
         self.out[i].iter().map(move |&e| &self.edges[e])
     }
@@ -368,6 +378,24 @@ impl Graph {
     /// A top-level symbol that no test file imports. Never true when the project has no tests at all.
     pub fn untested(&self, i: usize) -> bool {
         !self.test_files.is_empty() && self.symbols[i].parent.is_none() && self.symbols[i].tests.is_empty()
+    }
+    /// Nothing references `i` except the symbol that defines it. Pages, layouts and route
+    /// handlers are loaded by Next.js itself.
+    pub fn is_unused(&self, i: usize) -> bool {
+        !self.symbols[i].is_entry()
+            && !self.in_edges(i).any(|e| e.from != i && !matches!(e.kind, EdgeKind::Defines | EdgeKind::Context))
+    }
+    /// `i` is `anc` or defined (at any depth) inside it.
+    pub fn is_inside(&self, mut i: usize, anc: usize) -> bool {
+        loop {
+            if i == anc {
+                return true;
+            }
+            match self.symbols[i].parent {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
     }
 
     /// What `i` reaches out to: its own data uses first, then those of the hooks and functions it
