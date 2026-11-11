@@ -351,6 +351,16 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// A graph made from given symbols and links (a derived view, such as one card per file).
+    pub fn from_parts(symbols: Vec<Symbol>, edges: Vec<Edge>, file_list: Vec<String>) -> Graph {
+        let n = symbols.len();
+        let (mut out, mut inc) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+        for (ei, e) in edges.iter().enumerate() {
+            out[e.from].push(ei);
+            inc[e.to].push(ei);
+        }
+        Graph { files: file_list.len(), symbols, edges, file_list, out, inc, ..Graph::default() }
+    }
     pub fn out_edges(&self, i: usize) -> impl Iterator<Item = &Edge> {
         self.out[i].iter().map(move |&e| &self.edges[e])
     }

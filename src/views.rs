@@ -30,6 +30,12 @@ pub struct View {
     pub selected: Option<SymKey>,
     pub expanded: Vec<SymKey>,
     pub pinned: Vec<SymKey>,
+    /// "Group by: Files": one card per file
+    pub by_file: bool,
+    /// open file cards, by path
+    pub open_files: Vec<String>,
+    /// picked file card, by path
+    pub picked_file: Option<String>,
 }
 
 impl View {
@@ -101,6 +107,7 @@ impl Store {
     pub fn put(&mut self, project: &Path, mut view: View) {
         view.expanded.truncate(MAX_OPEN);
         view.pinned.truncate(MAX_OPEN);
+        view.open_files.truncate(MAX_OPEN);
         self.projects.retain(|(p, _)| !prefs::same(p, project));
         self.projects.insert(0, (project.to_path_buf(), view));
         self.projects.truncate(MAX_PROJECTS);
@@ -131,6 +138,9 @@ impl Store {
                 "selected" => view.selected = parse_key(v),
                 "expanded" => view.expanded.extend(parse_key(v)),
                 "pinned" => view.pinned.extend(parse_key(v)),
+                "group" => view.by_file = v == "files",
+                "openfile" if !v.is_empty() => view.open_files.push(v.to_string()),
+                "pickfile" if !v.is_empty() => view.picked_file = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -158,6 +168,15 @@ impl Store {
             for k in &v.pinned {
                 s.push_str(&format!("pinned={}\n", key_text(k)));
             }
+            if v.by_file {
+                s.push_str("group=files\n");
+            }
+            for f in &v.open_files {
+                s.push_str(&format!("openfile={f}\n"));
+            }
+            if let Some(f) = &v.picked_file {
+                s.push_str(&format!("pickfile={f}\n"));
+            }
         }
         s
     }
@@ -181,6 +200,9 @@ mod tests {
             selected: Some(key("src/App.tsx", "App", 0)),
             expanded: vec![key("src/App.tsx", "App", 0), key("src/ui/Button.tsx", "Button", 1)],
             pinned: vec![key("src/x.ts", "helper", 0)],
+            by_file: true,
+            open_files: vec!["src/App.tsx".into(), "src/ui/Button.tsx".into()],
+            picked_file: Some("src/ui/Button.tsx".into()),
         }
     }
 

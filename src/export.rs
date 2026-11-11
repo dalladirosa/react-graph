@@ -15,6 +15,8 @@ pub struct Drawn<'a> {
     pub pos: &'a HashMap<usize, (f32, f32)>,
     /// card size in canvas units
     pub card: (f32, f32),
+    /// cards are files (grouped by file), not symbols
+    pub files: bool,
 }
 
 const PAD: f32 = 24.0;
@@ -149,7 +151,7 @@ fn svg_with(d: &Drawn, ids: bool) -> String {
             xml(&clip(&s.name, 24)),
             x + 16.0,
             y + 43.0,
-            xml(&format!("{} · line {}", kind_word(s.kind), s.line)),
+            xml(&if d.files { format!("file · mostly {}s", kind_word(s.kind)) } else { format!("{} · line {}", kind_word(s.kind), s.line) }),
             x + 16.0,
             y + 57.0,
             xml(&clip(&s.file, 32)),
@@ -181,7 +183,7 @@ pub fn html(d: &Drawn, title: &str) -> String {
             serde_json::json!({
                 "i": i,
                 "name": s.name,
-                "kind": kind_word(s.kind),
+                "kind": if d.files { "file" } else { kind_word(s.kind) },
                 "file": s.file,
                 "line": s.line,
                 "wraps": s.wraps.iter().map(|w| w.label()).collect::<Vec<_>>(),
@@ -430,7 +432,7 @@ mod tests {
     fn context_fixture_exports() {
         let g = graph::build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/context"));
         let (nodes, edges, pos) = drawn_all(&g);
-        let d = Drawn { graph: &g, nodes: &nodes, edges: &edges, pos: &pos, card: (200.0, 66.0) };
+        let d = Drawn { graph: &g, nodes: &nodes, edges: &edges, pos: &pos, card: (200.0, 66.0), files: false };
 
         let m = mermaid(&d);
         assert!(m.starts_with("flowchart LR\n"));
@@ -454,7 +456,7 @@ mod tests {
     fn html_viewer_is_self_contained() {
         let g = graph::build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/context"));
         let (nodes, edges, pos) = drawn_all(&g);
-        let d = Drawn { graph: &g, nodes: &nodes, edges: &edges, pos: &pos, card: (200.0, 66.0) };
+        let d = Drawn { graph: &g, nodes: &nodes, edges: &edges, pos: &pos, card: (200.0, 66.0), files: false };
         let h = html(&d, "my <app> & co");
         assert!(h.starts_with("<!doctype html>") && h.trim_end().ends_with("</html>"));
         // the title is escaped, and nothing is loaded from elsewhere
@@ -480,7 +482,7 @@ mod tests {
     fn html_of_an_empty_graph_still_works() {
         let g = Graph::default();
         let pos = HashMap::new();
-        let d = Drawn { graph: &g, nodes: &[], edges: &[], pos: &pos, card: (200.0, 66.0) };
+        let d = Drawn { graph: &g, nodes: &[], edges: &[], pos: &pos, card: (200.0, 66.0), files: false };
         let h = html(&d, "empty");
         assert!(h.contains("\"nodes\":[]") && h.contains("<g id=\"vp\">"));
     }
