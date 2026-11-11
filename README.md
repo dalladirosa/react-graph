@@ -54,12 +54,7 @@ The builds aren't code-signed yet, so Windows SmartScreen may warn the first tim
 
 Download `rendermap-<version>-macos-arm64.dmg`, open it, and drag **Rendermap** onto **Applications**.
 
-The app isn't notarized by Apple yet, so macOS blocks it the first time ("Apple could not verify…"). To allow it once:
-
-1. Try to open Rendermap, then click **Done** in the warning.
-2. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to Rendermap.
-
-Or run this once in Terminal instead:
+When the repository has the signing secrets (see [Signing the macOS build](#signing-the-macos-build)), release builds are notarized by Apple and open normally. Without them, macOS blocks the app the first time ("Apple could not verify…"). To allow it once, open **System Settings → Privacy & Security** and click **Open Anyway** next to Rendermap, or run this once in Terminal:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Rendermap.app"
@@ -92,7 +87,7 @@ To build the packages locally:
 cargo build --release
 # Windows, with Inno Setup 6 (https://jrsoftware.org/isinfo.php) installed:
 iscc /DAppVersion=0.5.0 installer/rendermap.iss   # writes dist/rendermap-0.5.0-setup.exe
-# macOS:
+# macOS (needs `pip install dmgbuild`):
 installer/macos/bundle.sh 0.5.0                     # writes dist/Rendermap.app and dist/rendermap-0.5.0-macos-arm64.dmg
 ```
 
@@ -109,6 +104,20 @@ Releases are built by [`.github/workflows/release.yml`](.github/workflows/releas
 3. The workflow builds the Windows installer and portable zip, and the macOS `.dmg` on an Apple Silicon machine. It then publishes them together in one GitHub Release with automatic release notes.
 
 The tag must match the `Cargo.toml` version, or the workflow stops. You can also start the workflow by hand from the **Actions** tab. That builds everything and attaches it to the run, along with a screenshot of the Mac app starting up, but doesn't publish a release.
+
+### Signing the macOS build
+
+To make the `.dmg` open without the "Open Anyway" step, add these repository secrets (Settings → Secrets and variables → Actions). They need a paid Apple Developer account. Without them the build is still made, but only ad-hoc signed.
+
+| Secret | Value |
+|--------|-------|
+| `MACOS_CERT_P12` | Your "Developer ID Application" certificate and key, exported as `.p12`, then `base64 -i cert.p12 \| pbcopy` |
+| `MACOS_CERT_PASSWORD` | The password you set when you exported the `.p12` |
+| `APPLE_ID` | The Apple ID email of the developer account |
+| `APPLE_TEAM_ID` | Your 10-character team ID (developer.apple.com → Membership) |
+| `APPLE_APP_PASSWORD` | An app-specific password from account.apple.com |
+
+The install window's background is `installer/macos/dmg-background*.png`. To change it, edit and run `installer/macos/make_dmg_background.py` (needs Pillow).
 
 ## Credits
 
