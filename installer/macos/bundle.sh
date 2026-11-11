@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Packages target/release/react-graph into "React Graph.app" and a drag-to-Applications .dmg.
+# Packages target/release/rendermap into "Rendermap.app" and a drag-to-Applications .dmg.
 # Usage (on macOS, after `cargo build --release`): installer/macos/bundle.sh <version> [arch]
-# Writes dist/React Graph.app and dist/react-graph-<version>-macos-<arch>.dmg.
+# Writes dist/Rendermap.app and dist/rendermap-<version>-macos-<arch>.dmg.
 set -euo pipefail
 
 version="${1:?usage: bundle.sh <version> [arch]}"
 arch="${2:-arm64}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dist="$root/dist"
-app="$dist/React Graph.app"
+app="$dist/Rendermap.app"
 
 rm -rf "$app" "$dist/dmg" && mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$root/target/release/react-graph" "$app/Contents/MacOS/react-graph"
+cp "$root/target/release/rendermap" "$app/Contents/MacOS/rendermap"
 sed "s/@VERSION@/$version/g" "$root/installer/macos/Info.plist" > "$app/Contents/Info.plist"
 
 # app icon: every size iconutil wants, from the 512px PNG
@@ -34,7 +34,7 @@ codesign --force --deep --sign - "$app"
 mkdir -p "$dist/dmg"
 cp -R "$app" "$dist/dmg/"
 ln -s /Applications "$dist/dmg/Applications"
-hdiutil create -volname "React Graph" -srcfolder "$dist/dmg" -ov -format UDZO \
-  "$dist/react-graph-$version-macos-$arch.dmg"
+hdiutil create -volname "Rendermap" -srcfolder "$dist/dmg" -ov -format UDZO \
+  "$dist/rendermap-$version-macos-$arch.dmg"
 rm -rf "$dist/dmg"
-echo "Built $dist/react-graph-$version-macos-$arch.dmg"
+echo "Built $dist/rendermap-$version-macos-$arch.dmg"

@@ -1,10 +1,12 @@
-# React Graph
+# Rendermap
+
+**Website: [dalladirosa.github.io/react-graph](https://dalladirosa.github.io/react-graph/)** · Formerly called React Graph.
 
 A fast desktop app that maps a React codebase as an interactive graph of **components**, **hooks** and **functions**, with a Project panel inspired by JetBrains IDEs. It runs on **Windows** and **macOS (Apple Silicon)**.
 
-Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and React Graph parses it with tree-sitter (it never runs your code). It shows what renders, calls and passes what, starting from your entry points.
+Open a folder of `.ts` / `.tsx` / `.js` / `.jsx` files and Rendermap parses it with tree-sitter (it never runs your code). It shows what renders, calls and passes what, starting from your entry points.
 
-![React Graph in dark mode, with the App component expanded and the toolbar showing Dim others, Hooks & functions and Export](docs/screenshot.png)
+![Rendermap in dark mode, with the App component expanded and the toolbar showing Dim others, Hooks & functions and Export](docs/screenshot.png)
 
 ## Features
 
@@ -41,24 +43,24 @@ Download the latest build from the [Releases page](https://github.com/dalladiros
 
 | File | What it is |
 | --- | --- |
-| `react-graph-<version>-setup.exe` | Installer. Adds a Start Menu entry (and an optional desktop shortcut) and an uninstaller. It installs for your user only, without admin rights, unless you choose "all users". |
-| `react-graph-<version>-windows-x64-portable.zip` | Portable version: a single `react-graph.exe` you can run from anywhere. |
+| `rendermap-<version>-setup.exe` | Installer. Adds a Start Menu entry (and an optional desktop shortcut) and an uninstaller. It installs for your user only, without admin rights, unless you choose "all users". |
+| `rendermap-<version>-windows-x64-portable.zip` | Portable version: a single `rendermap.exe` you can run from anywhere. |
 
 The builds aren't code-signed yet, so Windows SmartScreen may warn the first time. Click **More info → Run anyway**.
 
 ### macOS (Apple Silicon: M1 or later)
 
-Download `react-graph-<version>-macos-arm64.dmg`, open it, and drag **React Graph** onto **Applications**.
+Download `rendermap-<version>-macos-arm64.dmg`, open it, and drag **Rendermap** onto **Applications**.
 
 The app isn't notarized by Apple yet, so macOS blocks it the first time ("Apple could not verify…"). To allow it once:
 
-1. Try to open React Graph, then click **Done** in the warning.
-2. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to React Graph.
+1. Try to open Rendermap, then click **Done** in the warning.
+2. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to Rendermap.
 
 Or run this once in Terminal instead:
 
 ```bash
-xattr -dr com.apple.quarantine "/Applications/React Graph.app"
+xattr -dr com.apple.quarantine "/Applications/Rendermap.app"
 ```
 
 ## Usage
@@ -66,11 +68,11 @@ xattr -dr com.apple.quarantine "/Applications/React Graph.app"
 Open a folder from the project menu in the title bar (Ctrl+O, or ⌘O on a Mac). You can also pass a folder on the command line:
 
 ```bash
-react-graph.exe C:\path\to\my-app                                        # Windows
-"/Applications/React Graph.app/Contents/MacOS/react-graph" ~/code/my-app   # macOS
+rendermap.exe C:\path\to\my-app                                        # Windows
+"/Applications/Rendermap.app/Contents/MacOS/rendermap" ~/code/my-app   # macOS
 ```
 
-`node_modules` and other build folders are skipped. Settings (theme and recent projects) are stored in `%APPDATA%\react-graph\settings.txt` on Windows and `~/.config/react-graph/settings.txt` on macOS; saved views are in `views.txt` next to it.
+`node_modules` and other build folders are skipped. Settings (theme and recent projects) are stored in `%APPDATA%\rendermap\settings.txt` on Windows and `~/.config/rendermap/settings.txt` on macOS; saved views are in `views.txt` next to it. Settings from React Graph (the app's old name, in a `react-graph` folder) are moved over the first time Rendermap starts. On Windows, the Rendermap installer upgrades an existing React Graph install in place.
 
 ## Build from source
 
@@ -87,9 +89,9 @@ To build the packages locally:
 ```bash
 cargo build --release
 # Windows, with Inno Setup 6 (https://jrsoftware.org/isinfo.php) installed:
-iscc /DAppVersion=0.5.0 installer/react-graph.iss   # writes dist/react-graph-0.5.0-setup.exe
+iscc /DAppVersion=0.5.0 installer/rendermap.iss   # writes dist/rendermap-0.5.0-setup.exe
 # macOS:
-installer/macos/bundle.sh 0.5.0                     # writes dist/React Graph.app and dist/react-graph-0.5.0-macos-arm64.dmg
+installer/macos/bundle.sh 0.5.0                     # writes dist/Rendermap.app and dist/rendermap-0.5.0-macos-arm64.dmg
 ```
 
 ## Releasing

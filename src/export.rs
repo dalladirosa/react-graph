@@ -208,7 +208,7 @@ const HTML_PAGE: &str = r####"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{TITLE}} · React Graph</title>
+<title>{{TITLE}} · Rendermap</title>
 <style>
   :root { --ink:#1a192b; --muted:#6b7280; --line:#e5e7eb; --bg:#f8f9fb; --accent:#ff0071; }
   * { box-sizing: border-box; }
@@ -458,7 +458,7 @@ mod tests {
         let h = html(&d, "my <app> & co");
         assert!(h.starts_with("<!doctype html>") && h.trim_end().ends_with("</html>"));
         // the title is escaped, and nothing is loaded from elsewhere
-        assert!(h.contains("<title>my &lt;app&gt; &amp; co · React Graph</title>"));
+        assert!(h.contains("<title>my &lt;app&gt; &amp; co · Rendermap</title>"));
         assert!(!h.contains("http://") || h.matches("http://").count() == 1, "only the svg namespace");
         assert!(!h.contains("https://") && !h.contains("src=") && !h.contains("@import"));
         // one card and one link per drawn symbol and edge, with the indexes the data refers to

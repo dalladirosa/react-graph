@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>React Graph</string>
+    <string>Rendermap</string>
     <key>CFBundleDisplayName</key>
-    <string>React Graph</string>
+    <string>Rendermap</string>
     <key>CFBundleIdentifier</key>
-    <string>com.dalladirosa.react-graph</string>
+    <string>com.dalladirosa.rendermap</string>
     <key>CFBundleExecutable</key>
-    <string>react-graph</string>
+    <string>rendermap</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>

@@ -1,8 +1,12 @@
 //! Settings kept between runs: light / dark mode and the recently opened project folders.
 //!
 //! Stored as plain `key=value` lines (one `recent=` line per folder, newest first) in
-//! `%APPDATA%\react-graph\settings.txt` on Windows, `$XDG_CONFIG_HOME/react-graph` or
-//! `~/.config/react-graph` elsewhere. A missing or unreadable file just means defaults.
+//! `%APPDATA%\rendermap\settings.txt` on Windows, `$XDG_CONFIG_HOME/rendermap` or
+//! `~/.config/rendermap` elsewhere. A missing or unreadable file just means defaults.
+//!
+//! The app used to be called React Graph and kept these files in a `react-graph` folder; the
+//! first run after the rename moves that folder over, so nobody loses their recent projects
+//! or saved views.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +29,32 @@ pub(crate) fn dir() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     };
-    base.map(|b| b.join("react-graph"))
+    let base = base?;
+    let dir = base.join("rendermap");
+    static MIGRATE: std::sync::Once = std::sync::Once::new();
+    MIGRATE.call_once(|| migrate(&base.join("react-graph"), &dir));
+    Some(dir)
+}
+
+/// Move the settings folder from the app's old name to its new one, once. Does nothing when
+/// the new folder already exists (it is never overwritten) or there is nothing to move.
+/// A rename can fail (another drive, a file in use), so it falls back to copying the files.
+fn migrate(old: &Path, new: &Path) {
+    if new.exists() || !old.is_dir() {
+        return;
+    }
+    if std::fs::rename(old, new).is_ok() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(old) else { return };
+    if std::fs::create_dir_all(new).is_err() {
+        return;
+    }
+    for e in entries.flatten() {
+        if e.path().is_file() {
+            let _ = std::fs::copy(e.path(), new.join(e.file_name()));
+        }
+    }
 }
 
 fn file() -> Option<PathBuf> {
@@ -132,6 +161,49 @@ mod tests {
         let p = Prefs::parse("nonsense\ntheme = light\nrecent=\nrecent=/x\nrecent=/x\n");
         assert_eq!(p.theme, "light");
         assert_eq!(p.recent, vec![PathBuf::from("/x")]);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rendermap-migrate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn old_settings_folder_moves_to_the_new_name() {
+        let base = scratch("move");
+        let (old, new) = (base.join("react-graph"), base.join("rendermap"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("settings.txt"), "theme=dark\nrecent=/x\n").unwrap();
+        std::fs::write(old.join("views.txt"), "views").unwrap();
+        migrate(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("settings.txt")).unwrap(), "theme=dark\nrecent=/x\n");
+        assert_eq!(std::fs::read_to_string(new.join("views.txt")).unwrap(), "views");
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn existing_new_folder_is_never_overwritten() {
+        let base = scratch("keep");
+        let (old, new) = (base.join("react-graph"), base.join("rendermap"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("settings.txt"), "theme=dark\n").unwrap();
+        std::fs::write(new.join("settings.txt"), "theme=light\n").unwrap();
+        migrate(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("settings.txt")).unwrap(), "theme=light\n");
+        assert!(old.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn nothing_to_migrate_is_fine() {
+        let base = scratch("none");
+        migrate(&base.join("react-graph"), &base.join("rendermap"));
+        assert!(!base.join("rendermap").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(windows)]
