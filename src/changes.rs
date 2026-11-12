@@ -148,6 +148,37 @@ pub fn head_sha(root: &Path) -> Option<String> {
     git_out(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).filter(|s| !s.is_empty())
 }
 
+/// The commit to compare with: where this branch split from the default branch (`origin/HEAD`,
+/// else `main` or `master`), or HEAD itself when there is none.
+pub fn base_sha(root: &Path) -> Option<String> {
+    let head = head_sha(root)?;
+    let default = git_out(root, &["rev-parse", "--abbrev-ref", "origin/HEAD"]).filter(|s| !s.is_empty());
+    let base = default
+        .into_iter()
+        .chain(["main".to_string(), "master".to_string()])
+        .find_map(|b| git_out(root, &["merge-base", "HEAD", &b]).filter(|s| !s.is_empty()));
+    Some(base.unwrap_or(head))
+}
+
+/// Which of `files` (relative to `root`) git ignores.
+fn ignored(root: &Path, files: &[&String]) -> HashSet<String> {
+    if files.is_empty() {
+        return HashSet::new();
+    }
+    let Ok(mut child) = git(root).args(["check-ignore", "--stdin", "-z"]).stdin(Stdio::piped()).spawn() else {
+        return HashSet::new();
+    };
+    let list: Vec<u8> = files.iter().flat_map(|f| f.bytes().chain([0])).collect();
+    if let Some(mut stdin) = child.stdin.take() {
+        // write from another thread: git answers while it reads
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&list);
+        });
+    }
+    let Ok(out) = child.wait_with_output() else { return HashSet::new() };
+    out.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()).map(|r| String::from_utf8_lossy(r).into_owned()).collect()
+}
+
 /// The repository's git folder (absolute), to watch for commits and checkouts.
 pub fn git_dir(root: &Path) -> Option<PathBuf> {
     let d = git_out(root, &["rev-parse", "--absolute-git-dir"])?;
@@ -158,7 +189,7 @@ pub fn git_dir(root: &Path) -> Option<PathBuf> {
 /// Does a change to `p` (inside the git folder) move HEAD or what it points at?
 pub fn moves_head(p: &Path) -> bool {
     let s = p.to_string_lossy().replace('\\', "/");
-    s.ends_with("/HEAD") || s.ends_with("/packed-refs") || s.contains("/refs/heads/")
+    s.ends_with("/HEAD") || s.ends_with("/packed-refs") || s.contains("/refs/heads/") || s.contains("/refs/remotes/")
 }
 
 /// Would `build` look at this file (relative to the project folder)?
@@ -247,10 +278,14 @@ pub fn load_head(root: &Path, sha: &str) -> Result<Head, String> {
     Ok(Head { sha: sha.to_string(), graph, src })
 }
 
-/// Files of the working tree (`files`, relative) whose text differs from `head`.
+/// Files of the working tree (`files`, relative) whose text differs from `head`; new files git
+/// ignores are left out.
 pub fn edited_files(root: &Path, files: &[String], head: &Head) -> Edited {
+    let new: Vec<&String> = files.iter().filter(|f| !head.src.contains_key(*f)).collect();
+    let skip = ignored(root, &new);
     files
         .iter()
+        .filter(|f| !skip.contains(*f))
         .filter_map(|f| {
             let now = std::fs::read_to_string(root.join(f)).ok()?;
             (head.src.get(f) != Some(&now)).then(|| (f.clone(), now))
@@ -288,10 +323,13 @@ pub fn diff(head: &Head, cur: &Graph, edited: &Edited) -> Changes {
     let deleted = h.file_list.iter().filter(|f| !cur_files.contains(f)).count();
 
     let mut ch = Changes { head: head.sha.chars().take(7).collect(), files: edited.len() + deleted, ..Changes::default() };
+    // a file the base doesn't have and `edited` left out (git ignores it): not part of the change
+    let out = |f: &str| !head.src.contains_key(f) && !edited.contains_key(f);
 
     // symbols: new, or code that differs (a file nobody edited can't hold an edit)
     for (i, k) in ck.iter().enumerate() {
         match h_at.get(k) {
+            None if out(&k.0) => {}
             None => {
                 ch.status.insert(i, Status::Added);
             }
@@ -331,7 +369,7 @@ pub fn diff(head: &Head, cur: &Graph, edited: &Edited) -> Changes {
     for (added, from_set, other) in [(true, &c_links, &h_links), (false, &h_links, &c_links)] {
         let mut v: Vec<&(SymKey, SymKey, EdgeKind)> = from_set.difference(other).collect();
         v.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-        for (f, t, kind) in v {
+        for (f, t, kind) in v.into_iter().filter(|(f, t, _)| !out(&f.0) && !out(&t.0)) {
             ch.links.push(LinkChange {
                 from: f.1.clone(),
                 to: t.1.clone(),
@@ -360,7 +398,7 @@ pub fn diff(head: &Head, cur: &Graph, edited: &Edited) -> Changes {
 
     // problems brought in or fixed
     let any_tests = !cur.test_files.is_empty();
-    for (i, k) in ck.iter().enumerate() {
+    for (i, k) in ck.iter().enumerate().filter(|(_, k)| !out(&k.0)) {
         let s = &cur.symbols[i];
         let (w, unused, cycle) = (s.warnings(), cur.is_unused(i), s.cycle);
         let push = |ch: &mut Changes, text: String, worse: bool| ch.issues.push(Issue { sym: Some(i), text, worse });
@@ -430,7 +468,7 @@ mod tests {
     }
 
     fn changes_for(root: &Path) -> (Changes, Graph) {
-        let sha = head_sha(root).expect("head");
+        let sha = base_sha(root).expect("head");
         let head = load_head(root, &sha).expect("load head");
         let cur = graph::build(root);
         let edited = edited_files(root, &cur.file_list, &head);
@@ -583,6 +621,37 @@ mod tests {
         assert_eq!(ch.status.get(&0), Some(&Status::Edited));
         assert!(ch.removed.is_empty(), "X is outside the opened folder");
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn gitignored_files_are_not_changes() {
+        let Some(root) = temp_repo(&[
+            (".gitignore", "gen/\n"),
+            ("src/App.tsx", "export function App() { return <div />; }\n"),
+        ]) else {
+            return;
+        };
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        std::fs::write(root.join("gen/Out.tsx"), "export function Out() { return <p />; }\n").unwrap();
+        let (ch, g) = changes_for(&root);
+        assert!(g.symbols.iter().any(|s| s.name == "Out"), "the graph still shows it");
+        assert!(ch.is_empty(), "{:?}", ch.status);
+        assert!(ch.issues.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compares_with_where_the_branch_left_main() {
+        let Some(root) = temp_repo(&[("src/App.tsx", "export function App() { return <div />; }\n")]) else {
+            return;
+        };
+        let run = |args: &[&str]| git(&root).args(args).status().is_ok_and(|s| s.success());
+        assert!(run(&["branch", "-M", "main"]) && run(&["checkout", "-q", "-b", "feat"]));
+        std::fs::write(root.join("src/Card.tsx"), "export function Card() { return <p />; }\n").unwrap();
+        assert!(run(&["add", "-A"]) && run(&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "card"]));
+        let (ch, g) = changes_for(&root);
+        assert_eq!(ch.status.get(&idx(&g, "Card")), Some(&Status::Added), "committed on the branch, still a change");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

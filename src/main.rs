@@ -2548,7 +2548,7 @@ impl GraphView {
         let cached = self.head.clone();
         let want_dir = self.git_watcher.is_none();
         let task = cx.background_spawn(async move {
-            let Some(sha) = changes::head_sha(&root) else {
+            let Some(sha) = changes::base_sha(&root) else {
                 return Err("Not a git repository (or no commits yet)".to_string());
             };
             let head = match cached.filter(|h| h.sha == sha) {
@@ -6314,7 +6314,7 @@ impl Render for GraphView {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .tooltip(tip_with(
                         format!("{} was removed", gh.name),
-                        Some(format!("It was in {}:{} in the last commit", gh.file, gh.line).into()),
+                        Some(format!("It was in {}:{} in the base commit", gh.file, gh.line).into()),
                     ))
                     .child(
                         div()
@@ -6717,7 +6717,7 @@ impl Render for GraphView {
                     let (added, edited) = (c.count(changes::Status::Added), c.count(changes::Status::Edited));
                     let (worse, better) = (c.worse(), c.better());
                     let detail = if c.is_empty() {
-                        "Nothing differs from the last commit".to_string()
+                        format!("Nothing differs from {}", c.head)
                     } else {
                         format!(
                             "{} changed since {}: {added} new, {edited} edited, {} removed symbols. {worse} problems added, {better} fixed. Click to show only what changed.",
@@ -6726,7 +6726,7 @@ impl Render for GraphView {
                             c.removed.len()
                         )
                     };
-                    let tip_title = if on { "Changes since HEAD (on)" } else { "Changes since HEAD" };
+                    let tip_title = if on { "Changes since the base branch (on)" } else { "Changes since the base branch" };
                     side = side.child(
                         strip
                             .cursor_pointer()
@@ -6739,8 +6739,18 @@ impl Render for GraphView {
                                     .text_color(rgb(if on { EDIT_FG } else { INK }))
                                     .child("Changes"),
                             )
-                            .child(div().text_xs().font_family(MONO_FONT).text_color(rgb(MUTED)).child(c.head.clone()))
-                            .child(div().flex_1())
+                            // the sha gives way when the counts need the room
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(MUTED))
+                                    .child(c.head.clone()),
+                            )
                             .when(c.is_empty(), |d| d.child(div().text_xs().text_color(rgb(MUTED)).child("none")))
                             .when(!c.is_empty(), |d| {
                                 d.child(num(added, "+", ADD_FG))
@@ -6761,7 +6771,7 @@ impl Render for GraphView {
                 (None, note) => {
                     let text = match note {
                         Some(n) => n.clone(),
-                        None if self.changes_busy => "Comparing with the last commit\u{2026}".into(),
+                        None if self.changes_busy => "Comparing with the base branch\u{2026}".into(),
                         None => String::new(),
                     };
                     if !text.is_empty() {
@@ -6980,7 +6990,7 @@ impl Render for GraphView {
             if let Some(c) = self.changes.as_ref().filter(|_| self.filters.changed) {
                 let issues: Vec<&changes::Issue> = c.issues.iter().filter(|x| x.sym.is_none_or(|i| self.in_scope(i))).collect();
                 if !issues.is_empty() {
-                    list.push(section("Since the last commit").px_3().into_any_element());
+                    list.push(section("Since the base branch").px_3().into_any_element());
                 }
                 for (n, x) in issues.into_iter().take(100).enumerate() {
                     let (mark, color) = if x.worse { ("\u{26a0}", 0xb45309) } else { ("\u{2713}", ADD_FG) };
@@ -8247,7 +8257,7 @@ impl Render for GraphView {
                 uses.sort_unstable();
                 uses.dedup();
                 if st.is_some() || !issues.is_empty() || !links.is_empty() || !uses.is_empty() {
-                    p = p.child(section("Since the last commit"));
+                    p = p.child(section("Since the base branch"));
                     let what = match st {
                         Some(changes::Status::Added) => format!("New since {}", c.head),
                         Some(changes::Status::Edited) => format!("Code edited since {}", c.head),
