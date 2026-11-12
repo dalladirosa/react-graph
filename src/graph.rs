@@ -1124,6 +1124,20 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
                 return;
             }
         }
+        // what a method or field calls belongs to the class: it is a symbol of its own, and a
+        // function even when capitalised (it is built with `new`, not rendered)
+        "class_declaration" | "abstract_class_declaration" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let id = new_symbol(text(name, cx.src), node, owner, cx);
+                cx.symbols[id].kind = SymKind::Function;
+                let mut c = node.walk();
+                let kids: Vec<Node> = node.children(&mut c).filter(|k| k.id() != name.id()).collect();
+                for k in kids {
+                    visit(k, Some(id), cx);
+                }
+                return;
+            }
+        }
         "variable_declarator" => {
             let name = node.child_by_field_name("name");
             let value = node.child_by_field_name("value");
@@ -1373,19 +1387,15 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
             }
             if let (Some(owner), Some(f)) = (owner, node.child_by_field_name("function")) {
                 if f.kind() == "identifier" {
-                    cx.refs.push(RawRef {
-                        owner,
-                        name: text(f, cx.src).to_string(),
-                        kind: EdgeKind::Calls,
-                        file: cx.file.clone(),
-                        line: node.start_position().row + 1,
-                        via: None,
-                        event_prop: false,
-                        unstable: Vec::new(),
-                        wrappers: Vec::new(),
-                        host: false,
-                        route: false,
-                    });
+                    push_call(owner, f, node, cx);
+                }
+            }
+        }
+        // `new AgentSession()` uses the class the way a call uses a function
+        "new_expression" => {
+            if let (Some(owner), Some(f)) = (owner, node.child_by_field_name("constructor")) {
+                if f.kind() == "identifier" {
+                    push_call(owner, f, node, cx);
                 }
             }
         }
@@ -1396,6 +1406,23 @@ fn visit_node(node: Node, owner: Option<usize>, cx: &mut Ctx) {
     for ch in children {
         visit(ch, owner, cx);
     }
+}
+
+/// Record that `owner` calls `callee` (an identifier) at `at`.
+fn push_call(owner: usize, callee: Node, at: Node, cx: &mut Ctx) {
+    cx.refs.push(RawRef {
+        owner,
+        name: text(callee, cx.src).to_string(),
+        kind: EdgeKind::Calls,
+        file: cx.file.clone(),
+        line: at.start_position().row + 1,
+        via: None,
+        event_prop: false,
+        unstable: Vec::new(),
+        wrappers: Vec::new(),
+        host: false,
+        route: false,
+    });
 }
 
 fn new_symbol(name: &str, node: Node, parent: Option<usize>, cx: &mut Ctx) -> usize {
@@ -2702,6 +2729,22 @@ mod tests {
         assert_eq!(g.cycles.len(), 2);
         let names: Vec<&str> = g.cycles[abc.unwrap()].iter().map(|&i| g.symbols[i].name.as_str()).collect();
         assert_eq!(names, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn calls_inside_class_methods_count_as_uses() {
+        let g = build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/classes"));
+        let session = idx(&g, "session.ts", "AgentSession");
+        // a method body and a field arrow both belong to the class that holds them
+        assert_eq!(targets(&g, session, EdgeKind::Calls), ["usage.ts:formatTokens", "usage.ts:readRunUsage"]);
+        assert!(!g.is_unused(idx(&g, "usage.ts", "readRunUsage")));
+        assert!(!g.is_unused(idx(&g, "usage.ts", "formatTokens")));
+        // `new AgentSession()` is a use of the class; a class nobody builds is still unused
+        assert!(!g.is_unused(session));
+        assert!(g.is_unused(idx(&g, "session.ts", "Orphan")));
+        assert_eq!(g.symbols[session].kind, SymKind::Function);
+        // `abstract class` is a different node kind with the same rule
+        assert_eq!(targets(&g, idx(&g, "session.ts", "Base"), EdgeKind::Calls), ["usage.ts:formatTokens"]);
     }
 
     #[test]
